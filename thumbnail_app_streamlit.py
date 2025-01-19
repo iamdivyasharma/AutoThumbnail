@@ -21,8 +21,7 @@ if 'history' not in st.session_state:
 
 # Load default background image
 if st.session_state.background_image is None:
-    st.session_state.background_image = Image.open(io.BytesIO(
-        st.experimental_get_binary_file(st.session_state.default_background))).convert("RGBA")
+    st.session_state.background_image = Image.open(st.session_state.default_background).convert("RGBA")
 
 # Sidebar components
 st.sidebar.title("Thumbnail Editor Options")
@@ -83,7 +82,7 @@ for idx, (name, x_positions, y_positions) in enumerate(layouts):
         thumbnail = default_thumbnail_layout(x_positions, y_positions, text=name)
         if st.button(name):
             selected_layout = idx
-        st.image(thumbnail, use_column_width=True)
+        st.image(thumbnail, use_container_width=True)
 
 # If the user selects a layout, update positions and skip canvas setup
 if selected_layout is not None:
