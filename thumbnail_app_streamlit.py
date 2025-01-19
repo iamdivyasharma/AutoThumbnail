@@ -18,19 +18,31 @@ if 'history' not in st.session_state:
 # Sidebar components
 st.sidebar.title("Thumbnail Editor Options")
 
-# Upload background image
-background_file = st.sidebar.file_uploader("Upload Background Image", type=["png", "jpg", "jpeg"])
+# Upload background image with placeholder
+background_file = st.sidebar.file_uploader(
+    "Upload Background Image", 
+    type=["png", "jpg", "jpeg"],
+    help="Upload the main image that will serve as the thumbnail background."
+)
 if background_file:
     st.session_state.background_image = Image.open(background_file)
     st.session_state.history.append(st.session_state.background_image.copy())
+else:
+    st.sidebar.write("No background image uploaded yet.")
 
-# Upload overlay image
-overlay_file = st.sidebar.file_uploader("Upload Overlay Image", type=["png", "jpg", "jpeg"])
+# Upload overlay image with placeholder
+overlay_file = st.sidebar.file_uploader(
+    "Upload Overlay Image", 
+    type=["png", "jpg", "jpeg"],
+    help="Upload an image to overlay on the background (e.g., logos or decorations)."
+)
 if overlay_file:
     # Remove background from overlay image
     overlay_bytes = remove(overlay_file.read())
     overlay_image = Image.open(io.BytesIO(overlay_bytes)).convert("RGBA")
     st.session_state.overlay_image = overlay_image
+else:
+    st.sidebar.write("No overlay image uploaded yet.")
 
 # Text options
 text_content = st.sidebar.text_input("Add Text", "Your Text Here")
