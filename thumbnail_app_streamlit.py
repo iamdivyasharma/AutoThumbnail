@@ -7,7 +7,7 @@ import base64
 from streamlit_drawable_canvas import st_canvas
 
 # Function to convert PIL image to base64
-def image_to_data_url(image):
+def image_to_base64(image):
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     buffer.seek(0)
@@ -62,11 +62,15 @@ for overlay_file in overlay_files:
 
 # Interactive Canvas
 st.write("## Customize Your Thumbnail")
+background_image_url = (
+    image_to_base64(st.session_state.background_image) if st.session_state.background_image else None
+)
+
 canvas_result = st_canvas(
     fill_color="rgba(255, 165, 0, 0.3)",
     stroke_width=3,
     stroke_color="#000000",
-    background_image=st.session_state.background_image if st.session_state.background_image else None,
+    background_image=background_image_url,
     update_streamlit=True,
     height=st.session_state.background_image.height if st.session_state.background_image else 400,
     width=st.session_state.background_image.width if st.session_state.background_image else 600,
