@@ -51,45 +51,57 @@ for overlay_file in overlay_files:
 # Generate Default Thumbnails
 st.write("## Choose a Default Thumbnail Layout")
 columns = st.columns(4)
-def default_thumbnail_layout(x_positions, y_positions, text=None):
+def default_thumbnail_layout(layout_name, positions, flip_images=False):
     bg = st.session_state.background_image.copy()
     draw = ImageDraw.Draw(bg)
 
     for i, overlay in enumerate(st.session_state.overlay_images):
-        if i < len(x_positions):
+        if i < len(positions):
             resized_overlay = overlay['image'].resize((
                 int(overlay['image'].width * overlay['scale']),
                 int(overlay['image'].height * overlay['scale'])
             ))
-            bg.paste(resized_overlay, (x_positions[i], y_positions[i]), resized_overlay)
 
-    if text:
-        font = ImageFont.truetype("arial.ttf", 30) if os.path.exists("arial.ttf") else ImageFont.load_default()
-        draw.text((150, 30), text, fill="black", font=font)
+            if flip_images and i % 2 == 1:  # Flip alternate images
+                resized_overlay = ImageOps.mirror(resized_overlay)
+
+            x, y = positions[i]
+            bg.paste(resized_overlay, (x, y), resized_overlay)
+
+    font = ImageFont.truetype("arial.ttf", 30) if os.path.exists("arial.ttf") else ImageFont.load_default()
+    draw.text((20, 20), layout_name, fill="black", font=font)
 
     return bg
 
+# Define layouts
 layouts = [
-    ("Layout 1", [50, 300], [50, 300]),
-    ("Layout 2", [100, 400], [50, 400]),
-    ("Layout 3", [150, 500], [100, 300]),
-    ("Layout 4", [200, 200], [200, 400])
+    ("Layout 1", [(50, 50), (300, 300)]),
+    ("Layout 2", [(50, 300), (300, 50)]),
+    ("Layout 3", [(100, 100), (400, 400)]),
+    ("Layout 4 (Mirrored)", [(50, 50), (300, 300)], True)
 ]
 
 selected_layout = None
-for idx, (name, x_positions, y_positions) in enumerate(layouts):
+for idx, layout in enumerate(layouts):
+    layout_name = layout[0]
+    positions = layout[1]
+    flip_images = layout[2] if len(layout) > 2 else False
+
     with columns[idx]:
-        thumbnail = default_thumbnail_layout(x_positions, y_positions, text=name)
-        if st.button(name):
-            selected_layout = idx
+        thumbnail = default_thumbnail_layout(layout_name, positions, flip_images=flip_images)
+        if st.button(layout_name):
+            selected_layout = layout
         st.image(thumbnail, use_container_width=True)
 
-# If the user selects a layout, update positions and skip canvas setup
+# Apply selected layout if chosen
 if selected_layout is not None:
-    name, x_positions, y_positions = layouts[selected_layout]
+    layout_name, positions, *flip_images = selected_layout
+    flip_images = flip_images[0] if flip_images else False
     for i, overlay in enumerate(st.session_state.overlay_images):
-        if i < len(x_positions):
-            overlay['x'], overlay['y'] = x_positions[i], y_positions[i]
+        if i < len(positions):
+            overlay['x'], overlay['y'] = positions[i]
+            if flip_images and i % 2 == 1:
+                overlay['image'] = ImageOps.mirror(overlay['image'])
 
 # Text management
 st.sidebar.write("### Add and Edit Text")
@@ -104,13 +116,7 @@ for i, text in enumerate(st.session_state.texts):
 
 # Interactive Canvas
 st.write("## Customize Your Thumbnail")
-canvas = st.canvas(
-    background_image=st.session_state.background_image,
-    width=st.session_state.background_image.width,
-    height=st.session_state.background_image.height,
-    drawing_mode="transform",
-    update_streamlit=True
-)
+# Placeholder for future canvas integration
 
 # Save Button
 if st.sidebar.button("Save Thumbnail"):
