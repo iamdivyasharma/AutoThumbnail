@@ -115,7 +115,7 @@ if st.session_state.background_image:
 
     # Draw bounding box if enabled
     if show_bounding_box:
-        text_width, text_height = draw.textsize(text_content, font=font)
+        text_width, text_height = font.getsize(text_content)  # Updated method
         x, y = text_position
         if bounding_box_style == "Rectangle":
             draw.rectangle([
