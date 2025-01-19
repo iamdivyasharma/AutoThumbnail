@@ -45,7 +45,7 @@ background_file = st.sidebar.file_uploader(
     type=["png", "jpg", "jpeg"]
 )
 if background_file:
-    st.session_state.background_image = Image.open(background_file)
+    st.session_state.background_image = Image.open(background_file).convert("RGBA")
     st.session_state.history.append({'background_image': st.session_state.background_image.copy()})
 
 # Sidebar: Upload Overlay Images
@@ -70,7 +70,7 @@ canvas_result = st_canvas(
     fill_color="rgba(255, 165, 0, 0.3)",
     stroke_width=3,
     stroke_color="#000000",
-    background_image=background_image_url,
+    background_image=st.session_state.background_image if isinstance(st.session_state.background_image, Image.Image) else None,
     update_streamlit=True,
     height=st.session_state.background_image.height if isinstance(st.session_state.background_image, Image.Image) else 400,
     width=st.session_state.background_image.width if isinstance(st.session_state.background_image, Image.Image) else 600,
