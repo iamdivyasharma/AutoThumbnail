@@ -11,7 +11,7 @@ st.set_page_config(page_title="Thumbnail Editor", page_icon="🎨", layout="wide
 if 'background_image' not in st.session_state:
     st.session_state.background_image = None
 if 'default_background' not in st.session_state:
-    st.session_state.default_background = "https://raw.githubusercontent.com/your-github-repo/default_image.png"
+    st.session_state.default_background = "youtube-thumbnail-orange-gradient-nm9iw60na2j0ibcy.jpg"
 if 'overlay_images' not in st.session_state:
     st.session_state.overlay_images = []
 if 'texts' not in st.session_state:
