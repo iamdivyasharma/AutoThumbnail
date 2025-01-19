@@ -63,7 +63,7 @@ for overlay_file in overlay_files:
 # Interactive Canvas
 st.write("## Customize Your Thumbnail")
 background_image_url = (
-    image_to_base64(st.session_state.background_image) if st.session_state.background_image else None
+    image_to_base64(st.session_state.background_image) if isinstance(st.session_state.background_image, Image.Image) else None
 )
 
 canvas_result = st_canvas(
@@ -72,8 +72,8 @@ canvas_result = st_canvas(
     stroke_color="#000000",
     background_image=background_image_url,
     update_streamlit=True,
-    height=st.session_state.background_image.height if st.session_state.background_image else 400,
-    width=st.session_state.background_image.width if st.session_state.background_image else 600,
+    height=st.session_state.background_image.height if isinstance(st.session_state.background_image, Image.Image) else 400,
+    width=st.session_state.background_image.width if isinstance(st.session_state.background_image, Image.Image) else 600,
     drawing_mode="transform",
     key="canvas",
 )
