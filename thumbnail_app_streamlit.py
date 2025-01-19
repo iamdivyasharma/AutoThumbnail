@@ -3,6 +3,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from rembg import remove
 import io
 import os
+from streamlit_drawable_canvas import st_canvas
 
 # Set page configuration
 st.set_page_config(page_title="Thumbnail Editor", page_icon="🎨", layout="wide")
@@ -18,6 +19,8 @@ if 'texts' not in st.session_state:
     st.session_state.texts = []
 if 'history' not in st.session_state:
     st.session_state.history = []
+if 'selected_layout' not in st.session_state:
+    st.session_state.selected_layout = None
 
 # Load default background image
 if st.session_state.background_image is None:
@@ -81,7 +84,6 @@ layouts = [
     ("Layout 4 (Mirrored)", [(50, 50), (300, 300)], True)
 ]
 
-selected_layout = None
 for idx, layout in enumerate(layouts):
     layout_name = layout[0]
     positions = layout[1]
@@ -90,12 +92,12 @@ for idx, layout in enumerate(layouts):
     with columns[idx]:
         thumbnail = default_thumbnail_layout(layout_name, positions, flip_images=flip_images)
         if st.button(layout_name):
-            selected_layout = layout
+            st.session_state.selected_layout = layout
         st.image(thumbnail, use_container_width=True)
 
 # Apply selected layout if chosen
-if selected_layout is not None:
-    layout_name, positions, *flip_images = selected_layout
+if st.session_state.selected_layout is not None:
+    layout_name, positions, *flip_images = st.session_state.selected_layout
     flip_images = flip_images[0] if flip_images else False
     for i, overlay in enumerate(st.session_state.overlay_images):
         if i < len(positions):
@@ -116,7 +118,14 @@ for i, text in enumerate(st.session_state.texts):
 
 # Interactive Canvas
 st.write("## Customize Your Thumbnail")
-# Placeholder for future canvas integration
+canvas_result = st_canvas(
+    background_image=st.session_state.background_image,
+    width=st.session_state.background_image.width,
+    height=st.session_state.background_image.height,
+    drawing_mode="transform",
+    update_streamlit=True,
+    key="canvas"
+)
 
 # Save Button
 if st.sidebar.button("Save Thumbnail"):
