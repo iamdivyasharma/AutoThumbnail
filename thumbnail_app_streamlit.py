@@ -11,8 +11,7 @@ def image_to_base64(image):
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     buffer.seek(0)
-    data_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
-    return data_url
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
 
 # Set page configuration
 st.set_page_config(page_title="Thumbnail Editor", page_icon="🎨", layout="wide")
@@ -75,6 +74,7 @@ canvas_result = st_canvas(
     height=st.session_state.background_image.height if isinstance(st.session_state.background_image, Image.Image) else 400,
     width=st.session_state.background_image.width if isinstance(st.session_state.background_image, Image.Image) else 600,
     drawing_mode="transform",
+    display_toolbar=True,
     key="canvas",
 )
 
