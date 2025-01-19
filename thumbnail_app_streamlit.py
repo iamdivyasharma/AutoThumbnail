@@ -69,14 +69,35 @@ canvas_result = st_canvas(
     fill_color="rgba(255, 165, 0, 0.3)",
     stroke_width=3,
     stroke_color="#000000",
-    background_image=st.session_state.background_image if isinstance(st.session_state.background_image, Image.Image) else None,
+    background_image=st.session_state.background_image,
     update_streamlit=True,
     height=st.session_state.background_image.height if isinstance(st.session_state.background_image, Image.Image) else 400,
     width=st.session_state.background_image.width if isinstance(st.session_state.background_image, Image.Image) else 600,
     drawing_mode="transform",
     display_toolbar=True,
+    point_display_radius=0,
     key="canvas",
 )
+
+# Manage overlay images and text dynamically
+if canvas_result.json_data is not None:
+    objects = canvas_result.json_data.get("objects", [])
+    for obj in objects:
+        if obj.get("type") == "image":
+            st.session_state.overlay_images.append({
+                'image': Image.open(io.BytesIO(base64.b64decode(obj["src"].split(",")[-1]))),
+                'x': obj["left"],
+                'y': obj["top"],
+                'scale': obj["scaleX"]
+            })
+        elif obj.get("type") == "textbox":
+            st.session_state.texts.append({
+                'content': obj["text"],
+                'x': obj["left"],
+                'y': obj["top"],
+                'color': obj["fill"],
+                'size': obj["fontSize"]
+            })
 
 # Save Button
 if st.sidebar.button("Save Thumbnail"):
@@ -89,11 +110,11 @@ if st.sidebar.button("Save Thumbnail"):
             int(overlay['image'].width * overlay['scale']),
             int(overlay['image'].height * overlay['scale'])
         ))
-        bg_image.paste(resized_overlay, (overlay['x'], overlay['y']), resized_overlay)
+        bg_image.paste(resized_overlay, (int(overlay['x']), int(overlay['y'])), resized_overlay)
 
     for text in st.session_state.texts:
-        font = ImageFont.truetype("arial.ttf", text['size']) if os.path.exists("arial.ttf") else ImageFont.load_default()
-        draw.text((text['x'], text['y']), text['content'], fill=text['color'], font=font)
+        font = ImageFont.truetype("arial.ttf", int(text['size'])) if os.path.exists("arial.ttf") else ImageFont.load_default()
+        draw.text((int(text['x']), int(text['y'])), text['content'], fill=text['color'], font=font)
 
     bg_image.save(buffer, format="PNG")
     buffer.seek(0)
