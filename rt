@@ -1,0 +1,54 @@
+# hotel_server.py
+from __future__ import annotations
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+import uvicorn
+
+# ── import your RAG QA chain here ─────────────────────────────────────────────
+# Example: from my_rag_module import hotel_qa_chain  # must be callable
+# For demo, we mock it:
+def hotel_qa_chain(query: str, **kwargs) -> str:
+    # Replace this with your real chain call, e.g. chain.run(query)
+    return f"[hotel QA] answer for: {query}, extras={kwargs}"
+
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+app = FastAPI(title="Hotel Bot", version="1.0.0")
+
+class HotelQuery(BaseModel):
+    # MCP discovery prefers a clear input schema. `qquery` is common in your stack.
+    qquery: str = Field(..., description="User free-text query")
+    # Allow extras (optional) if the orchestrator passes knobs like top_k, filters, etc.
+    top_k: Optional[int] = Field(default=5, ge=1, le=50, description="Result count")
+    filters: Optional[Dict[str, Any]] = Field(default=None, description="Filter dict")
+    # add any other fields your chain expects…
+
+@app.post("/hotel_query", operation_id="hotel_query_tool")
+async def hotel_query(inp: HotelQuery):
+    """
+    REST tool entrypoint (and also advertised to MCP via operation_id).
+    The orchestrator (REST or MCP) expects an object with 'answer' key.
+    """
+    # Call your RAG chain (sync or async). If your chain is async, await it.
+    try:
+        result = hotel_qa_chain(inp.qquery, top_k=inp.top_k, filters=inp.filters)
+    except Exception as e:
+        # Return a consistent error structure if you like,
+        # but 200 + {"answer": "...error..."} also works for your current stack.
+        return {"answer": f"Hotel chain error: {type(e).__name__}: {e}"}
+    return {"answer": result}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+# ── Mount MCP over HTTP at /mcp ───────────────────────────────────────────────
+from fastapi_mcp import FastApiMCP
+mcp = FastApiMCP(app, name="hotel-mcp")
+# This registers a fixed /mcp route (no path param) for MCP clients
+mcp.mount_http()  # default path "/mcp"
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # Run on 9001 (so your orchestrator can reach http://127.0.0.1:9001/mcp)
+    uvicorn.run(app, host="0.0.0.0", port=9001)
