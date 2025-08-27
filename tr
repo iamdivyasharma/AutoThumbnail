@@ -1,0 +1,421 @@
+# orchestrator_mcp_end2end.py
+from __future__ import annotations
+import asyncio, contextlib, json, traceback
+from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict, deque
+from time import time
+
+from fastapi import FastAPI, Body
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+# ───────────────────────────────────────────────────────────────────────────────
+#                         MCP SERVER CONNECTIONS (HTTP)
+# ───────────────────────────────────────────────────────────────────────────────
+# Each bot must mount MCP at /mcp with HTTP:
+#   from fastapi_mcp import FastApiMCP
+#   mcp = FastApiMCP(app, name="bot")
+#   mcp.mount_http()   # default path '/mcp'
+#
+# NOTE: change host/ports or switch to your SageMaker proxy URLs if needed.
+MCP_CONFIG: Dict[str, dict] = {
+    "hotel": {"transport": {"type": "streamable_http", "url": "http://127.0.0.1:9001/mcp"}},
+    "air":   {"transport": {"type": "streamable_http", "url": "http://127.0.0.1:9002/mcp"}},
+    "tdna":  {"transport": {"type": "streamable_http", "url": "http://127.0.0.1:9003/mcp"}},
+}
+
+# Optional: “domain alias” to “preferred tool name” hints. If a preferred tool
+# isn’t found via discovery, we’ll just pick the first available tool.
+PREFERRED_TOOL_NAME = {
+    "hotel": "hotel_query_tool",
+    "air":   "air_query_tool",
+    "tdna":  "tdna_query_tool",
+}
+
+# ───────────────────────────────────────────────────────────────────────────────
+#                            LIGHTWEIGHT ORCHESTRATION
+# ───────────────────────────────────────────────────────────────────────────────
+def heuristic_route(q: str) -> List[str]:
+    s = q.lower()
+    air   = any(w in s for w in ("flight","flights","air","airline","pnr","fare","seat","airport"))
+    hotel = any(w in s for w in ("hotel","room","rooms","stay","booking","reservation","amenities","check-in","check out"))
+    tdna  = any(w in s for w in ("tdna","dna","genome","variant","gene","sequence","omics"))
+    picks = []
+    if air: picks.append("air")
+    if hotel: picks.append("hotel")
+    if tdna: picks.append("tdna")
+    return picks or ["hotel"]
+
+def compose(user_q: str, per_target: Dict[str, Any]) -> str:
+    parts = []
+    for k in ("hotel","air","tdna"):
+        if k in per_target:
+            parts.append(f"{k}: {per_target[k]}")
+    return " | ".join(map(str, parts)) if parts else "No result."
+
+# ───────────────────────────────────────────────────────────────────────────────
+#                                 MEMORY + CACHE
+# ───────────────────────────────────────────────────────────────────────────────
+MEM: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"history": deque(maxlen=20), "created": time()})
+def mem_add(sid: str, role: str, content: Any):
+    MEM[sid]["history"].append({"role": role, "content": content, "ts": time()})
+def mem_get(sid: str, k: int = 10) -> List[Dict[str, Any]]:
+    hist = list(MEM[sid]["history"]); return hist[-k:] if k else hist
+def mem_clear(sid: str): MEM.pop(sid, None)
+
+# ───────────────────────────────────────────────────────────────────────────────
+#                                 MCP CLIENT
+# ───────────────────────────────────────────────────────────────────────────────
+from langchain_mcp_adapters.clients import MultiServerMCPClient
+
+app = FastAPI(title="Orchestrator (Pure MCP, end-to-end)")
+
+_client_holder: Dict[str, Any] = {"client": None}
+_tool_cache: Dict[str, List[Any]] = {}  # server -> list of tool objects (from discovery)
+
+async def _get_tools(session) -> List[Any]:
+    # Works across library variants (get_tools or get_all_tools)
+    for attr in ("get_tools", "get_all_tools"):
+        fn = getattr(session, attr, None)
+        if fn:
+            try:
+                res = await fn()
+            except TypeError:
+                res = fn()
+            # Some impls return dict {server: [tools]}, others a list
+            return [t for _, L in res.items() for t in L] if isinstance(res, dict) else list(res)
+    raise RuntimeError("No get_tools/get_all_tools on session")
+
+def _struct_err(server: str, tool: str, stage: str, e: Exception):
+    return {
+        "_mcp_error": True,
+        "server": server,
+        "tool": tool,
+        "stage": stage,
+        "etype": type(e).__name__,
+        "message": str(e),
+        "trace": traceback.format_exc(),
+    }
+
+def _pick_tool(server: str, tools: List[Any]) -> Optional[Any]:
+    """Choose a tool: prefer PREFERRED_TOOL_NAME[server], else first."""
+    pref = PREFERRED_TOOL_NAME.get(server)
+    if pref:
+        for t in tools:
+            if getattr(t, "name", "") == pref:
+                return t
+    return tools[0] if tools else None
+
+def _schema_dict(tool: Any) -> Dict[str, Any]:
+    # Try common attribute names for schema
+    for attr in ("input_schema", "schema", "inputSchema"):
+        sch = getattr(tool, attr, None)
+        if isinstance(sch, dict):
+            return sch
+    # Some tool objects may expose .to_dict() or .model_dump()
+    for attr in ("to_dict", "model_dump"):
+        fn = getattr(tool, attr, None)
+        if callable(fn):
+            try:
+                data = fn()
+                if isinstance(data, dict) and "input_schema" in data:
+                    return data["input_schema"]
+            except Exception:
+                pass
+    return {}
+
+def _build_payload_from_schema(schema: Dict[str, Any], query: str, extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Best-effort payload builder:
+    - Prefer 'qquery' or 'query' fields if present,
+    - else first string-typed field,
+    - merge extra keys that exist in schema.properties (ignore unknowns).
+    """
+    payload: Dict[str, Any] = {}
+    props = (schema or {}).get("properties", {}) if isinstance(schema, dict) else {}
+    required = set(schema.get("required", []) if isinstance(schema, dict) else [])
+    candidate_field = None
+
+    if "qquery" in props: candidate_field = "qquery"
+    elif "query" in props: candidate_field = "query"
+    else:
+        # find the first string-typed field
+        for k, v in props.items():
+            if isinstance(v, dict) and v.get("type") in ("string", ["string"]):
+                candidate_field = k
+                break
+
+    if candidate_field:
+        payload[candidate_field] = query
+    # Fill remaining required fields with simple defaults if missing
+    for k in required:
+        if k not in payload:
+            v = props.get(k, {})
+            t = v.get("type")
+            if t in ("integer", ["integer"]): payload[k] = 1
+            elif t in ("number", ["number"]): payload[k] = 1
+            elif t in ("boolean", ["boolean"]): payload[k] = False
+            elif t in ("array", ["array"]): payload[k] = []
+            elif t in ("object", ["object"]): payload[k] = {}
+            else: payload[k] = ""  # string or unknown
+
+    if isinstance(extra, dict):
+        # Only merge keys that exist in schema to reduce 422s
+        for k, v in extra.items():
+            if (not props) or (k in props):
+                payload[k] = v
+
+    # If schema was empty, fall back to a common pattern
+    if not payload:
+        payload = {"qquery": query}
+        if isinstance(extra, dict):
+            payload.update(extra)
+
+    return payload
+
+async def mcp_call(server: str, payload: Dict[str, Any], preferred_tool: Optional[str] = None) -> Any:
+    """
+    Discover tools on the server (cached per process), pick one, invoke with payload.
+    Returns tool result or a structured error dict { _mcp_error: True, ... }.
+    """
+    cfg = MCP_CONFIG.get(server)
+    print(f"[mcp_call] server={server} cfg={cfg} payload_keys={list(payload.keys())}")
+    tool_name_for_err = preferred_tool or "<auto>"
+
+    # Get client
+    try:
+        cli = _client_holder["client"]
+        if cli is None:
+            raise RuntimeError("MCP client not initialized")
+    except Exception as e:
+        print("[mcp_call] get_client FAILED:", repr(e))
+        return _struct_err(server, tool_name_for_err, "get_client", e)
+
+    # Open session (transport negotiation happens here)
+    try:
+        cm = cli.session(server)
+    except Exception as e:
+        print("[mcp_call] make_session FAILED:", repr(e))
+        return _struct_err(server, tool_name_for_err, "make_session", e)
+
+    try:
+        sess = await cm.__aenter__()
+    except Exception as e:
+        print("[mcp_call] enter_session FAILED:", repr(e))
+        return _struct_err(server, tool_name_for_err, "enter_session", e)
+
+    try:
+        # Discover tools (cache by server for speed)
+        tools = _tool_cache.get(server)
+        if tools is None:
+            tools = await _get_tools(sess)
+            _tool_cache[server] = tools
+        if not tools:
+            raise RuntimeError("No tools discovered on server")
+
+        # Pick a tool (prefer hint, else first)
+        chosen = None
+        if preferred_tool:
+            for t in tools:
+                if getattr(t, "name", "") == preferred_tool:
+                    chosen = t; break
+        if not chosen:
+            chosen = _pick_tool(server, tools)
+        if not chosen:
+            raise RuntimeError("Could not select a tool")
+
+        tname = getattr(chosen, "name", "<unknown>")
+        schema = _schema_dict(chosen)
+        # Build payload matching schema (merge user payload)
+        # If user payload already conforms, this won't fight it.
+        auto_payload = _build_payload_from_schema(schema, payload.get("qquery") or payload.get("query") or "", payload)
+
+        print(f"[mcp_call] invoking tool={tname} with keys={list(auto_payload.keys())}")
+
+        # Invoke (async preferred)
+        ainvoke = getattr(chosen, "ainvoke", None)
+        if callable(ainvoke):
+            try:
+                out = await chosen.ainvoke(auto_payload)
+            except Exception:
+                out = await chosen.ainvoke({"input": auto_payload})
+        else:
+            loop = asyncio.get_running_loop()
+            def _call():
+                try: return chosen.invoke(auto_payload)
+                except Exception: return chosen.invoke({"input": auto_payload})
+            out = await loop.run_in_executor(None, _call)
+
+        # Normalize tool result
+        if isinstance(out, dict):
+            return out.get("answer") or out.get("result") or out.get("output") or out.get("content") or out
+        return out
+
+    except Exception as e:
+        print("[mcp_call] tools_or_invoke FAILED:", repr(e))
+        return _struct_err(server, tool_name_for_err, "tools_or_invoke", e)
+
+    finally:
+        with contextlib.suppress(Exception):
+            await cm.__aexit__(None, None, None)
+
+# ───────────────────────────────────────────────────────────────────────────────
+#                                STARTUP PROBE
+# ───────────────────────────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def _startup():
+    print("=== STARTUP (Pure MCP) ===")
+    print("MCP_CONFIG =", MCP_CONFIG)
+    cli = MultiServerMCPClient(MCP_CONFIG)
+    # Probe each server; cache tools so first request is fast.
+    for srv in MCP_CONFIG.keys():
+        try:
+            async with cli.session(srv) as s:
+                tools = await _get_tools(s)
+                names = [getattr(t, "name", "") for t in tools]
+                _tool_cache[srv] = tools
+                print(f"[OK] {srv} tools:", names)
+        except Exception as e:
+            print(f"[FAIL] {srv} {type(e).__name__}: {e}")
+    _client_holder["client"] = cli
+    print("=== STARTUP DONE ===")
+
+@app.on_event("shutdown")
+async def _shutdown():
+    cli = _client_holder.get("client")
+    if cli:
+        with contextlib.suppress(Exception):
+            await cli.aclose()
+
+# ───────────────────────────────────────────────────────────────────────────────
+#                                 API SCHEMA
+# ───────────────────────────────────────────────────────────────────────────────
+class RouteIn(BaseModel):
+    query: str
+    extra: Optional[Dict[str, Any]] = None
+    target: Optional[str] = None       # "hotel" / "air" / "tdna"
+    targets: Optional[List[str]] = None
+
+class RouteOut(BaseModel):
+    tool: str = "route_query_tool"
+    targets: List[str]
+    routed_by: str
+    answer: Any
+    answers_by_target: Optional[Dict[str, Any]] = None
+    errors: Optional[Dict[str, Any]] = None
+
+class AgentIn(BaseModel):
+    query: str
+    extra: Optional[Dict[str, Any]] = None
+    session_id: str = "default"
+    max_iters: int = 1                 # simple single-iteration demo (can extend)
+    parallel_cap: int = 3
+    autonomy: bool = True
+
+class AgentOut(BaseModel):
+    tool: str = "agent_query_tool"
+    session_id: str
+    iterations: int
+    final_answer: Any
+    observations: List[Dict[str, Any]]
+    autonomy: bool
+
+# ───────────────────────────────────────────────────────────────────────────────
+#                                   ENDPOINTS
+# ───────────────────────────────────────────────────────────────────────────────
+@app.post("/route_query", response_model=RouteOut)
+async def route_query(inp: RouteIn = Body(...)):
+    q, extra = inp.query, inp.extra
+    # Decide which servers to hit
+    if inp.targets:
+        targets, how = [t for t in inp.targets if t in MCP_CONFIG], "hint:list"
+    elif inp.target in MCP_CONFIG:
+        targets, how = [inp.target], "hint:single"
+    else:
+        targets, how = heuristic_route(q), "heuristic"
+
+    results: Dict[str, Any] = {}
+    errors: Dict[str, Any] = {}
+
+    async def one(server: str):
+        # Build a neutral payload; schema builder will adapt
+        base_payload = {"qquery": q}
+        if isinstance(extra, dict):
+            base_payload.update(extra)
+        res = await mcp_call(server, base_payload, preferred_tool=PREFERRED_TOOL_NAME.get(server))
+        return server, res
+
+    if len(targets) == 1:
+        srv, res = await one(targets[0])
+        if isinstance(res, dict) and res.get("_mcp_error"):
+            errors[srv] = res
+        else:
+            results[srv] = res
+    else:
+        outs = await asyncio.gather(*[one(s) for s in targets], return_exceptions=False)
+        for srv, res in outs:
+            if isinstance(res, dict) and res.get("_mcp_error"):
+                errors[srv] = res
+            else:
+                results[srv] = res
+
+    answer = compose(q, results) if len(results) > 1 else next(iter(results.values()), None)
+    status = 200 if not errors else 502
+    return RouteOut(
+        targets=targets, routed_by=how, answer=answer,
+        answers_by_target=(results or None), errors=(errors or None)
+    ), status
+
+@app.post("/agent_query", response_model=AgentOut)
+async def agent_query(inp: AgentIn = Body(...)):
+    q, extra, sid = inp.query, inp.extra, inp.session_id
+    mem_add(sid, "user", q)
+
+    # Simple “agent”: choose targets once and run them in parallel.
+    targets = heuristic_route(q)[:inp.parallel_cap]
+    observations: List[Dict[str, Any]] = []
+
+    async def one(server: str):
+        base_payload = {"qquery": q}
+        if isinstance(extra, dict):
+            base_payload.update(extra)
+        res = await mcp_call(server, base_payload, preferred_tool=PREFERRED_TOOL_NAME.get(server))
+        if isinstance(res, dict) and res.get("_mcp_error"):
+            return {"step": {"target": server}, "error": res}
+        return {"step": {"target": server}, "result": res}
+
+    batch = await asyncio.gather(*[one(s) for s in targets], return_exceptions=False)
+    observations.extend(batch)
+
+    latest: Dict[str, Any] = {}
+    for ob in reversed(batch):
+        t = ob["step"]["target"]
+        if "result" in ob and t not in latest:
+            latest[t] = ob["result"]
+    final_answer = compose(q, latest) if latest else "No result."
+
+    any_err = any("error" in ob for ob in observations)
+    status = 200 if not any_err else 502
+    mem_add(sid, "assistant", final_answer)
+    return AgentOut(
+        session_id=sid, iterations=len(batch),
+        final_answer=final_answer, observations=observations[-6:],
+        autonomy=inp.autonomy
+    ), status
+
+# Utilities
+@app.post("/memory/clear")
+def memory_clear(payload: Dict[str, Any] = Body(...)):
+    sid = payload.get("session_id", "default"); mem_clear(sid)
+    return JSONResponse({"ok": True, "session_id": sid})
+
+@app.get("/memory/show")
+def memory_show(session_id: str = "default"):
+    return JSONResponse({"session_id": session_id, "history": mem_get(session_id, 0)})
+
+@app.get("/healthz")
+def healthz(): return {"ok": True}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=9000)
