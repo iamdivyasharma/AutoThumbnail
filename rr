@@ -1,0 +1,355 @@
+# orchestrator_fastapi_mcp_httpx.py
+from __future__ import annotations
+import os, json, asyncio, hashlib
+from typing import Dict, Any, Optional, List, Tuple
+from collections import defaultdict, deque
+from time import time
+
+import httpx  # pip install httpx
+from fastapi import FastAPI, Body
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from fastapi_mcp import FastApiMCP
+
+import boto3
+from botocore.config import Config
+
+# ==================== Config ====================
+ORCH_PORT = int(os.getenv("ORCH_PORT", "9000"))
+
+# Put your *proxy* MCP URLs here (copy from your browser up to /proxy):
+# Examples:
+#   https://<BASE>/proxy/9001/mcp
+#   https://<BASE>/proxy/9002/mcp
+#   https://<BASE>/proxy/9003/mcp
+HOTEL_MCP_URL = os.getenv("HOTEL_MCP_URL", "https://<BASE>/proxy/9001/mcp")
+AIR_MCP_URL   = os.getenv("AIR_MCP_URL",   "https://<BASE>/proxy/9002/mcp")
+TDNA_MCP_URL  = os.getenv("TDNA_MCP_URL",  "https://<BASE>/proxy/9003/mcp")
+
+# Map our logical services → MCP server URL + tool name + input field
+SERVICES: Dict[str, Dict[str, str]] = {
+    "hotel": {"url": HOTEL_MCP_URL, "tool": "hotel_query_tool", "field": os.getenv("HOTEL_FIELD", "qquery")},
+    "air":   {"url": AIR_MCP_URL,   "tool": "air_query_tool",   "field": os.getenv("AIR_FIELD",   "qquery")},
+    "tdna":  {"url": TDNA_MCP_URL,  "tool": "tdna_query_tool",  "field": os.getenv("TDNA_FIELD",  "qquery")},
+}
+
+# AWS Bedrock Claude (routing + composing)
+BEDROCK_REGION    = os.getenv("BEDROCK_REGION", "us-east-1")
+CLAUDE_MODEL_ID   = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0")
+ANTHROPIC_VERSION = "bedrock-2023-05-31"
+bedrock = boto3.client(
+    "bedrock-runtime",
+    region_name=BEDROCK_REGION,
+    config=Config(connect_timeout=5, read_timeout=30, retries={"max_attempts": 2, "mode": "standard"}),
+)
+
+# ==================== Tiny MCP HTTP client (JSON-RPC over HTTP) ====================
+class MCPHTTPClient:
+    """
+    Minimal MCP client for 'streamable_http' servers (FastAPI MCP at /mcp).
+    Implements JSON-RPC:
+      - tools/list
+      - tools/call
+    """
+
+    def __init__(self, base_url: str, timeout: float = 30.0, headers: Optional[Dict[str, str]] = None):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self._id = 0
+        self.headers = {"content-type": "application/json"}
+        if headers: self.headers.update(headers)
+
+    def _next_id(self) -> str:
+        self._id += 1
+        return str(self._id)
+
+    async def _rpc(self, method: str, params: Dict[str, Any]) -> Any:
+        payload = {"jsonrpc": "2.0", "id": self._next_id(), "method": method, "params": params}
+        async with httpx.AsyncClient(timeout=self.timeout, verify=True) as client:
+            r = await client.post(self.base_url, json=payload, headers=self.headers)
+            r.raise_for_status()
+            data = r.json()
+        if "error" in data:
+            raise RuntimeError(f"RPC error: {data['error']}")
+        return data.get("result")
+
+    async def tools_list(self) -> Dict[str, Any]:
+        return await self._rpc("tools/list", {})
+
+    async def tools_call(self, name: str, arguments: Dict[str, Any]) -> Any:
+        # Some servers expect {"name": <tool>, "arguments": {...}}
+        return await self._rpc("tools/call", {"name": name, "arguments": arguments})
+
+# one client per downstream bot
+MCP_CLIENTS: Dict[str, MCPHTTPClient] = {
+    svc: MCPHTTPClient(info["url"]) for svc, info in SERVICES.items()
+}
+
+# ==================== Memory & Cache ====================
+MEMORY: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"history": deque(maxlen=20), "created": time()})
+def mem_append(sid: str, role: str, content: Any): MEMORY[sid]["history"].append({"role": role, "content": content, "ts": time()})
+def mem_get(sid: str, k: int = 10) -> List[Dict[str, Any]]:
+    hist = list(MEMORY[sid]["history"]); return hist[-k:] if k else hist
+def mem_clear(sid: str): MEMORY.pop(sid, None)
+
+CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "300"))
+_CACHE: Dict[str, Tuple[float, Any]] = {}
+def _h(obj: Any) -> str: return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
+def cache_get(k: str):
+    rec = _CACHE.get(k)
+    if not rec: return None
+    exp, val = rec
+    if exp < time(): _CACHE.pop(k, None); return None
+    return val
+def cache_set(k: str, v: Any, ttl: int = CACHE_TTL_SEC): _CACHE[k] = (time()+ttl, v)
+
+# ==================== Bedrock helpers ====================
+def _invoke_bedrock(body: dict) -> dict:
+    resp = bedrock.invoke_model(modelId=CLAUDE_MODEL_ID, body=json.dumps(body))
+    return json.loads(resp["body"].read().decode("utf-8"))
+
+def claude_json(system: str, user_obj: dict, max_tokens=256, temperature=0):
+    payload = _invoke_bedrock({
+        "anthropic_version": ANTHROPIC_VERSION,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "system": system,
+        "messages": [{"role":"user","content":[{"type":"text","text": json.dumps(user_obj)}]}],
+    })
+    return json.loads(payload["content"][0]["text"])
+
+def claude_text(system: str, user_obj: dict, max_tokens=512, temperature=0) -> str:
+    payload = _invoke_bedrock({
+        "anthropic_version": ANTHROPIC_VERSION,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "system": system,
+        "messages": [{"role":"user","content":[{"type":"text","text": json.dumps(user_obj)}]}],
+    })
+    return payload["content"][0]["text"].strip()
+
+# ==================== Prompts ====================
+ROUTER_SYSTEM = (
+    "You are a strict router for a multi-tool system. Tools: air, hotel, tdna. "
+    'Return ONLY JSON like {"targets":["air"|"hotel"|"tdna", ...]}'
+)
+COMPOSER_SYSTEM = (
+    "You are a response composer. Combine multiple tool answers (air/hotel/tdna) "
+    "into one concise reply. Be actionable; mention conflicts briefly if any."
+)
+PLANNER_SYSTEM = (
+    "You are an orchestration planner. Tools: air, hotel, tdna. "
+    'Return ONLY JSON: {"steps":[{"target":"air"|"hotel"|"tdna","input":"<text>"}...],'
+    '"finish":false,"final_answer":""}. Prefer parallel independent steps; use memory.'
+)
+FINISHER_SYSTEM = (
+    'If observations + memory satisfy the goal, return {"finish": true, "final_answer": "..."} '
+    'else {"finish": false}.'
+)
+
+# ==================== Downstream MCP calls ====================
+async def call_backend(target: str, query: str, extra: Optional[Dict[str, Any]]):
+    svc = SERVICES[target]
+    client = MCP_CLIENTS[target]
+    payload = {svc["field"]: query}
+    if isinstance(extra, dict): payload.update(extra)
+
+    ckey = f"bot:{target}:{_h({'q':query,'x':extra})}"
+    hit = cache_get(ckey)
+    if hit is not None: return hit
+
+    try:
+        # direct MCP JSON-RPC call
+        result = await client.tools_call(name=svc["tool"], arguments=payload)
+        # Normalize typical shapes
+        if isinstance(result, dict):
+            val = result.get("answer") or result.get("result") or result.get("output") or result.get("content") or result
+        else:
+            val = result
+        cache_set(ckey, val)
+        return val
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+def compose_final(user_query: str, answers_by_target: Dict[str, Any]) -> str:
+    if not answers_by_target: return ""
+    ckey = f"compose:{_h({'q':user_query,'a':answers_by_target})}"
+    hit = cache_get(ckey)
+    if hit is not None: return hit
+    try:
+        txt = claude_text(COMPOSER_SYSTEM, {"user_query": user_query, "answers_by_target": answers_by_target}, max_tokens=512)
+        cache_set(ckey, txt)
+        return txt
+    except Exception:
+        parts = [f"{k}: {v}" for k, v in answers_by_target.items()]
+        txt = " | ".join(map(str, parts))
+        cache_set(ckey, txt)
+        return txt
+
+def llm_decide_targets(query: str) -> List[str]:
+    try:
+        out = claude_json(ROUTER_SYSTEM, {"query": query}, max_tokens=128)
+        picks = [t for t in out.get("targets", []) if t in SERVICES]
+        return picks or ["hotel"]
+    except Exception:
+        return ["hotel"]
+
+# ==================== FastAPI + MCP exposure ====================
+app = FastAPI(title="Orchestrator (Pure MCP over HTTP)")
+
+class RouteIn(BaseModel):
+    query: str
+    extra: Optional[Dict[str, Any]] = None
+    target: Optional[str] = None
+    targets: Optional[List[str]] = None
+
+class RouteOut(BaseModel):
+    tool: str = "route_query_tool"
+    targets: List[str]
+    routed_by: str
+    answer: Any
+    answers_by_target: Optional[Dict[str, Any]] = None
+    errors: Optional[Dict[str, str]] = None
+
+@app.post("/route_query", operation_id="route_query_tool", response_model=RouteOut)
+async def route_query(inp: RouteIn = Body(...)):
+    q, extra = inp.query, inp.extra
+    if inp.targets:
+        targets, routed_by = [t for t in inp.targets if t in SERVICES], "hint:list"
+    elif inp.target in SERVICES:
+        targets, routed_by = [inp.target], "hint:single"
+    elif inp.target == "both":
+        # common shortcut: hotel + air
+        targets, routed_by = ["hotel", "air"], "hint:both"
+    else:
+        targets, routed_by = llm_decide_targets(q), "llm"
+
+    results, errors = {}, {}
+    if len(targets) <= 1:
+        tgt = targets[0] if targets else "hotel"
+        results[tgt] = await call_backend(tgt, q, extra)
+    else:
+        coros = [call_backend(t, q, extra) for t in targets]
+        outs = await asyncio.gather(*coros, return_exceptions=True)
+        for t, out in zip(targets, outs):
+            if isinstance(out, Exception):
+                errors[t] = f"{type(out).__name__}: {out}"
+            else:
+                results[t] = out
+
+    answer = compose_final(q, results) if len(results) > 1 else next(iter(results.values()), "")
+    return RouteOut(
+        targets=targets, routed_by=routed_by, answer=answer,
+        answers_by_target=(results if len(results) > 1 else None),
+        errors=(errors or None)
+    )
+
+# (Optional) simple agentic loop — minimal version without LangChain
+class AgentIn(BaseModel):
+    query: str
+    extra: Optional[Dict[str, Any]] = None
+    session_id: str = "default"
+    max_iters: int = 2           # keep small for simplicity
+    parallel_cap: int = 2        # limit fan-out per step
+    autonomy: bool = True
+
+class AgentOut(BaseModel):
+    tool: str = "agent_query_tool"
+    session_id: str
+    iterations: int
+    final_answer: Any
+    observations: List[Dict[str, Any]]
+    autonomy: bool
+
+@app.post("/agent_query", operation_id="agent_query_tool", response_model=AgentOut)
+async def agent_query(inp: AgentIn = Body(...)):
+    q, extra, sid = inp.query, inp.extra, inp.session_id
+    mem_append(sid, "user", q)
+    observations: List[Dict[str, Any]] = []
+    final_answer = None
+
+    async def execute(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        steps = [s for s in steps if s.get("target") in SERVICES][:inp.parallel_cap]
+        if not steps: return []
+        outs = await asyncio.gather(
+            *[call_backend(s["target"], s.get("input", q), extra) for s in steps],
+            return_exceptions=True
+        )
+        batch: List[Dict[str, Any]] = []
+        for s, out in zip(steps, outs):
+            if isinstance(out, Exception):
+                batch.append({"step": s, "error": f"{type(out).__name__}: {out}"})
+            else:
+                batch.append({"step": s, "result": out})
+        return batch
+
+    for _ in range(max(1, min(inp.max_iters, 6))):
+        # very small “planner”
+        try:
+            plan = claude_json(
+                "You plan tool calls. Return ONLY JSON: {\"steps\":[{\"target\":\"air|hotel|tdna\",\"input\":\"...\"}],\"finish\":false,\"final_answer\":\"\"}",
+                {"user_query": q, "memory": mem_get(sid, 6), "observations": observations[-2:]},
+                max_tokens=256
+            )
+        except Exception:
+            targets = llm_decide_targets(q)
+            plan = {"steps":[{"target": targets[0] if targets else "hotel", "input": q}], "finish": False, "final_answer": ""}
+
+        if plan.get("finish") and plan.get("final_answer"):
+            final_answer = plan["final_answer"]; break
+
+        steps = plan.get("steps", [])
+        if not steps: break
+
+        batch = await execute(steps)
+        observations.extend(batch)
+
+        if not inp.autonomy:
+            latest = {ob["step"]["target"]: ob.get("result") for ob in observations if "result" in ob}
+            final_answer = compose_final(q, latest) if latest else "No result."
+            break
+
+        try:
+            fin = claude_json(
+                'If observations+memory satisfy the goal, return {"finish": true, "final_answer": "..."} else {"finish": false}.',
+                {"user_query": q, "memory": mem_get(sid, 6), "observations": batch}, max_tokens=196
+            )
+        except Exception:
+            fin = {"finish": False}
+        if fin.get("finish"):
+            final_answer = fin.get("final_answer"); break
+
+    if final_answer is None:
+        latest = {}
+        for ob in reversed(observations):
+            tgt = ob.get("step",{}).get("target")
+            if tgt and "result" in ob and tgt not in latest:
+                latest[tgt] = ob["result"]
+        final_answer = compose_final(q, latest) if latest else "No result."
+
+    mem_append(sid, "assistant", final_answer)
+    return AgentOut(
+        session_id=sid,
+        iterations=min(len(observations), inp.max_iters),
+        final_answer=final_answer,
+        observations=observations[-6:],
+        autonomy=inp.autonomy
+    )
+
+# Optional memory utils
+@app.post("/memory/clear")
+def memory_clear(payload: Dict[str, Any] = Body(...)):
+    sid = payload.get("session_id","default"); mem_clear(sid)
+    return JSONResponse({"ok": True, "session_id": sid})
+
+@app.get("/memory/show")
+def memory_show(session_id: str = "default"):
+    return JSONResponse({"session_id": session_id, "history": mem_get(session_id, 0)})
+
+# Expose orchestrator itself as an MCP server at /mcp
+mcp_server = FastApiMCP(app, name="orchestrator-mcp")
+mcp_server.mount()
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=ORCH_PORT)
