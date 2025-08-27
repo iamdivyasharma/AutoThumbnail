@@ -1,0 +1,347 @@
+# orchestrator_fastapi_mcp_debug.py
+from __future__ import annotations
+import json, hashlib, asyncio, contextlib
+from typing import Dict, Any, List, Optional, Tuple
+from collections import defaultdict, deque
+from time import time
+
+from fastapi import FastAPI, Body
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+# ======== Hardcoded MCP server endpoints (NO envs) ========
+# Each bot must expose its MCP endpoint at /mcp
+RAW_MCP_CONFIG: Dict[str, dict] = {
+    "hotel": {"url": "http://127.0.0.1:9001/mcp"},
+    "air":   {"url": "http://127.0.0.1:9002/mcp"},
+    "tdna":  {"url": "http://127.0.0.1:9003/mcp"},
+}
+
+# Services mapping: orchestrator tool targets -> MCP server key, tool name, and payload field
+SERVICES: Dict[str, Dict[str, str]] = {
+    "hotel": {"server": "hotel", "tool": "hotel_query_tool", "field": "qquery"},
+    "air":   {"server": "air",   "tool": "air_query_tool",   "field": "qquery"},
+    "tdna":  {"server": "tdna",  "tool": "tdna_query_tool",  "field": "qquery"},
+}
+
+# ======== LLM (stubbed text-only; swap with your own if needed) ========
+# If you want to keep Bedrock/Claude, re-wire here. For now we keep simple rules to avoid external deps.
+def simple_route_decider(q: str) -> List[str]:
+    s = q.lower()
+    picks = []
+    if any(w in s for w in ("flight","air","airline","pnr","fare","seat","airport")): picks.append("air")
+    if any(w in s for w in ("hotel","room","stay","booking","reservation","amenities","check-in","check out")): picks.append("hotel")
+    if any(w in s for w in ("tdna","dna","genome","variant","gene","sequence","omics")): picks.append("tdna")
+    if picks: return sorted(set(picks), key=picks.index)
+    return ["hotel"]
+
+def simple_compose(user_query: str, answers: Dict[str, Any]) -> str:
+    parts = []
+    for k in ("hotel","air","tdna"):
+        if k in answers:
+            parts.append(f"{k}: {answers[k]}")
+    return " | ".join(map(str, parts)) if parts else ""
+
+# ======== Memory & Cache ========
+MEMORY: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"history": deque(maxlen=20), "created": time()})
+def mem_append(sid: str, role: str, content: Any): MEMORY[sid]["history"].append({"role": role, "content": content, "ts": time()})
+def mem_get(sid: str, k: int = 10) -> List[Dict[str, Any]]:
+    hist = list(MEMORY[sid]["history"]); return hist[-k:] if k else hist
+def mem_clear(sid: str): MEMORY.pop(sid, None)
+
+CACHE_TTL_SEC = 300
+_CACHE: Dict[str, Tuple[float, Any]] = {}
+def _h(obj: Any) -> str: return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
+def cache_get(k: str):
+    rec = _CACHE.get(k)
+    if not rec: return None
+    exp, val = rec
+    if exp < time(): _CACHE.pop(k, None); return None
+    return val
+def cache_set(k: str, v: Any, ttl: int = CACHE_TTL_SEC): _CACHE[k] = (time()+ttl, v)
+
+# ======== Transport normalization (no envs) ========
+ALLOWED_TRANSPORTS = {"stdio", "sse", "websocket", "streamable_http"}
+TRANSPORT_ALIASES = {
+    "http": "streamable_http",
+    "rest": "streamable_http",
+    "web": "streamable_http",
+    "stream": "streamable_http",
+    "streamable_http": "streamable_http",
+}
+PREFERRED_TRANSPORT = "streamable_http"  # <- hardcoded
+
+def _sanitize_url(u: str) -> str:
+    if not isinstance(u, str):
+        raise ValueError(f"Bad URL type: {type(u)}")
+    u = u.strip()
+
+    # fix common typos
+    if u.startswith("lhttp://"): u = "http://"  + u[len("lhttp://"):]
+    if u.startswith("lhttps://"): u = "https://" + u[len("lhttps://"):]
+
+    # ensure scheme
+    if not (u.startswith("http://") or u.startswith("https://")):
+        u = "http://" + u
+
+    # ensure /mcp suffix
+    if not u.rstrip("/").endswith("/mcp"):
+        u = u.rstrip("/") + "/mcp"
+    return u
+
+def normalize_servers(cfg: dict) -> dict:
+    out = {}
+    t = TRANSPORT_ALIASES.get(PREFERRED_TRANSPORT, PREFERRED_TRANSPORT)
+    if t not in ALLOWED_TRANSPORTS:
+        raise ValueError(f"Invalid transport '{t}' (allowed: {sorted(ALLOWED_TRANSPORTS)})")
+    for name, val in cfg.items():
+        if isinstance(val, str):
+            url = _sanitize_url(val)
+            out[name] = {"transport": {"type": t, "url": url}}
+        elif isinstance(val, dict):
+            url = _sanitize_url(val.get("url") or val.get("transport", {}).get("url", ""))
+            tt = TRANSPORT_ALIASES.get(val.get("transport", {}).get("type", t), t)
+            if tt not in ALLOWED_TRANSPORTS:
+                raise ValueError(f"Invalid transport '{tt}' for '{name}' (allowed: {sorted(ALLOWED_TRANSPORTS)})")
+            out[name] = {"transport": {"type": tt, "url": url}}
+        else:
+            raise TypeError(f"Bad server config for '{name}': {val!r}")
+    return out
+
+MCP_CONFIG = normalize_servers(RAW_MCP_CONFIG)
+
+# ======== MCP client (with startup probe + holder) ========
+from langchain_mcp_adapters.clients.multi_server import MultiServerMCPClient
+
+app = FastAPI(title="Orchestrator (MCP debug)")
+
+_client_holder: Dict[str, Any] = {"client": None}
+
+async def _get_tools_any(session):
+    for attr in ("get_tools", "get_all_tools"):
+        fn = getattr(session, attr, None)
+        if callable(fn):
+            try:
+                res = await fn()
+            except TypeError:
+                res = fn()
+            return [t for _, L in res.items() for t in L] if isinstance(res, dict) else list(res)
+    raise RuntimeError("No get_tools/get_all_tools on session")
+
+@app.on_event("startup")
+async def _startup_probe():
+    print("=== STARTUP DIAG ===")
+    print("PREFERRED_TRANSPORT =", PREFERRED_TRANSPORT)
+    print("RAW_MCP_CONFIG      =", RAW_MCP_CONFIG)
+    print("MCP_CONFIG          =", MCP_CONFIG)
+
+    client = MultiServerMCPClient(MCP_CONFIG)
+    # probe tool listing for each server
+    for server in MCP_CONFIG.keys():
+        try:
+            async with client.session(server) as sess:
+                tools = await _get_tools_any(sess)
+                names = [getattr(t, "name", "") for t in tools]
+                print(f"[OK] {server}: tools = {names}")
+        except Exception as e:
+            print(f"[FAIL] {server}: {type(e).__name__}: {e}")
+    _client_holder["client"] = client
+    print("=== STARTUP DONE ===")
+
+@app.on_event("shutdown")
+async def _shutdown_client():
+    cli = _client_holder.get("client")
+    if cli:
+        with contextlib.suppress(Exception):
+            await cli.aclose()
+
+def get_client() -> MultiServerMCPClient:
+    cli = _client_holder.get("client")
+    if cli is None:
+        raise RuntimeError("MCP client not initialized")
+    return cli
+
+# ======== MCP invoke helpers ========
+def _flatten_exc(e: BaseException) -> str:
+    try:
+        # Python 3.11 ExceptionGroup friendly
+        if getattr(e, "__class__", None) and e.__class__.__name__ == "ExceptionGroup":
+            return " | ".join(_flatten_exc(sub) for sub in getattr(e, "exceptions", []) or [])
+        if hasattr(e, "exceptions"):
+            return " | ".join(_flatten_exc(sub) for sub in getattr(e, "exceptions", []) or [])
+        return f"{type(e).__name__}: {e}"
+    except Exception as ee:
+        return f"{type(e).__name__}: {e} (flatten_err:{ee})"
+
+async def mcp_invoke(server: str, tool_name: str, payload: dict):
+    try:
+        async with get_client().session(server) as sess:
+            tools = await _get_tools_any(sess)
+            tool = next((t for t in tools if getattr(t, "name", "") == tool_name), None)
+            if tool is None:
+                raise RuntimeError(f"Tool {tool_name!r} not found on server {server!r}")
+            ainvoke = getattr(tool, "ainvoke", None)
+            if callable(ainvoke):
+                try:
+                    out = await tool.ainvoke(payload)
+                except Exception:
+                    out = await tool.ainvoke({"input": payload})
+            else:
+                loop = asyncio.get_running_loop()
+                def _call():
+                    try: return tool.invoke(payload)
+                    except Exception: return tool.invoke({"input": payload})
+                out = await loop.run_in_executor(None, _call)
+        if isinstance(out, dict):
+            return out.get("answer") or out.get("result") or out.get("output") or out.get("content") or out
+        return out
+    except Exception as e:
+        return f"MCP[{server}:{tool_name}] error: { _flatten_exc(e) }"
+
+async def mcp_call_backend(target: str, query: str, extra: Optional[Dict[str, Any]]):
+    svc = SERVICES[target]
+    server, tool, field = svc["server"], svc["tool"], svc["field"]
+    payload = {field: query}
+    if isinstance(extra, dict): payload.update(extra)
+
+    # DEBUG: show the exact config used per call
+    print(f"[mcp_call_backend] target={target} server={server} tool={tool} payload_keys={list(payload.keys())}")
+    print(f"[mcp_call_backend] server_cfg={MCP_CONFIG.get(server)}")
+
+    # simple cache
+    ckey = f"bot:{server}:{tool}:{_h({'q':query,'x':extra})}"
+    hit = cache_get(ckey)
+    if hit is not None:
+        print(f"[mcp_call_backend] cache HIT {server}:{tool}")
+        return hit
+
+    val = await mcp_invoke(server, tool, payload)
+    cache_set(ckey, val)
+    print(f"[mcp_call_backend] result type={type(val).__name__}")
+    return val
+
+# ======== API models ========
+class RouteIn(BaseModel):
+    query: str
+    extra: Optional[Dict[str, Any]] = None
+    target: Optional[str] = None
+    targets: Optional[List[str]] = None
+
+class RouteOut(BaseModel):
+    tool: str = "route_query_tool"
+    targets: List[str]
+    routed_by: str
+    answer: Any
+    answers_by_target: Optional[Dict[str, Any]] = None
+    errors: Optional[Dict[str, str]] = None
+
+class AgentIn(BaseModel):
+    query: str
+    extra: Optional[Dict[str, Any]] = None
+    session_id: str = "default"
+    max_iters: int = 3
+    parallel_cap: int = 3
+    autonomy: bool = True
+
+class AgentOut(BaseModel):
+    tool: str = "agent_query_tool"
+    session_id: str
+    iterations: int
+    final_answer: Any
+    observations: List[Dict[str, Any]]
+    autonomy: bool
+
+# ======== HTTP endpoints ========
+@app.post("/route_query", operation_id="route_query_tool", response_model=RouteOut)
+async def route_query(inp: RouteIn = Body(...)):
+    q, extra = inp.query, inp.extra
+    # routing
+    if inp.targets:
+        targets, routed_by = [t for t in inp.targets if t in SERVICES], "hint:list"
+    elif inp.target in SERVICES:
+        targets, routed_by = [inp.target], "hint:single"
+    elif inp.target == "both":
+        targets, routed_by = ["hotel", "air"], "hint:both"
+    else:
+        targets, routed_by = simple_route_decider(q), "heuristic"
+
+    results, errors = {}, {}
+    if len(targets) <= 1:
+        tgt = targets[0] if targets else "hotel"
+        results[tgt] = await mcp_call_backend(tgt, q, extra)
+    else:
+        coros = [mcp_call_backend(t, q, extra) for t in targets]
+        outs = await asyncio.gather(*coros, return_exceptions=True)
+        for t, out in zip(targets, outs):
+            if isinstance(out, Exception):
+                errors[t] = _flatten_exc(out)
+            else:
+                results[t] = out
+
+    answer = simple_compose(q, results) if len(results) > 1 else next(iter(results.values()), "")
+    return RouteOut(
+        targets=targets, routed_by=routed_by, answer=answer,
+        answers_by_target=(results if len(results) > 1 else None),
+        errors=(errors or None)
+    )
+
+@app.post("/agent_query", operation_id="agent_query_tool", response_model=AgentOut)
+async def agent_query(inp: AgentIn = Body(...)):
+    q, extra, sid = inp.query, inp.extra, inp.session_id
+    mem_append(sid, "user", q)
+    observations: List[Dict[str, Any]] = []
+    final_answer = None
+
+    async def execute(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        steps = [s for s in steps if s.get("target") in SERVICES][:inp.parallel_cap]
+        if not steps: return []
+        outs = await asyncio.gather(
+            *[mcp_call_backend(s["target"], s.get("input", q), extra) for s in steps],
+            return_exceptions=True
+        )
+        batch: List[Dict[str, Any]] = []
+        for s, out in zip(steps, outs):
+            if isinstance(out, Exception):
+                batch.append({"step": s, "error": _flatten_exc(out)})
+            else:
+                batch.append({"step": s, "result": out})
+        return batch
+
+    # very simple 1-2 loop planner substitute (no external LLM)
+    steps = [{"target": t, "input": q} for t in simple_route_decider(q)]
+    batch = await execute(steps)
+    observations.extend(batch)
+
+    latest = {}
+    for ob in reversed(batch):
+        t = ob.get("step",{}).get("target")
+        if t and "result" in ob and t not in latest: latest[t] = ob["result"]
+    final_answer = simple_compose(q, latest) if latest else "No result."
+
+    mem_append(sid, "assistant", final_answer)
+    return AgentOut(
+        session_id=sid,
+        iterations=len(batch),
+        final_answer=final_answer,
+        observations=observations[-6:],
+        autonomy=inp.autonomy
+    )
+
+# Memory utils
+@app.post("/memory/clear")
+def memory_clear(payload: Dict[str, Any] = Body(...)):
+    sid = payload.get("session_id","default"); mem_clear(sid)
+    return JSONResponse({"ok": True, "session_id": sid})
+
+@app.get("/memory/show")
+def memory_show(session_id: str = "default"):
+    return JSONResponse({"session_id": session_id, "history": mem_get(session_id, 0)})
+
+# Health
+@app.get("/healthz")
+def healthz(): return {"ok": True}
+
+if __name__ == "__main__":
+    import uvicorn
+    # Orchestrator on 9000
+    uvicorn.run(app, host="0.0.0.0", port=9000)
