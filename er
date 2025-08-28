@@ -1,0 +1,31 @@
+import shlex
+from fastmcp import Client as MCPClient
+
+async def call_backend(target: str, query: str, extra: Optional[Dict[str, Any]]):
+    svc = SERVICES[target]
+    payload = {svc["field"]: query}
+    if isinstance(extra, dict):
+        payload.update(extra)
+
+    # Make sure we pass a LIST, not a single string
+    raw = svc["cmd"]  # e.g., "python servers/hotel_mcp_server.py"
+    cmd = raw if isinstance(raw, (list, tuple)) else shlex.split(raw)
+
+    # ✅ fastmcp 2.11.2: pass command positionally; no 'command=' kwarg
+    #    Transport will be inferred from type(list) → stdio. If you want to be explicit:
+    #    async with MCPClient(cmd, "stdio") as client:
+    async with MCPClient(cmd) as client:
+        result = await client.call_tool(svc["tool"], payload)
+
+    # Normalize typical shapes
+    if isinstance(result, dict):
+        return (result.get("answer")
+                or result.get("result")
+                or result.get("output")
+                or result.get("content")
+                or result)
+    # Content helpers (some fastmcp builds attach these)
+    return (getattr(result, "json", None)
+            or getattr(result, "data", None)
+            or getattr(result, "text", None)
+            or result)
