@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""
+hotel_mcp.py — MCP stdio server using fastmcp (decorator-based).
+pip install fastmcp
+"""
+
+import os, sys, asyncio, logging
+from typing import Any, Dict
+
+# ---- Logging to stderr so we don't break MCP's stdout framing ----
+LOG_LEVEL = logging.DEBUG if os.getenv("DEBUG","").lower() in ("1","true","yes","on") else logging.INFO
+logging.basicConfig(stream=sys.stderr, level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | hotel-mcp | %(message)s")
+log = logging.getLogger("hotel-mcp")
+
+# Your business logic
+from bot.hotel_bot import hotel_qa_chain  # make sure this import works
+
+try:
+    from fastmcp import FastMCP
+except ImportError as e:
+    log.error("fastmcp not installed. Try: pip install fastmcp  (error: %s)", e)
+    raise
+
+mcp = FastMCP("hotel-mcp")
+
+def _redact(d: Any, keys=("api_key","token","password","secret","authorization")) -> Any:
+    try:
+        keyset = {k.strip().lower() for k in os.getenv("REDACT_KEYS", ",".join(keys)).split(",") if k.strip()}
+        if isinstance(d, dict):
+            out = {}
+            for k, v in d.items():
+                out[k] = "***REDACTED***" if str(k).lower() in keyset else _redact(v, keyset)
+            return out
+        if isinstance(d, list):
+            return [_redact(x, keyset) for x in d]
+        return d
+    except Exception:
+        return d
+
+async def _maybe_await(x):
+    if asyncio.iscoroutine(x):
+        return await x
+    return x
+
+@mcp.tool(
+    name="hotel_query_tool",
+    description="Query hotel availability/prices or QA about hotels. Input field: qquery (string).",
+    schema={
+        "type": "object",
+        "properties": {"qquery": {"type": "string"}},
+        "required": ["qquery"],
+        "additionalProperties": True,
+    },
+)
+async def hotel_query_tool(qquery: str) -> Dict[str, Any]:
+    """
+    The orchestrator sends: {"qquery": "<user text>", ...}
+    Return shape can include 'answer' which the orchestrator extracts.
+    """
+    log.debug("hotel_query_tool called with qquery=%r", qquery)
+    try:
+        ans = await _maybe_await(hotel_qa_chain(qquery))
+        result = {"answer": f"{ans}"}
+        log.debug("hotel_query_tool result=%s", _redact(result))
+        return result
+    except Exception as e:
+        log.exception("hotel_query_tool error: %s", e)
+        return {"answer": f"ERROR: {e.__class__.__name__}: {e}"}
+
+if __name__ == "__main__":
+    # IMPORTANT: do not print to stdout; FastMCP handles stdio protocol.
+    log.info("Starting hotel-mcp (stdio)")
+    mcp.run()
