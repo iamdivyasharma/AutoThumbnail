@@ -7,20 +7,17 @@ async def call_backend(target: str, query: str, extra: Optional[Dict[str, Any]])
     if isinstance(extra, dict):
         payload.update(extra)
 
-    # Ensure we have a SINGLE STRING command (not a list)
-    raw_cmd = svc["cmd"]                     # e.g. "python tdna_mcp_server.py"
+    raw_cmd = svc["cmd"]
     cmd_str = raw_cmd if isinstance(raw_cmd, str) else shlex.join(raw_cmd)
 
-    # On fastmcp 2.11.2 either of these works (depending on your exact build):
-    # explicit transport:
-    # async with MCPClient(cmd_str, "stdio") as client:
-    async with MCPClient(cmd_str) as client:   # let it infer stdio from a plain command string
+    # Prefix with "stdio:" so the client doesn’t have to infer
+    stdio_uri = f"stdio:{cmd_str}"
+
+    async with MCPClient(stdio_uri) as client:
         result = await client.call_tool(svc["tool"], payload)
 
     if isinstance(result, dict):
-        return (result.get("answer") or result.get("result") or result.get("output")
-                or result.get("content") or result)
-    return (getattr(result, "json", None)
-            or getattr(result, "data", None)
-            or getattr(result, "text", None)
-            or result)
+        return (result.get("answer") or result.get("result") or
+                result.get("output") or result.get("content") or result)
+    return (getattr(result, "json", None) or getattr(result, "data", None) or
+            getattr(result, "text", None) or result)
