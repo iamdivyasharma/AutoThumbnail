@@ -7,13 +7,12 @@ async def call_backend(target: str, query: str, extra: Optional[Dict[str, Any]])
     if isinstance(extra, dict):
         payload.update(extra)
 
-    raw_cmd = svc["cmd"]
+    # Ensure single string command
+    raw_cmd = svc["cmd"]                          # e.g. "python -u tdna_mcp_server.py"
     cmd_str = raw_cmd if isinstance(raw_cmd, str) else shlex.join(raw_cmd)
 
-    # Prefix with "stdio:" so the client doesn’t have to infer
-    stdio_uri = f"stdio:{cmd_str}"
-
-    async with MCPClient(stdio_uri) as client:
+    # Force stdio (no inference)
+    async with MCPClient(cmd_str, "stdio") as client:
         result = await client.call_tool(svc["tool"], payload)
 
     if isinstance(result, dict):
