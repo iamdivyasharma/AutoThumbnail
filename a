@@ -1,58 +1,80 @@
-import sys, shlex
-
-def _env_cmd(key: str, default: str) -> list[str]:
-    # Split env var into argv if present; else split default
-    return shlex.split(os.getenv(key, default))
-
-PY = sys.executable  # same interpreter as orchestrator
-
-HOTEL_CMD = _env_cmd("HOTEL_MCP_CMD", f"{PY} sr/hotel_mcp_server.py")
-AIR_CMD   = _env_cmd("AIR_MCP_CMD",   f"{PY} sr/air_mcp_server.py")
-TDNA_CMD  = _env_cmd("TDNA_MCP_CMD",  f"{PY} sr/tdna_mcp_server.py")
-
-RAW_MCP_CONFIG = {
-    "hotel": {"transport": {"type": "stdio", "command": HOTEL_CMD}},
-    "air":   {"transport": {"type": "stdio", "command": AIR_CMD}},
-    "tdna":  {"transport": {"type": "stdio", "command": TDNA_CMD}},
-}
-
-import sys, shlex
-
-def _env_cmd(key: str, default: str) -> list[str]:
-    # Split env var into argv if present; else split default
-    return shlex.split(os.getenv(key, default))
-
-PY = sys.executable  # same interpreter as orchestrator
-
-HOTEL_CMD = _env_cmd("HOTEL_MCP_CMD", f"{PY} sr/hotel_mcp_server.py")
-AIR_CMD   = _env_cmd("AIR_MCP_CMD",   f"{PY} sr/air_mcp_server.py")
-TDNA_CMD  = _env_cmd("TDNA_MCP_CMD",  f"{PY} sr/tdna_mcp_server.py")
-
-RAW_MCP_CONFIG = {
-    "hotel": {"transport": {"type": "stdio", "command": HOTEL_CMD}},
-    "air":   {"transport": {"type": "stdio", "command": AIR_CMD}},
-    "tdna":  {"transport": {"type": "stdio", "command": TDNA_CMD}},
-}
 import shlex
 
-if ttype == "stdio":
-    cmd = tinfo.get("command")
-    # normalize to list[str]
-    if isinstance(cmd, str):
-        cmd = shlex.split(cmd)
-    elif isinstance(cmd, tuple):
-        cmd = list(cmd)
-    if not isinstance(cmd, list) or not cmd:
-        raise ValueError(f"Server '{server}' stdio transport requires 'command' as list[str] or str")
+def normalize_servers(cfg: dict) -> dict:
+    """Normalize RAW_MCP_CONFIG into a strict structure.
 
-    if TRACE_MCP:
-        log.debug("[HybridMCP] starting stdio server=%s cwd=%s cmd=%s", server, os.getcwd(), cmd)
+    Accepts:
+      - {"name": {"transport": {"type":"stdio","command":[...]}}}
+      - {"name": {"transport": {"type":"stdio","command":"python -m foo"}}}
+      - {"name": {"transport": "stdio", "command": "..."}}
+      - {"name": "python -m foo"}  # shortcut -> stdio
+    """
+    out = {}
+    for name, val in cfg.items():
+        # Shortcut: plain string -> stdio command
+        if isinstance(val, str):
+            cmd = shlex.split(val)
+            out[name] = {"transport": {"type": "stdio", "command": cmd}}
+            continue
 
-    opener = await _open_stdio_session(cmd)  # your helper that tries 1-arg then multi-arg
-    async with opener as (read, write):
-        sess = ClientSession(read, write)
-        await sess.initialize()
-        try:
-            yield _MCPStdIOSession(sess)
-        finally:
-            await sess.close()
+        if not isinstance(val, dict):
+            raise ValueError(f"Server '{name}' must be dict or str, got {type(val).__name__}")
+
+        tinfo = val.get("transport")
+        # allow "transport": "stdio"
+        if isinstance(tinfo, str):
+            tinfo = {"type": tinfo}
+        elif not isinstance(tinfo, dict):
+            raise ValueError(f"Server '{name}' missing/invalid 'transport'")
+
+        ttype = tinfo.get("type")
+        if ttype not in ("stdio", "sse", "websocket", "streamable_http"):
+            raise ValueError(f"Server '{name}' invalid transport type: {ttype!r}")
+
+        if ttype == "stdio":
+            cmd = tinfo.get("command", val.get("command"))
+            if isinstance(cmd, str):
+                cmd = shlex.split(cmd)
+            elif isinstance(cmd, tuple):
+                cmd = list(cmd)
+            if not isinstance(cmd, list) or not cmd:
+                raise ValueError(f"Server '{name}' stdio requires 'command' as list[str] or str; got {cmd!r}")
+            tinfo["command"] = cmd
+        else:
+            url = tinfo.get("url", val.get("url"))
+            if not isinstance(url, str) or not url:
+                raise ValueError(f"Server '{name}' transport '{ttype}' requires 'url'")
+            tinfo["url"] = url
+
+        out[name] = {"transport": tinfo}
+    return out
+
+
+
+MCP_CONFIG = normalize_servers(RAW_MCP_CONFIG)
+
+
+from mcp.client.session import ClientSession
+from mcp.client.stdio import stdio_client
+
+async def _open_stdio_session(cmd_list: list[str]):
+    import shlex as _shlex
+    cmd_str = " ".join(_shlex.quote(p) for p in cmd_list)
+    try:
+        return stdio_client(cmd_str)    # older mcp SDK: single string
+    except TypeError:
+        return stdio_client(*cmd_list)  # newer mcp SDK: multiple args
+# tinfo already normalized by normalize_servers
+cmd = tinfo["command"]                     # list[str]
+if TRACE_MCP:
+    log.debug("[HybridMCP] starting stdio server=%s cwd=%s cmd=%s", server, os.getcwd(), cmd)
+
+opener = await _open_stdio_session(cmd)    # returns async context manager
+async with opener as (read, write):
+    sess = ClientSession(read, write)
+    await sess.initialize()
+    try:
+        yield _MCPStdIOSession(sess)
+    finally:
+        await sess.close()
+
