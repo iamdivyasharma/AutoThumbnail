@@ -1,51 +1,35 @@
-import shlex
-from mcp.client.session import ClientSession
-from mcp.client.stdio import stdio_client
+import sys, shlex
 
-async def _open_stdio_session(cmd_list):
-    """
-    Supports both mcp SDK signatures:
-      - stdio_client("python -m hotel_mcp")
-      - (newer) stdio_client("/path/to/bin", "--flag")  <-- if present
-    We try 1-arg first (older), then fall back to multi-arg.
-    """
-    # 1) Older API: single string command
-    cmd_str = " ".join(shlex.quote(p) for p in cmd_list)
-    try:
-        return stdio_client(cmd_str)
-    except TypeError:
-        # 2) Newer API: multiple positional args
-        return stdio_client(*cmd_list)
+def _env_cmd(key: str, default: str) -> list[str]:
+    # Split env var into argv if present; else split default
+    return shlex.split(os.getenv(key, default))
 
+PY = sys.executable  # same interpreter as orchestrator
 
+HOTEL_CMD = _env_cmd("HOTEL_MCP_CMD", f"{PY} sr/hotel_mcp_server.py")
+AIR_CMD   = _env_cmd("AIR_MCP_CMD",   f"{PY} sr/air_mcp_server.py")
+TDNA_CMD  = _env_cmd("TDNA_MCP_CMD",  f"{PY} sr/tdna_mcp_server.py")
 
-@asynccontextmanager
-async def session(self, server: str):
-    tinfo = self.cfg[server]["transport"]
-    ttype = tinfo.get("type")
-    if ttype == "stdio":
-        cmd = tinfo.get("command")
-        if not isinstance(cmd, list) or not cmd:
-            raise ValueError(f"Server '{server}' stdio transport requires a non-empty 'command' list")
-        if TRACE_MCP:
-            log.debug("[HybridMCP] starting stdio server=%s cmd=%s", server, cmd)
+RAW_MCP_CONFIG = {
+    "hotel": {"transport": {"type": "stdio", "command": HOTEL_CMD}},
+    "air":   {"transport": {"type": "stdio", "command": AIR_CMD}},
+    "tdna":  {"transport": {"type": "stdio", "command": TDNA_CMD}},
+}
 
-        # <<<<< ONLY THIS PART CHANGED >>>>>
-        opener = await _open_stdio_session(cmd)   # returns an async context manager
-        async with opener as (read, write):
-            sess = ClientSession(read, write)
-            await sess.initialize()
-            try:
-                yield _MCPStdIOSession(sess)
-            finally:
-                await sess.close()
-        # <<<<< END CHANGE >>>>>
+import sys, shlex
 
-    else:
-        # unchanged HTTP branch
-        if not self.http_client:
-            raise RuntimeError("No HTTP-capable client configured")
-        if TRACE_MCP:
-            log.debug("[HybridMCP] delegating HTTP session for server=%s", server)
-        async with self.http_client.session(server) as s:
-            yield s
+def _env_cmd(key: str, default: str) -> list[str]:
+    # Split env var into argv if present; else split default
+    return shlex.split(os.getenv(key, default))
+
+PY = sys.executable  # same interpreter as orchestrator
+
+HOTEL_CMD = _env_cmd("HOTEL_MCP_CMD", f"{PY} sr/hotel_mcp_server.py")
+AIR_CMD   = _env_cmd("AIR_MCP_CMD",   f"{PY} sr/air_mcp_server.py")
+TDNA_CMD  = _env_cmd("TDNA_MCP_CMD",  f"{PY} sr/tdna_mcp_server.py")
+
+RAW_MCP_CONFIG = {
+    "hotel": {"transport": {"type": "stdio", "command": HOTEL_CMD}},
+    "air":   {"transport": {"type": "stdio", "command": AIR_CMD}},
+    "tdna":  {"transport": {"type": "stdio", "command": TDNA_CMD}},
+}
