@@ -33,3 +33,26 @@ RAW_MCP_CONFIG = {
     "air":   {"transport": {"type": "stdio", "command": AIR_CMD}},
     "tdna":  {"transport": {"type": "stdio", "command": TDNA_CMD}},
 }
+import shlex
+
+if ttype == "stdio":
+    cmd = tinfo.get("command")
+    # normalize to list[str]
+    if isinstance(cmd, str):
+        cmd = shlex.split(cmd)
+    elif isinstance(cmd, tuple):
+        cmd = list(cmd)
+    if not isinstance(cmd, list) or not cmd:
+        raise ValueError(f"Server '{server}' stdio transport requires 'command' as list[str] or str")
+
+    if TRACE_MCP:
+        log.debug("[HybridMCP] starting stdio server=%s cwd=%s cmd=%s", server, os.getcwd(), cmd)
+
+    opener = await _open_stdio_session(cmd)  # your helper that tries 1-arg then multi-arg
+    async with opener as (read, write):
+        sess = ClientSession(read, write)
+        await sess.initialize()
+        try:
+            yield _MCPStdIOSession(sess)
+        finally:
+            await sess.close()
