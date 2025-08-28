@@ -1,73 +1,51 @@
-#!/usr/bin/env python3
-"""
-hotel_mcp.py — MCP stdio server using fastmcp (no explicit schema param).
-pip install fastmcp
-"""
+import shlex
+from mcp.client.session import ClientSession
+from mcp.client.stdio import stdio_client
 
-import os, sys, asyncio, logging
-from typing import Any, Dict
-
-# ---- Logging to stderr so we don't corrupt stdio protocol on stdout ----
-LOG_LEVEL = logging.DEBUG if os.getenv("DEBUG","").lower() in ("1","true","yes","on") else logging.INFO
-logging.basicConfig(stream=sys.stderr, level=LOG_LEVEL,
-                    format="%(asctime)s | %(levelname)s | hotel-mcp | %(message)s")
-log = logging.getLogger("hotel-mcp")
-
-# Your business logic
-from bot.hotel_bot import hotel_qa_chain  # must be importable
-
-try:
-    from fastmcp import FastMCP
-except ImportError as e:
-    log.error("fastmcp not installed. Try: pip install fastmcp  (error: %s)", e)
-    raise
-
-mcp = FastMCP("hotel-mcp")
-
-def _redact(d: Any, keys=("api_key","token","password","secret","authorization")) -> Any:
-    try:
-        keyset = {k.strip().lower() for k in os.getenv("REDACT_KEYS", ",".join(keys)).split(",") if k.strip()}
-        if isinstance(d, dict):
-            out = {}
-            for k, v in d.items():
-                out[k] = "***REDACTED***" if str(k).lower() in keyset else _redact(v, keyset)
-            return out
-        if isinstance(d, list):
-            return [_redact(x, keyset) for x in d]
-        return d
-    except Exception:
-        return d
-
-async def _maybe_await(x):
-    if asyncio.iscoroutine(x):
-        return await x
-    return x
-
-@mcp.tool(
-    name="hotel_query_tool",
-    description="Query hotel availability/prices or do hotel QA. Input field: qquery (string).",
-)
-async def hotel_query_tool(qquery: str) -> Dict[str, Any]:
+async def _open_stdio_session(cmd_list):
     """
-    The orchestrator sends: {"qquery": "<user text>", ...}
-    Return should include 'answer' (orchestrator extracts this).
+    Supports both mcp SDK signatures:
+      - stdio_client("python -m hotel_mcp")
+      - (newer) stdio_client("/path/to/bin", "--flag")  <-- if present
+    We try 1-arg first (older), then fall back to multi-arg.
     """
-    log.debug("hotel_query_tool called with qquery=%r", qquery)
+    # 1) Older API: single string command
+    cmd_str = " ".join(shlex.quote(p) for p in cmd_list)
     try:
-        ans = await _maybe_await(hotel_qa_chain(qquery))
-        result = {"answer": f"{ans}"}
-        log.debug("hotel_query_tool result=%s", _redact(result))
-        return result
-    except Exception as e:
-        log.exception("hotel_query_tool error: %s", e)
-        # Returning a dict is fine; orchestrator will surface answer text
-        return {"answer": f"ERROR: {e.__class__.__name__}: {e}"}
+        return stdio_client(cmd_str)
+    except TypeError:
+        # 2) Newer API: multiple positional args
+        return stdio_client(*cmd_list)
 
-if __name__ == "__main__":
-    # IMPORTANT: Do not print to stdout. fastmcp handles the stdio protocol on stdout.
-    log.info("Starting hotel-mcp (stdio)")
-    # If you want to force debug from inside the process (instead of shell exports), uncomment:
-    # os.environ["DEBUG"] = "1"
-    # os.environ["TRACE_MCP"] = "1"
-    # os.environ["LOG_PAYLOADS"] = "1"
-    mcp.run()
+
+
+@asynccontextmanager
+async def session(self, server: str):
+    tinfo = self.cfg[server]["transport"]
+    ttype = tinfo.get("type")
+    if ttype == "stdio":
+        cmd = tinfo.get("command")
+        if not isinstance(cmd, list) or not cmd:
+            raise ValueError(f"Server '{server}' stdio transport requires a non-empty 'command' list")
+        if TRACE_MCP:
+            log.debug("[HybridMCP] starting stdio server=%s cmd=%s", server, cmd)
+
+        # <<<<< ONLY THIS PART CHANGED >>>>>
+        opener = await _open_stdio_session(cmd)   # returns an async context manager
+        async with opener as (read, write):
+            sess = ClientSession(read, write)
+            await sess.initialize()
+            try:
+                yield _MCPStdIOSession(sess)
+            finally:
+                await sess.close()
+        # <<<<< END CHANGE >>>>>
+
+    else:
+        # unchanged HTTP branch
+        if not self.http_client:
+            raise RuntimeError("No HTTP-capable client configured")
+        if TRACE_MCP:
+            log.debug("[HybridMCP] delegating HTTP session for server=%s", server)
+        async with self.http_client.session(server) as s:
+            yield s
