@@ -1,0 +1,41 @@
+import shlex
+from fastmcp import Client as MCPClient
+
+async def call_backend(target: str, query: str, extra: Optional[Dict[str, Any]]):
+    svc = SERVICES[target]
+    payload = {svc["field"]: query}
+    if isinstance(extra, dict):
+        payload.update(extra)
+
+    ckey = f"bot:{target}:{_h({'q':query,'x':extra})}"
+    hit = cache_get(ckey)
+    if hit is not None:
+        return hit
+
+    # --- force stdio + pass a command LIST ---
+    raw_cmd = svc["cmd"]                         # e.g. "python srvrs/hotel_mcp_server.py"
+    cmd = raw_cmd if isinstance(raw_cmd, (list, tuple)) else shlex.split(raw_cmd)
+
+    try:
+        # Explicit transport removes all ambiguity
+        async with MCPClient(command=cmd, transport="stdio") as client:
+            result = await client.call_tool(svc["tool"], payload)
+
+        if isinstance(result, dict):
+            val = (result.get("answer")
+                   or result.get("result")
+                   or result.get("output")
+                   or result.get("content")
+                   or result)
+        else:
+            # FastMCP content helpers
+            val = (getattr(result, "json", None)
+                   or getattr(result, "data", None)
+                   or getattr(result, "text", None)
+                   or result)
+
+        cache_set(ckey, val)
+        return val
+
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
