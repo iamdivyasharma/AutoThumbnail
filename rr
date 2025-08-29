@@ -1,50 +1,37 @@
-# --- in MCPHTTPClient.__init__ ---
-self.headers = {
-    # JSON-RPC request body
-    "content-type": "application/json",
-    # IMPORTANT: advertise SSE explicitly (and only) to satisfy strict servers/proxies
-    "accept": "text/event-stream",
-    # Some servers now require this per MCP HTTP transport spec
-    # Use the latest version your server advertises; 2025-06-18 is current as of mid-2025
-    "MCP-Protocol-Version": os.getenv("MCP_PROTOCOL_VERSION", "2025-06-18"),
-    # (Optional but often helps with proxies)
-    "cache-control": "no-cache",
-    "connection": "keep-alive",
-}
-if headers:
-    self.headers.update(headers)
+import httpx
 
-# --- replace _rpc with robust SSE parsing ---
-async def _rpc(self, method: str, params: Dict[str, Any]) -> Any:
-    payload = {"jsonrpc": "2.0", "id": self._next_id(), "method": method, "params": params}
-    async with httpx.AsyncClient(timeout=self.timeout, verify=True) as client:
-        async with client.stream("POST", self.base_url, json=payload, headers=self.headers) as r:
-            r.raise_for_status()
-            ctype = (r.headers.get("content-type") or "").split(";")[0].strip()
+# ...
 
-            # Fast path: if the server *still* returns JSON (some do), parse it
-            if ctype == "application/json":
-                data = json.loads(await r.aread())
-            else:
-                # Expect SSE frames: groups of lines ending with a blank line.
-                # We join multi-line data: blocks per SSE and keep the last complete JSON-RPC message.
-                last_data = None
-                buf = []
-                async for line in r.aiter_lines():
-                    if line == "":
-                        # end of frame
-                        if buf:
-                            # Extract "data:" lines and concatenate (spec allows multi-line)
-                            data_fields = [l[5:].lstrip() for l in buf if l.startswith("data:")]
-                            if data_fields:
-                                last_data = "\n".join(data_fields)
-                            buf.clear()
-                        continue
-                    buf.append(line)
-                if last_data is None:
-                    raise RuntimeError("Empty SSE stream from MCP server")
-                data = json.loads(last_data)
+    async def _rpc(self, method: str, params: Dict[str, Any]) -> Any:
+        payload = {"jsonrpc": "2.0", "id": self._next_id(), "method": method, "params": params}
 
-    if "error" in data:
-        raise RuntimeError(f"RPC error: {data['error']}")
-    return data.get("result")
+        transport = httpx.AsyncHTTPTransport(http2=False)  # <-- force HTTP/1.1 for SSE
+        async with httpx.AsyncClient(timeout=self.timeout, verify=True, transport=transport) as client:
+            async with client.stream(
+                "POST",
+                self.base_url,
+                json=payload,
+                headers=self.headers,  # has: accept: text/event-stream
+            ) as r:
+                r.raise_for_status()
+                ctype = (r.headers.get("content-type") or "").split(";")[0].strip()
+                if ctype == "application/json":
+                    data = json.loads(await r.aread())
+                else:
+                    last_data, buf = None, []
+                    async for line in r.aiter_lines():
+                        if line == "":
+                            if buf:
+                                data_fields = [l[5:].lstrip() for l in buf if l.startswith("data:")]
+                                if data_fields:
+                                    last_data = "\n".join(data_fields)
+                                buf.clear()
+                            continue
+                        buf.append(line)
+                    if last_data is None:
+                        raise RuntimeError("Empty SSE stream from MCP server")
+                    data = json.loads(last_data)
+
+        if "error" in data:
+            raise RuntimeError(f"RPC error: {data['error']}")
+        return data.get("result")
