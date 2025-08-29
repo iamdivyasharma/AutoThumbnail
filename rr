@@ -365,3 +365,72 @@ mcp_server.mount()  # this one can stay; it’s for *clients of the orchestrator
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=ORCH_PORT)
+
+
+# hotel_mcp_server.py
+from fastapi import FastAPI, Body, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+app = FastAPI(title="HotelBot (MCP JSON)")
+
+# --- Your regular REST tool (re-usable by JSON-RPC) ---
+class HotelIn(BaseModel):
+    qquery: str
+
+@app.post("/hotel_query", operation_id="hotel_query_tool")
+async def hotel_query(inp: HotelIn = Body(...)):
+    # from bots.hotel_bot import hotel_qa_chain
+    # answer = hotel_qa_chain.run(inp.qquery)
+    answer = f"Hotel results for: {inp.qquery}"  # stub
+    return {"answer": answer}
+
+# --- JSON-RPC /mcp (batch/JSON) ---
+@app.post("/mcp", response_class=JSONResponse)
+async def mcp_jsonrpc(req: Request):
+    data = await req.json()
+    mid = data.get("id")
+    method = data.get("method")
+    params = data.get("params") or {}
+
+    try:
+        if method == "tools/list":
+            result = {
+                "tools": [
+                    {
+                        "name": "hotel_query_tool",
+                        "arguments": {"qquery": {"type": "string"}},
+                        "description": "Query hotel inventory/prices by text",
+                    }
+                ]
+            }
+            return JSONResponse({"jsonrpc": "2.0", "id": mid, "result": result})
+
+        if method == "tools/call":
+            name = params.get("name")
+            args = params.get("arguments") or {}
+            if name != "hotel_query_tool":
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "id": mid,
+                     "error": {"code": -32601, "message": "Method not found"}},
+                    status_code=400,
+                )
+            # Reuse your REST handler directly
+            out = await hotel_query(HotelIn(**args))
+            return JSONResponse({"jsonrpc": "2.0", "id": mid, "result": out})
+
+        # Unknown method
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found"}},
+            status_code=400,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": str(e)}},
+            status_code=500,
+        )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("hotel_mcp_server:app", host="0.0.0.0", port=8080, reload=False)
+
