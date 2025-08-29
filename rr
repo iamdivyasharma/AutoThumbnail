@@ -1,0 +1,38 @@
+# --- in MCPHTTPClient.__init__ ---
+self.headers = {
+    "content-type": "application/json",
+    "accept": "text/event-stream, application/json"  # <- IMPORTANT
+}
+if headers:
+    self.headers.update(headers)
+
+# --- replace _rpc with an SSE-aware version ---
+async def _rpc(self, method: str, params: Dict[str, Any]) -> Any:
+    payload = {"jsonrpc": "2.0", "id": self._next_id(), "method": method, "params": params}
+    async with httpx.AsyncClient(timeout=self.timeout, verify=True) as client:
+        # We don’t know in advance whether we’ll get JSON or SSE, so use streaming API
+        async with client.stream("POST", self.base_url, json=payload, headers=self.headers) as r:
+            r.raise_for_status()
+            ctype = r.headers.get("content-type", "")
+            if ctype.startswith("text/event-stream"):
+                # Parse SSE: lines like "data: {...}\n\n"
+                buf = ""
+                async for line in r.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        data_str = line[len("data:"):].strip()
+                        if not data_str:
+                            continue
+                        # Servers often emit multiple events; keep the last full JSON-RPC message.
+                        buf = data_str
+                if not buf:
+                    raise RuntimeError("Empty SSE stream from MCP server")
+                data = json.loads(buf)
+            else:
+                # Fallback to plain JSON response
+                data = r.json()
+
+    if "error" in data:
+        raise RuntimeError(f"RPC error: {data['error']}")
+    return data.get("result")
