@@ -1,0 +1,106 @@
+# utils.py
+from typing import Dict, Any, Tuple, Optional, NamedTuple
+
+class HotelInputs(NamedTuple):
+    """
+    Rich, structured inputs parsed from an orchestrator call.
+    - query: the search/query text (looks at 'qquery' then 'query')
+    - user_name / user_email: pulled from nested 'extra' first, then top-level
+    - filters: dict with keys like { ond: {origin, destination}, start_date, policy_status }
+    - session_id, target: from 'context' if present (or top-level fallbacks)
+    - ui_version: from 'extra' or top-level
+    - extra: the raw nested 'extra' dict ({} if missing)
+    """
+    query: str
+    user_name: Optional[str]
+    user_email: Optional[str]
+    filters: Dict[str, Any]
+    session_id: Optional[str]
+    target: Optional[str]
+    ui_version: Optional[str]
+    extra: Dict[str, Any]
+
+
+def parse_hotel_payload(payload: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    BACKWARD-COMPATIBLE parser (keeps the original return shape).
+    It now supports both:
+      - New nested style: arguments.extra.{user_name,user_email,...}
+      - Legacy flat style: arguments.{user_name,user_email,...}
+    """
+    # Query can live under service field (qquery) or a generic 'query'
+    query = str(payload.get("qquery", "") or payload.get("query", "")).strip()
+
+    # Nested 'extra' (preferred in new orchestrator) + flat fallback
+    extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+    user_name = payload.get("user_name") or extra.get("user_name")
+    user_email = payload.get("user_email") or extra.get("user_email")
+
+    return query, user_name, user_email
+
+
+def parse_hotel_payload_v2(payload: Dict[str, Any]) -> HotelInputs:
+    """
+    RICH parser that also returns filters, context, ui_version, and raw extra.
+    Use this in new code paths while keeping parse_hotel_payload() for legacy sites.
+    """
+    # Safe getters
+    extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+
+    # Query
+    query = str(payload.get("qquery", "") or payload.get("query", "")).strip()
+
+    # Identity
+    user_name = payload.get("user_name") or extra.get("user_name")
+    user_email = payload.get("user_email") or extra.get("user_email")
+
+    # Filters can be nested under extra or flattened
+    filters = {}
+    if isinstance(extra.get("filters"), dict):
+        filters = extra["filters"]
+    elif isinstance(payload.get("filters"), dict):
+        filters = payload["filters"]
+
+    # UI/versioning hints
+    ui_version = payload.get("ui_version") or extra.get("ui_version")
+
+    # Context (session + target) – new orchestrator sends this alongside 'extra'
+    session_id = context.get("session_id") or payload.get("session_id")
+    target = context.get("target") or payload.get("target")
+
+    return HotelInputs(
+        query=query,
+        user_name=user_name,
+        user_email=user_email,
+        filters=filters or {},
+        session_id=session_id,
+        target=target,
+        ui_version=ui_version,
+        extra=extra or {},
+    )
+
+
+def extract_filter_values(filters: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Convenience helper to pull (origin, destination, start_date, policy_status)
+    out of the filters dict regardless of presence/shape.
+    """
+    ond = filters.get("ond") if isinstance(filters.get("ond"), dict) else {}
+    origin = ond.get("origin")
+    destination = ond.get("destination")
+    start_date = filters.get("start_date")
+    policy_status = filters.get("policy_status")
+    return origin, destination, start_date, policy_status
+
+
+
+
+parsed = parse_hotel_payload_v2(arguments)
+# Access everything:
+q = parsed.query
+name = parsed.user_name
+email = parsed.user_email
+origin, dest, start_dt, policy = extract_filter_values(parsed.filters)
+sid = parsed.session_id
+tgt = parsed.target
