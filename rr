@@ -39,9 +39,16 @@ def _idx(val, opts, default=0):
 def _iso_to_dates(xs):
     return sorted(date.fromisoformat(x) if isinstance(x, str) else x for x in xs)
 
-def _as_date(x):
-    # Accept ISO string or datetime.date; return a date
-    return x if isinstance(x, date) else date.fromisoformat(str(x))
+def _as_date(x, fallback: date) -> date:
+    """Accept date or ISO string; coerce invalid/None to fallback."""
+    if isinstance(x, date):
+        return x
+    if isinstance(x, str):
+        try:
+            return date.fromisoformat(x)
+        except ValueError:
+            pass
+    return fallback
 
 START_WHITELIST = _iso_to_dates(ALLOWED_START_DATES)
 END_WHITELIST   = _iso_to_dates(ALLOWED_END_DATES)
@@ -63,20 +70,34 @@ def _snap_to_allowed(chosen: date, allowed: list[date], *, direction="nearest", 
         return allowed[0]
     return min(allowed, key=lambda d: abs(d - chosen))
 
-# Ensure state (store dates as ISO strings)
-if "filters" not in st.session_state:
-    st.session_state.filters = {
-        "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
-        "start_date": START_WHITELIST[0].isoformat(),
-        "end_date": END_WHITELIST[0].isoformat(),
-        "policy_status": "Any",
-    }
+# ===== Ensure & sanitize state (store dates as ISO strings) =====
+DEFAULTS = {
+    "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
+    "start_date": START_WHITELIST[0].isoformat(),
+    "end_date": END_WHITELIST[0].isoformat(),
+    "policy_status": "Any",
+}
 
-# One-time cleanup in case old runs put date objects into state
-for k in ("start_date", "end_date"):
-    v = st.session_state.filters.get(k)
+if "filters" not in st.session_state or not isinstance(st.session_state.filters, dict):
+    st.session_state.filters = DEFAULTS.copy()
+
+# Fill missing keys
+for k, v in DEFAULTS.items():
+    if k not in st.session_state.filters:
+        st.session_state.filters[k] = v
+
+# Coerce bad/missing date values to safe ISO strings
+for key, fallback in (("start_date", START_WHITELIST[0]), ("end_date", END_WHITELIST[0])):
+    v = st.session_state.filters.get(key)
     if isinstance(v, date):
-        st.session_state.filters[k] = v.isoformat()
+        st.session_state.filters[key] = v.isoformat()
+    elif isinstance(v, str):
+        try:
+            date.fromisoformat(v)
+        except Exception:
+            st.session_state.filters[key] = fallback.isoformat()
+    else:
+        st.session_state.filters[key] = fallback.isoformat()
 
 f = st.session_state.filters
 
@@ -111,7 +132,8 @@ with st.container():
     # Calendar pickers (bounded by whitelist range)
     d1, d2 = st.columns(2)
     with d1:
-        start_default = _as_date(f["start_date"])
+        start_default = _as_date(f.get("start_date"), START_WHITELIST[0])
+          # snap to nearest allowed start
         start_default = _snap_to_allowed(start_default, START_WHITELIST, direction="nearest")
         start_pick = st.date_input(
             "Start date",
@@ -122,7 +144,7 @@ with st.container():
             key="start_date_picker",
         )
     with d2:
-        end_default = _as_date(f["end_date"])
+        end_default = _as_date(f.get("end_date"), END_WHITELIST[0])
         # End must be >= start; snap upward and enforce min_after
         end_default = _snap_to_allowed(end_default, END_WHITELIST, direction="up", min_after=start_pick)
         end_pick = st.date_input(
@@ -163,12 +185,7 @@ with st.container():
             st.success("Filters applied.")
 
     if clear_filters:
-        st.session_state.filters = {
-            "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
-            "start_date": START_WHITELIST[0].isoformat(),
-            "end_date": END_WHITELIST[0].isoformat(),
-            "policy_status": "Any",
-        }
+        st.session_state.filters = DEFAULTS.copy()
         st.info("Filters reset to defaults.")
 
     fil = st.session_state.filters
