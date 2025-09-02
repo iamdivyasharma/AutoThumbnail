@@ -107,3 +107,37 @@ def extract_filter_values(filters: Dict[str, Any]) -> Tuple[
     end_date   = filters.get("end_date")          # <-- include end_date
     policy     = filters.get("policy_status")
     return origin, destination, start_date, end_date, policy
+
+
+# hotel_mcp_server.py
+from utils import parse_hotel_payload_v2, extract_filter_values
+
+def hotel_query_tool(arguments: dict):
+    # 1) Parse everything from the orchestrator payload
+    inp = parse_hotel_payload_v2(arguments)
+
+    # 2) Pull the filter primitives you care about
+    origin, dest, start_dt, end_dt, policy = extract_filter_values(inp.filters)
+
+    # 3) Do your logic (search/DF filter/etc.)
+    # results = search_hotels(
+    #     query=inp.query,
+    #     origin=origin, destination=dest,
+    #     start_date=start_dt, end_date=end_dt,
+    #     policy_status=policy,
+    #     session_id=inp.session_id,
+    # )
+
+    # 4) Return your shape (whatever your MCP server expects to return)
+    return {
+        "answer": {
+            "query": inp.query,
+            "origin": origin,
+            "destination": dest,
+            "start_date": start_dt,
+            "end_date": end_dt,
+            "policy_status": policy,
+            "session_id": inp.session_id,
+        }
+    }
+
