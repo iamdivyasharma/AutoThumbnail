@@ -1,0 +1,124 @@
+# ================== Filters bar (codes + names, calendar dates) ==================
+from datetime import date, timedelta
+
+# Labels for display
+AIRPORT_LABELS = {
+    "DEL": "Delhi — Indira Gandhi Intl",
+    "BOM": "Mumbai — Chhatrapati Shivaji Maharaj Intl",
+    "BLR": "Bengaluru — Kempegowda Intl",
+    "MAA": "Chennai — Chennai Intl",
+    "HYD": "Hyderabad — Rajiv Gandhi Intl",
+    "CCU": "Kolkata — Netaji Subhas Chandra Bose Intl",
+    "PNQ": "Pune — Lohegaon",
+    "COK": "Kochi — Cochin Intl",
+    "GOI": "Goa — Dabolim",
+    "DXB": "Dubai — Dubai Intl",
+    "SIN": "Singapore — Changi",
+    "LHR": "London — Heathrow",
+    "JFK": "New York — John F. Kennedy Intl",
+    "SFO": "San Francisco — SFO",
+}
+
+# Fixed option lists (you can extend)
+ORIGIN_OPTIONS      = ["DEL","BLR","MAA","HYD","CCU","PNQ","COK","GOI","BOM","DXB","SIN","LHR","JFK","SFO"]
+DESTINATION_OPTIONS = ["BOM","DEL","BLR","CCU","MAA","HYD","COK","PNQ","GOI","DXB","SIN","LHR","JFK","SFO"]
+POLICY_OPTIONS      = ["Any", "Compliant", "Non-compliant", "Pending"]
+
+def label_for(code: str) -> str:
+    return f"{code} ({AIRPORT_LABELS.get(code, 'Unknown')})"
+
+# Ensure state keys exist
+if "filters" not in st.session_state:
+    st.session_state.filters = {
+        "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
+        "start_date": date.today().isoformat(),
+        "end_date": (date.today() + timedelta(days=7)).isoformat(),
+        "policy_status": "Any",
+    }
+f = st.session_state.filters
+
+def _idx(val, opts, default=0):
+    try:
+        return opts.index(val) if val in opts else default
+    except Exception:
+        return default
+
+with st.container():
+    st.markdown("### 🔎 Filters")
+
+    col1, col2, col3 = st.columns([1,1,1])
+    with col1:
+        origin_code = st.selectbox(
+            "Origin",
+            options=ORIGIN_OPTIONS,
+            index=_idx(f["ond"]["origin"], ORIGIN_OPTIONS, 0),
+            format_func=label_for,
+            key="origin_select",
+        )
+    with col2:
+        dest_code = st.selectbox(
+            "Destination",
+            options=DESTINATION_OPTIONS,
+            index=_idx(f["ond"]["destination"], DESTINATION_OPTIONS, 0),
+            format_func=label_for,
+            key="dest_select",
+        )
+    with col3:
+        policy = st.selectbox(
+            "Policy status",
+            options=POLICY_OPTIONS,
+            index=_idx(f["policy_status"], POLICY_OPTIONS, 0),
+            key="policy_select",
+        )
+
+    # Calendar pickers
+    d1, d2 = st.columns(2)
+    with d1:
+        start_dt = st.date_input(
+            "Start date",
+            value=date.fromisoformat(f["start_date"]) if f.get("start_date") else date.today(),
+            format="YYYY-MM-DD",
+            key="start_date_picker",
+        )
+    with d2:
+        end_default = date.fromisoformat(f["end_date"]) if f.get("end_date") else (start_dt + timedelta(days=7))
+        end_dt = st.date_input(
+            "End date",
+            value=end_default if end_default >= start_dt else start_dt,
+            min_value=start_dt,
+            format="YYYY-MM-DD",
+            key="end_date_picker",
+        )
+
+    a1, a2 = st.columns(2)
+    with a1:
+        apply = st.button("Apply", use_container_width=True, key="filters_apply")
+    with a2:
+        clear = st.button("Clear", use_container_width=True, key="filters_clear")
+
+    if apply:
+        if origin_code == dest_code:
+            st.warning("Origin and Destination cannot be the same.")
+        else:
+            st.session_state.filters = {
+                "ond": {"origin": origin_code, "destination": dest_code},
+                "start_date": start_dt.isoformat(),
+                "end_date": end_dt.isoformat(),
+                "policy_status": policy,
+            }
+            st.success("Filters applied.")
+
+    if clear:
+        st.session_state.filters = {
+            "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
+            "start_date": date.today().isoformat(),
+            "end_date": (date.today() + timedelta(days=7)).isoformat(),
+            "policy_status": "Any",
+        }
+        st.info("Filters reset to defaults.")
+
+    fil = st.session_state.filters
+    st.caption(
+        f"Active → {label_for(fil['ond']['origin'])} → {label_for(fil['ond']['destination'])} | "
+        f"Start: {fil['start_date']} | End: {fil['end_date']} | Policy: {fil['policy_status']}"
+    )
