@@ -1,0 +1,83 @@
+# pip install boto3 langchain
+
+import json
+import boto3
+from typing import Any, Dict, List, Optional
+from langchain.llms.base import LLM
+from langchain.callbacks.manager import CallbackManagerForLLMRun
+
+class BedrockInvokeLLM(LLM):
+    """
+    LangChain LLM wrapper around boto3 Bedrock invoke_model.
+    """
+
+    def __init__(
+        self,
+        model_id: str,
+        region_name: str,
+        model_kwargs: Optional[Dict[str, Any]] = None,
+        aws_access_key_id: Optional[str] = None,
+        aws_secret_access_key: Optional[str] = None,
+        aws_session_token: Optional[str] = None,
+    ):
+        super().__init__()
+        self.model_id = model_id   # <-- store model id here
+        self.region_name = region_name
+        self.model_kwargs = model_kwargs or {}
+
+        # boto3 client with manual creds
+        self.client = boto3.client(
+            "bedrock-runtime",
+            region_name=self.region_name,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+        )
+
+    @property
+    def _llm_type(self) -> str:
+        return "bedrock-invoke"
+
+    @property
+    def _identifying_params(self) -> Dict[str, Any]:
+        return {"model_id": self.model_id, **self.model_kwargs}
+
+    def _build_body(self, prompt: str) -> Dict[str, Any]:
+        # Example for Claude 3 style input
+        return {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": prompt}]}
+            ],
+            "max_tokens": self.model_kwargs.get("max_tokens", 512),
+            "temperature": self.model_kwargs.get("temperature", 0.2),
+        }
+
+    def _parse_text(self, response_json: Dict[str, Any]) -> str:
+        for blk in response_json.get("content", []):
+            if blk.get("type") == "text":
+                return blk.get("text", "")
+        return json.dumps(response_json)
+
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> str:
+        body = self._build_body(prompt)
+        resp = self.client.invoke_model(
+            modelId=self.model_id,
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(body),
+        )
+        payload = json.loads(resp["body"].read())
+        text = self._parse_text(payload)
+
+        # optional stop handling
+        if stop:
+            for s in stop:
+                if s in text:
+                    text = text.split(s)[0]
+        return text
