@@ -1,4 +1,4 @@
-# ================== Filters bar (codes+names, calendar with ALLOWED dates) ==================
+import streamlit as st
 from datetime import date, timedelta
 
 # --- Display labels for airports ---
@@ -31,30 +31,39 @@ def label_for(code: str) -> str:
     return f"{code} ({AIRPORT_LABELS.get(code, 'Unknown')})"
 
 def _idx(val, opts, default=0):
-    try: return opts.index(val) if val in opts else default
-    except Exception: return default
+    try:
+        return opts.index(val) if val in opts else default
+    except Exception:
+        return default
 
 def _iso_to_dates(xs):
     return sorted(date.fromisoformat(x) if isinstance(x, str) else x for x in xs)
+
+def _as_date(x):
+    # Accept ISO string or datetime.date; return a date
+    return x if isinstance(x, date) else date.fromisoformat(str(x))
 
 START_WHITELIST = _iso_to_dates(ALLOWED_START_DATES)
 END_WHITELIST   = _iso_to_dates(ALLOWED_END_DATES)
 
 def _snap_to_allowed(chosen: date, allowed: list[date], *, direction="nearest", min_after: date | None = None) -> date:
-    if not allowed: return chosen
+    if not allowed:
+        return chosen
     if min_after is not None:
         allowed = [d for d in allowed if d >= min_after] or [allowed[-1]]
     if direction == "up":
         for d in allowed:
-            if d >= chosen: return d
+            if d >= chosen:
+                return d
         return allowed[-1]
     if direction == "down":
         for d in reversed(allowed):
-            if d <= chosen: return d
+            if d <= chosen:
+                return d
         return allowed[0]
     return min(allowed, key=lambda d: abs(d - chosen))
 
-# Ensure state
+# Ensure state (store dates as ISO strings)
 if "filters" not in st.session_state:
     st.session_state.filters = {
         "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
@@ -62,6 +71,13 @@ if "filters" not in st.session_state:
         "end_date": END_WHITELIST[0].isoformat(),
         "policy_status": "Any",
     }
+
+# One-time cleanup in case old runs put date objects into state
+for k in ("start_date", "end_date"):
+    v = st.session_state.filters.get(k)
+    if isinstance(v, date):
+        st.session_state.filters[k] = v.isoformat()
+
 f = st.session_state.filters
 
 with st.container():
@@ -95,7 +111,7 @@ with st.container():
     # Calendar pickers (bounded by whitelist range)
     d1, d2 = st.columns(2)
     with d1:
-        start_default = date.fromisoformat(f["start_date"])
+        start_default = _as_date(f["start_date"])
         start_default = _snap_to_allowed(start_default, START_WHITELIST, direction="nearest")
         start_pick = st.date_input(
             "Start date",
@@ -106,7 +122,7 @@ with st.container():
             key="start_date_picker",
         )
     with d2:
-        end_default = date.fromisoformat(f["end_date"])
+        end_default = _as_date(f["end_date"])
         # End must be >= start; snap upward and enforce min_after
         end_default = _snap_to_allowed(end_default, END_WHITELIST, direction="up", min_after=start_pick)
         end_pick = st.date_input(
