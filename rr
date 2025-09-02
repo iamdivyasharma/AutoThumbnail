@@ -1,143 +1,124 @@
-# utils.py
-from typing import Dict, Any, Tuple, Optional, NamedTuple
+# bots/hotel_bot.py
+from typing import Dict, Any
 
-class HotelInputs(NamedTuple):
-    """
-    Rich, structured inputs parsed from an orchestrator call.
-    - query: the search/query text (checks 'qquery' then 'query')
-    - user_name / user_email: from nested 'extra' first, then top-level
-    - filters: { ond: {origin, destination}, start_date, end_date, policy_status }
-    - session_id, target: from 'context' if present (or top-level fallbacks)
-    - ui_version: from 'extra' or top-level
-    - extra: the raw nested 'extra' dict ({} if missing)
-    """
-    query: str
-    user_name: Optional[str]
-    user_email: Optional[str]
-    filters: Dict[str, Any]
-    session_id: Optional[str]
-    target: Optional[str]
-    ui_version: Optional[str]
-    extra: Dict[str, Any]
+def run_hotel_bot(payload: Dict[str, Any]) -> Any:
+    # Example of how to consume the normalized fields
+    q     = payload["query"]
+    f     = payload["filters"]
+    ond   = f"{f.get('origin')}-{f.get('destination')}" if f.get('origin') and f.get('destination') else None
+    start = f.get("start_date")
+    end   = f.get("end_date")
+    policy= f.get("policy_status")
 
-def _upper3(code: Optional[str]) -> Optional[str]:
-    if not code or not isinstance(code, str): return None
-    c = code.strip().upper()
-    return c if len(c) == 3 and c.isalpha() else None
-
-def _iso(val: Optional[str]) -> Optional[str]:
-    # Accept ISO "YYYY-MM-DD" (leave strict validation to caller if needed)
-    if not val or not isinstance(val, str): return None
-    s = val.strip()
-    return s
-
-def parse_hotel_payload(payload: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str]]:
-    """
-    BACKWARD-COMPATIBLE parser (original return shape).
-    Supports both nested extra and flat keys, and 'query'/'qquery'.
-    """
-    query = str(payload.get("qquery", "") or payload.get("query", "")).strip()
-    extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
-    user_name = payload.get("user_name") or extra.get("user_name")
-    user_email = payload.get("user_email") or extra.get("user_email")
-    return query, user_name, user_email
-
-def parse_hotel_payload_v2(payload: Dict[str, Any]) -> HotelInputs:
-    """
-    Rich parser (recommended):
-    - reads filters incl. end_date
-    - normalizes IATA codes
-    - ensures end_date >= start_date if both present
-    """
-    extra   = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
-    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
-
-    query = str(payload.get("qquery", "") or payload.get("query", "")).strip()
-
-    user_name  = payload.get("user_name") or extra.get("user_name")
-    user_email = payload.get("user_email") or extra.get("user_email")
-
-    # filters: prefer nested, fallback to top-level
-    raw_filters = extra.get("filters") if isinstance(extra.get("filters"), dict) else (payload.get("filters") or {})
-    ond = raw_filters.get("ond") if isinstance(raw_filters.get("ond"), dict) else {}
-
-    origin       = _upper3(ond.get("origin"))
-    destination  = _upper3(ond.get("destination"))
-    start_date   = _iso(raw_filters.get("start_date"))
-    end_date     = _iso(raw_filters.get("end_date"))
-    policy       = raw_filters.get("policy_status")
-
-    # Keep ISO strings; ensure order if both present
-    if isinstance(start_date, str) and isinstance(end_date, str) and start_date > end_date:
-        end_date = start_date
-
-    filters_norm: Dict[str, Any] = {
-        "ond": {"origin": origin, "destination": destination},
-        "start_date": start_date,
-        "end_date": end_date,                 # <-- now included
+    # TODO: your real logic here (DF filters, API calls, etc.)
+    # For now, return a compact echo:
+    return {
+        "query": q,
+        "ond": ond,
+        "start_date": start,
+        "end_date": end,
         "policy_status": policy,
+        "session_id": payload.get("session_id"),
     }
-
-    ui_version = payload.get("ui_version") or extra.get("ui_version")
-    session_id = context.get("session_id") or payload.get("session_id")
-    target     = context.get("target") or payload.get("target")
-
-    return HotelInputs(
-        query=query,
-        user_name=user_name,
-        user_email=user_email,
-        filters=filters_norm,
-        session_id=session_id,
-        target=target,
-        ui_version=ui_version,
-        extra=extra or {},
-    )
-
-def extract_filter_values(filters: Dict[str, Any]) -> Tuple[
-    Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]
-]:
-    """
-    Returns (origin, destination, start_date, end_date, policy_status).
-    Works whether filters came nested or flat.
-    """
-    ond = filters.get("ond") if isinstance(filters.get("ond"), dict) else {}
-    origin = ond.get("origin")
-    destination = ond.get("destination")
-    start_date = filters.get("start_date")
-    end_date   = filters.get("end_date")          # <-- include end_date
-    policy     = filters.get("policy_status")
-    return origin, destination, start_date, end_date, policy
 
 
 # hotel_mcp_server.py
+from typing import Any, Dict
+from fastapi import FastAPI, Body, Request
+from fastapi.responses import JSONResponse
+
+# ⬅️ import the parsers you already wrote
 from utils import parse_hotel_payload_v2, extract_filter_values
 
-def hotel_query_tool(arguments: dict):
-    # 1) Parse everything from the orchestrator payload
-    inp = parse_hotel_payload_v2(arguments)
+app = FastAPI(title="HotelBot (MCP JSON)")
 
-    # 2) Pull the filter primitives you care about
-    origin, dest, start_dt, end_dt, policy = extract_filter_values(inp.filters)
+# ---------- Unified handler (used by both REST and JSON-RPC) ----------
+async def handle_hotel(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    # 1) Parse and normalize everything from orchestrator
+    inputs = parse_hotel_payload_v2(arguments)
+    origin, dest, start_dt, end_dt, policy = extract_filter_values(inputs.filters)
 
-    # 3) Do your logic (search/DF filter/etc.)
-    # results = search_hotels(
-    #     query=inp.query,
-    #     origin=origin, destination=dest,
-    #     start_date=start_dt, end_date=end_dt,
-    #     policy_status=policy,
-    #     session_id=inp.session_id,
-    # )
-
-    # 4) Return your shape (whatever your MCP server expects to return)
-    return {
-        "answer": {
-            "query": inp.query,
+    # 2) Build a clean payload for your bot
+    bot_payload: Dict[str, Any] = {
+        "query": inputs.query,
+        "user_name": inputs.user_name,
+        "user_email": inputs.user_email,
+        "session_id": inputs.session_id,
+        "target": inputs.target,
+        "filters": {
             "origin": origin,
             "destination": dest,
             "start_date": start_dt,
             "end_date": end_dt,
             "policy_status": policy,
-            "session_id": inp.session_id,
-        }
+        },
+        # keep the raw extra in case the bot needs more knobs
+        "extra": inputs.extra,
+        "ui_version": inputs.ui_version,
     }
 
+    # 3) Call your downstream bot
+    #    (import inside function to avoid circular imports during app startup)
+    from bots.hotel_bot import run_hotel_bot  # make this function in your bot file
+    answer = run_hotel_bot(bot_payload)  # if async: `answer = await run_hotel_bot(bot_payload)`
+
+    # 4) Return MCP-style result
+    return {"answer": answer}
+
+# ---------- REST tool (so you can call it directly if needed) ----------
+@app.post("/hotel_query", operation_id="hotel_query_tool")
+async def hotel_query(arguments: Dict[str, Any] = Body(...)):
+    return await handle_hotel(arguments)
+
+# ---------- JSON-RPC MCP (batch/JSON) ----------
+@app.post("/mcp", response_class=JSONResponse)
+async def mcp_jsonrpc(req: Request):
+    data = await req.json()
+    mid = data.get("id")
+    method = data.get("method")
+    params = data.get("params") or {}
+
+    try:
+        if method == "tools/list":
+            result = {
+                "tools": [
+                    {
+                        "name": "hotel_query_tool",
+                        # Advertise the modern args (backward compatible; we still accept qquery too)
+                        "arguments": {
+                            "query":   {"type": "string"},
+                            "extra":   {"type": "object"},
+                            "context": {"type": "object"},
+                        },
+                        "description": "Query hotel inventory/prices with filters (OND, dates, policy).",
+                    }
+                ]
+            }
+            return JSONResponse({"jsonrpc": "2.0", "id": mid, "result": result})
+
+        if method == "tools/call":
+            name = params.get("name")
+            args = params.get("arguments") or {}
+            if name != "hotel_query_tool":
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "id": mid,
+                     "error": {"code": -32601, "message": "Method not found"}},
+                    status_code=400,
+                )
+            out = await handle_hotel(args)
+            return JSONResponse({"jsonrpc": "2.0", "id": mid, "result": out})
+
+        # Unknown method
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found"}},
+            status_code=400,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": str(e)}},
+            status_code=500,
+        )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("hotel_mcp_server:app", host="0.0.0.0", port=8080, reload=False)
