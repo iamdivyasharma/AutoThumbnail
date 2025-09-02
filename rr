@@ -1,7 +1,7 @@
-# ================== Filters bar (codes + names, calendar dates) ==================
+# ================== Filters bar (codes+names, calendar with ALLOWED dates) ==================
 from datetime import date, timedelta
 
-# Labels for display
+# --- Display labels for airports ---
 AIRPORT_LABELS = {
     "DEL": "Delhi — Indira Gandhi Intl",
     "BOM": "Mumbai — Chhatrapati Shivaji Maharaj Intl",
@@ -18,30 +18,51 @@ AIRPORT_LABELS = {
     "JFK": "New York — John F. Kennedy Intl",
     "SFO": "San Francisco — SFO",
 }
-
-# Fixed option lists (you can extend)
 ORIGIN_OPTIONS      = ["DEL","BLR","MAA","HYD","CCU","PNQ","COK","GOI","BOM","DXB","SIN","LHR","JFK","SFO"]
 DESTINATION_OPTIONS = ["BOM","DEL","BLR","CCU","MAA","HYD","COK","PNQ","GOI","DXB","SIN","LHR","JFK","SFO"]
 POLICY_OPTIONS      = ["Any", "Compliant", "Non-compliant", "Pending"]
 
+# --- Only these dates are allowed (edit these lists) ---
+ALLOWED_START_DATES = ["2025-09-01", "2025-09-05", "2025-09-08", "2025-09-10", "2025-10-01"]
+ALLOWED_END_DATES   = ["2025-09-01", "2025-09-07", "2025-09-10", "2025-09-15", "2025-10-31", "2025-12-31"]
+
+# Helpers
 def label_for(code: str) -> str:
     return f"{code} ({AIRPORT_LABELS.get(code, 'Unknown')})"
 
-# Ensure state keys exist
+def _idx(val, opts, default=0):
+    try: return opts.index(val) if val in opts else default
+    except Exception: return default
+
+def _iso_to_dates(xs):
+    return sorted(date.fromisoformat(x) if isinstance(x, str) else x for x in xs)
+
+START_WHITELIST = _iso_to_dates(ALLOWED_START_DATES)
+END_WHITELIST   = _iso_to_dates(ALLOWED_END_DATES)
+
+def _snap_to_allowed(chosen: date, allowed: list[date], *, direction="nearest", min_after: date | None = None) -> date:
+    if not allowed: return chosen
+    if min_after is not None:
+        allowed = [d for d in allowed if d >= min_after] or [allowed[-1]]
+    if direction == "up":
+        for d in allowed:
+            if d >= chosen: return d
+        return allowed[-1]
+    if direction == "down":
+        for d in reversed(allowed):
+            if d <= chosen: return d
+        return allowed[0]
+    return min(allowed, key=lambda d: abs(d - chosen))
+
+# Ensure state
 if "filters" not in st.session_state:
     st.session_state.filters = {
         "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
-        "start_date": date.today().isoformat(),
-        "end_date": (date.today() + timedelta(days=7)).isoformat(),
+        "start_date": START_WHITELIST[0].isoformat(),
+        "end_date": END_WHITELIST[0].isoformat(),
         "policy_status": "Any",
     }
 f = st.session_state.filters
-
-def _idx(val, opts, default=0):
-    try:
-        return opts.index(val) if val in opts else default
-    except Exception:
-        return default
 
 with st.container():
     st.markdown("### 🔎 Filters")
@@ -71,48 +92,65 @@ with st.container():
             key="policy_select",
         )
 
-    # Calendar pickers
+    # Calendar pickers (bounded by whitelist range)
     d1, d2 = st.columns(2)
     with d1:
-        start_dt = st.date_input(
+        start_default = date.fromisoformat(f["start_date"])
+        start_default = _snap_to_allowed(start_default, START_WHITELIST, direction="nearest")
+        start_pick = st.date_input(
             "Start date",
-            value=date.fromisoformat(f["start_date"]) if f.get("start_date") else date.today(),
+            value=start_default,
+            min_value=START_WHITELIST[0],
+            max_value=START_WHITELIST[-1],
             format="YYYY-MM-DD",
             key="start_date_picker",
         )
     with d2:
-        end_default = date.fromisoformat(f["end_date"]) if f.get("end_date") else (start_dt + timedelta(days=7))
-        end_dt = st.date_input(
+        end_default = date.fromisoformat(f["end_date"])
+        # End must be >= start; snap upward and enforce min_after
+        end_default = _snap_to_allowed(end_default, END_WHITELIST, direction="up", min_after=start_pick)
+        end_pick = st.date_input(
             "End date",
-            value=end_default if end_default >= start_dt else start_dt,
-            min_value=start_dt,
+            value=end_default,
+            min_value=END_WHITELIST[0],
+            max_value=END_WHITELIST[-1],
             format="YYYY-MM-DD",
             key="end_date_picker",
         )
 
     a1, a2 = st.columns(2)
     with a1:
-        apply = st.button("Apply", use_container_width=True, key="filters_apply")
+        apply_filters = st.button("Apply", use_container_width=True, key="filters_apply")
     with a2:
-        clear = st.button("Clear", use_container_width=True, key="filters_clear")
+        clear_filters = st.button("Clear", use_container_width=True, key="filters_clear")
 
-    if apply:
+    if apply_filters:
+        # snap to allowed sets
+        snapped_start = _snap_to_allowed(start_pick, START_WHITELIST, direction="nearest")
+        snapped_end   = _snap_to_allowed(end_pick,   END_WHITELIST,   direction="up", min_after=snapped_start)
+
         if origin_code == dest_code:
             st.warning("Origin and Destination cannot be the same.")
         else:
+            # save to state (ISO)
             st.session_state.filters = {
                 "ond": {"origin": origin_code, "destination": dest_code},
-                "start_date": start_dt.isoformat(),
-                "end_date": end_dt.isoformat(),
+                "start_date": snapped_start.isoformat(),
+                "end_date": snapped_end.isoformat(),
                 "policy_status": policy,
             }
+            # surface adjustments, if any
+            if snapped_start != start_pick:
+                st.info(f"Start date adjusted to allowed date: {snapped_start.isoformat()}")
+            if snapped_end != end_pick:
+                st.info(f"End date adjusted to allowed date: {snapped_end.isoformat()}")
             st.success("Filters applied.")
 
-    if clear:
+    if clear_filters:
         st.session_state.filters = {
             "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
-            "start_date": date.today().isoformat(),
-            "end_date": (date.today() + timedelta(days=7)).isoformat(),
+            "start_date": START_WHITELIST[0].isoformat(),
+            "end_date": END_WHITELIST[0].isoformat(),
             "policy_status": "Any",
         }
         st.info("Filters reset to defaults.")
