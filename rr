@@ -1,111 +1,104 @@
-# === NEW: one-time boot flags (first Apply only) ===
-if "boot_agentic" not in st.session_state:
-    st.session_state.boot_agentic = False
-if "boot_air" not in st.session_state:
-    st.session_state.boot_air = False
-if "boot_hotel" not in st.session_state:
-    st.session_state.boot_hotel = False
+if apply:
+    if origin_code == dest_code:
+        st.warning("Origin and Destination cannot be the same.")
 
+    chosen_start = start_date_input if isinstance(start_date_input, date) else START_WHITELIST[0]
+    snapped_start = _snap_to_allowed(chosen_start, START_WHITELIST, direction="nearest")
 
+    chosen_end = end_date_input if isinstance(end_date_input, date) else END_WHITELIST[-1]
+    snapped_end = _snap_to_allowed(chosen_end, END_WHITELIST, direction="up", min_after=snapped_start)
 
+    # save filters (ISO)
+    st.session_state.filters = {
+        "ond": {"origin": origin_code, "destination": dest_code},
+        "start_date": snapped_start.isoformat(),
+        "end_date": snapped_end.isoformat(),
+        "policy_status": policy_input,
+    }
 
-        if apply:
-            if origin_code == dest_code:
-                st.warning("Origin and Destination cannot be the same.")
+    # ---------- First-time-only Apply behavior ----------
+    def _call_orchestrator(url: str, payload: dict, response_key: str):
+        # Guard against typos
+        assert isinstance(url, str) and url, "internal: url must be a non-empty string"
+        assert isinstance(payload, dict), "internal: payload must be a dict"
+        assert isinstance(response_key, str) and response_key, "internal: response_key required"
 
-            chosen_start = start_date_input if isinstance(start_date_input, date) else START_WHITELIST[0]
-            snapped_start = _snap_to_allowed(chosen_start, START_WHITELIST, direction="nearest")
+        st.session_state.skip_transcript_this_run = True
+        with st.chat_message("assistant"):
+            ph = st.empty()
+            ph.markdown("**Great! Agent is planning your trip…**")
+            with st.spinner("Processing…"):
+                status, data = post(url, payload)
+            raw_answer = data.get(response_key, "") if isinstance(data, dict) else str(data)
+            final_answer = normalize_answer(raw_answer)
+            ph.markdown(final_answer)
 
-            chosen_end = end_date_input if isinstance(end_date_input, date) else END_WHITELIST[-1]
-            snapped_end = _snap_to_allowed(chosen_end, END_WHITELIST, direction="up", min_after=snapped_start)
+        sig = answer_sig(final_answer, payload)
+        if st.session_state.last_answer_hash != sig:
+            st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": None})
+            st.session_state.last_answer_hash = sig
 
-            # save filters (ISO)
-            st.session_state.filters = {
-                "ond": {"origin": origin_code, "destination": dest_code},
-                "start_date": snapped_start.isoformat(),
-                "end_date": snapped_end.isoformat(),
-                "policy_status": policy_input,
+    if st.session_state.mode == "Agentic AI":
+        if not st.session_state.boot_agentic:
+            qtext = build_query_combined(st.session_state.filters)
+            payload = {
+                "query": qtext,
+                "session_id": st.session_state.session_id,
+                "targets": ["air", "hotel", "tdna"],
+                "extra": {
+                    "user_name": st.session_state.user_name.strip(),
+                    "user_email": st.session_state.user_email.strip(),
+                    "filters": st.session_state.filters,
+                    "ui_version": "new-ui-v1",
+                    "source": "filters_apply",
+                    "llm_hints": "Use conversation history; keep answers succinct and avoid repetition.",
+                },
             }
+            _call_orchestrator(ROUTE_URL, payload, response_key="answer")
+            st.session_state.boot_agentic = True
+        else:
+            st.info("Filters updated. They’ll be used for your next message.", icon="✅")
 
-            # ---------- NEW: first-time-only Apply behavior ----------
-            def _call_orchestrator(url, payload, response_key):
-                st.session_state.skip_transcript_this_run = True
-                with st.chat_message("assistant"):
-                    ph = st.empty()
-                    ph.markdown("**Great! Agent is planning your trip…**")
-                    with st.spinner("Processing…"):
-                        status, data = post(url, payload)
-                    raw_answer = data.get(response_key, "") if isinstance(data, dict) else str(data)
-                    final_answer = normalize_answer(raw_answer)
-                    ph.markdown(final_answer)
-                sig = answer_sig(final_answer, payload)
-                if st.session_state.last_answer_hash != sig:
-                    st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": None})
-                    st.session_state.last_answer_hash = sig
-
-            if st.session_state.mode == "Agentic AI":
-                if not st.session_state.boot_agentic:
-                    # First time only → send the combined default query now
-                    qtext = build_query_combined(st.session_state.filters)
-                    payload = {
-                        "query": qtext,
-                        "session_id": st.session_state.session_id,
-                        "targets": ["air", "hotel", "tdna"],
-                        "extra": {
-                            "user_name": st.session_state.user_name.strip(),
-                            "user_email": st.session_state.user_email.strip(),
-                            "filters": st.session_state.filters,
-                            "ui_version": "new-ui-v1",
-                            "source": "filters_apply",
-                            "llm_hints": "Use conversation history; keep answers succinct and avoid repetition.",
-                        },
-                    }
-                    _call_orchestrator(ROUTE_URL, payload, response_key="answer")
-                    st.session_state.boot_agentic = True
-                else:
-                    # From now on, do NOT send default query again
-                    st.info("Filters updated. They’ll be used for your next message.", icon="✅")
-
+    else:
+        if st.session_state.target == "hotel":
+            if not st.session_state.boot_hotel:
+                qtext = build_query_hotels_only(st.session_state.filters)
+                payload = {
+                    "query": qtext,
+                    "session_id": st.session_state.session_id,
+                    "target": "hotel",
+                    "extra": {
+                        "user_name": st.session_state.user_name.strip(),
+                        "user_email": st.session_state.user_email.strip(),
+                        "filters": st.session_state.filters,
+                        "ui_version": "new-ui-v1",
+                        "source": "filters_apply",
+                    },
+                }
+                _call_orchestrator(ROUTE_URL, payload, response_key="answer")
+                st.session_state.boot_hotel = True
             else:
-                if st.session_state.target == "hotel":
-                    if not st.session_state.boot_hotel:
-                        qtext = build_query_hotels_only(st.session_state.filters)
-                        payload = {
-                            "query": qtext,
-                            "session_id": st.session_state.session_id,
-                            "target": "hotel",
-                            "extra": {
-                                "user_name": st.session_state.user_name.strip(),
-                                "user_email": st.session_state.user_email.strip(),
-                                "filters": st.session_state.filters,
-                                "ui_version": "new-ui-v1",
-                                "source": "filters_apply",
-                            },
-                        }
-                        _call_orchestrator(ROUTE_URL, payload, response_key="answer")
-                        st.session_state.boot_hotel = True
-                    else:
-                        st.info("Filters updated. They’ll be used for your next message.", icon="✅")
+                st.info("Filters updated. They’ll be used for your next message.", icon="✅")
 
-                elif st.session_state.target == "air":
-                    if not st.session_state.boot_air:
-                        qtext = build_query_flights_only(st.session_state.filters)
-                        payload = {
-                            "query": qtext,
-                            "session_id": st.session_state.session_id,
-                            "target": "air",
-                            "extra": {
-                                "user_name": st.session_state.user_name.strip(),
-                                "user_email": st.session_state.user_email.strip(),
-                                "filters": st.session_state.filters,
-                                "ui_version": "new-ui-v1",
-                                "source": "filters_apply",
-                            },
-                        }
-                        _call_orchestrator(ROUTE_URL, payload, response_key="answer")
-                        st.session_state.boot_air = True
-                    else:
-                        st.info("Filters updated. They’ll be used for your next message.", icon="✅")
+        elif st.session_state.target == "air":
+            if not st.session_state.boot_air:
+                qtext = build_query_flights_only(st.session_state.filters)
+                payload = {
+                    "query": qtext,
+                    "session_id": st.session_state.session_id,
+                    "target": "air",
+                    "extra": {
+                        "user_name": st.session_state.user_name.strip(),
+                        "user_email": st.session_state.user_email.strip(),
+                        "filters": st.session_state.filters,
+                        "ui_version": "new-ui-v1",
+                        "source": "filters_apply",
+                    },
+                }
+                _call_orchestrator(ROUTE_URL, payload, response_key="answer")
+                st.session_state.boot_air = True
+            else:
+                st.info("Filters updated. They’ll be used for your next message.", icon="✅")
 
-                else:
-                    st.info("TDNA does not use filters. Please type directly in chat.", icon="ℹ️")
+        else:
+            st.info("TDNA does not use filters. Please type directly in chat.", icon="ℹ️")
