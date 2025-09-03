@@ -1,57 +1,97 @@
-import re  # <-- add this at top with other imports
+# de-dupe guards (put right after ensure_state())
+if "last_user_sig" not in st.session_state:
+    st.session_state.last_user_sig = ""
+if "last_answer_hash" not in st.session_state:
+    st.session_state.last_answer_hash = ""
+if "skip_transcript_this_run" not in st.session_state:
+    st.session_state.skip_transcript_this_run = False
 
-# Replace your normalize_answer with this:
-HEADER_RE = re.compile(
-    r'^\s*(?:[*_]{0,2})\s*(air(?:\s*bot)?|hotel(?:\s*bot)?|tdna(?:\s*bot)?)\s*(?:[:\-–—|]+\s*)?(?:[*_]{0,2})\s*$',
-    re.IGNORECASE,
-)
-PREFIX_RE = re.compile(
-    r'^\s*(?:[*_]{0,2})\s*(air(?:\s*bot)?|hotel(?:\s*bot)?|tdna(?:\s*bot)?)\s*(?:[:\-–—|]+\s*)',
-    re.IGNORECASE,
-)
 
-def normalize_answer(text: str) -> str:
-    """
-    1) Drop stand-alone headers like 'Air:', 'Hotel:', 'TDNA:' lines (with optional **bold** / _italics_ and punctuation).
-    2) Strip those same headers when they appear at the START of a line that also has content (e.g., '**Air:** Best fare …').
-    3) Collapse accidental duplicate lines and multiple blank lines.
-    """
-    if not isinstance(text, str):
-        text = str(text)
+# ================== Chat input FIRST, then transcript (prevents double renders) ==================
+prompt = st.chat_input("Type a message and press Enter…")
 
-    lines = [ln.rstrip() for ln in text.splitlines()]
-    out = []
-    prev_norm = ""
+if prompt:
+    # ---- Prevent accidental double-submit (e.g., key repeat) ----
+    user_sig = hashlib.sha256(prompt.strip().encode()).hexdigest()[:16]
+    if st.session_state.last_user_sig == user_sig:
+        st.stop()  # ignore a duplicate keystroke in the same run
+    st.session_state.last_user_sig = user_sig
 
-    for ln in lines:
-        s = ln.strip()
-        if not s:
-            if out and out[-1] != "":
-                out.append("")
-            continue
+    # Show the user bubble right away
+    st.session_state.messages.append({"role": "user", "content": prompt, "meta": None})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-        # 1) Remove pure header lines like "Air:" / "**Hotel —**"
-        if HEADER_RE.match(s):
-            continue
+    # Build extra
+    extra = {
+        "user_name": st.session_state.user_name.strip(),
+        "user_email": st.session_state.user_email.strip(),
+        "filters": {
+            "ond": {
+                "origin": st.session_state.filters["ond"]["origin"],
+                "destination": st.session_state.filters["ond"]["destination"],
+            },
+            "start_date": st.session_state.filters["start_date"],
+            "end_date": st.session_state.filters.get("end_date"),
+            "policy_status": st.session_state.filters["policy_status"],
+        },
+        "ui_version": "new-ui-v1",
+        "source": "chat_input",
+    }
 
-        # 2) Remove header prefix at the very start of the line (e.g., "Air: Best …")
-        s = PREFIX_RE.sub("", s)
+    # Decide endpoint for this chat turn
+    if st.session_state.mode == "Agentic AI":
+        # Agentic chat → use AGENT_URL (planner/loop)
+        payload = {
+            "query": prompt.strip(),
+            "session_id": st.session_state.session_id,
+            "autonomy": st.session_state.autonomy,
+            "max_iters": st.session_state.max_iters,
+            "extra": extra,
+        }
+        url = AGENT_URL
+        response_key = "final_answer"
+    else:
+        # Direct tool (AIR/HOTEL/TDNA) → /route_query
+        payload = {
+            "query": prompt.strip(),
+            "target": st.session_state.target,
+            "extra": extra,
+            "session_id": f"{st.session_state.session_id}::{st.session_state.target}",
+        }
+        url = ROUTE_URL
+        response_key = "answer"
 
-        # 3) De-dupe near-identical consecutive lines
-        norm = " ".join(s.split()).rstrip(" .|").lower()
-        if norm == prev_norm:
-            continue
-        if out and " ".join(out[-1].split()).rstrip(" .|").lower() == norm:
-            continue
+    # ---- Single bubble that updates from 'thinking' → final answer; skip transcript this run ----
+    st.session_state.skip_transcript_this_run = True
+    try:
+        with st.chat_message("assistant"):
+            ph = st.empty()
+            ph.markdown("_thinking…_")
+            status, data = post(url, payload)
+            raw_answer = data.get(response_key, "") if isinstance(data, dict) else str(data)
+            final_answer = normalize_answer(raw_answer)
+            ph.markdown(final_answer)
 
-        out.append(s)
-        prev_norm = norm
+        # Append once to history with a robust signature to avoid duplicates on rerun
+        sig = answer_sig(final_answer, payload)
+        if st.session_state.last_answer_hash != sig:
+            st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": None})
+            st.session_state.last_answer_hash = sig
+    except Exception as e:
+        err = f"Request error: {e}"
+        with st.chat_message("assistant"):
+            st.markdown(err)
+        sig = answer_sig(err, {"query": prompt, "sid": st.session_state.session_id})
+        if st.session_state.last_answer_hash != sig:
+            st.session_state.messages.append({"role": "assistant", "content": err, "meta": None})
+            st.session_state.last_answer_hash = sig
 
-    # 4) Collapse multiple blank lines
-    cleaned = []
-    for s in out:
-        if s == "" and (not cleaned or cleaned[-1] == ""):
-            continue
-        cleaned.append(s)
+# ================== Transcript (render AFTER handling input) ==================
+if not st.session_state.get("skip_transcript_this_run", False):
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
 
-    return "\n".join(cleaned).strip()
+# Reset the skip flag so next rerun shows the updated transcript once
+st.session_state.skip_transcript_this_run = False
