@@ -1,28 +1,472 @@
-# de-dupe guards (put right after ensure_state())
-if "last_user_sig" not in st.session_state:
-    st.session_state.last_user_sig = ""
-if "last_answer_hash" not in st.session_state:
-    st.session_state.last_answer_hash = ""
-if "skip_transcript_this_run" not in st.session_state:
-    st.session_state.skip_transcript_this_run = False
+# filtered_new_ui.py
+import json
+import uuid
+import re
+import hashlib
+import requests
+import streamlit as st
+from pathlib import Path
+from datetime import date
 
+# ================== Orchestrator endpoints (aligned with your FastAPI) ==================
+ORCH_BASE = "http://localhost:9000"  # change if deployed
+ROUTE_URL = f"{ORCH_BASE}/route_query"   # expects: query, (target|targets), extra, session_id
+AGENT_URL = f"{ORCH_BASE}/agent_query"   # expects: query, extra, session_id, max_iters, parallel_cap, autonomy
+TIMEOUT   = 30
+
+# ================== Example users ==================
+USERS = [
+    {"name": "Alice Singh",  "email": "alice@example.com"},
+    {"name": "Bob Kumar",    "email": "bob@example.com"},
+    {"name": "Charlie Rao",  "email": "charlie@example.com"},
+]
+
+# ================== Airports: options + labels ==================
+AIRPORT_LABELS = {
+    "DEL": "Delhi — Indira Gandhi Intl",
+    "BOM": "Mumbai — Chhatrapati Shivaji Maharaj Intl",
+    "BLR": "Bengaluru — Kempegowda Intl",
+    "MAA": "Chennai — Chennai Intl",
+    "HYD": "Hyderabad — Rajiv Gandhi Intl",
+    "CCU": "Kolkata — Netaji Subhas Chandra Bose Intl",
+    "PNQ": "Pune — Lohegaon",
+    "COK": "Kochi — Cochin Intl",
+    "GOI": "Goa — Dabolim",
+    "DXB": "Dubai — Dubai Intl",
+    "SIN": "Singapore — Changi",
+    "LHR": "London — Heathrow",
+    "JFK": "New York — John F. Kennedy Intl",
+    "SFO": "San Francisco — SFO",
+}
+ORIGIN_OPTIONS      = ["DEL","BLR","MAA","HYD","CCU","PNQ","COK","GOI","BOM","DXB","SIN","LHR","JFK","SFO"]
+DESTINATION_OPTIONS = ["BOM","DEL","BLR","CCU","MAA","HYD","COK","PNQ","GOI","DXB","SIN","LHR","JFK","SFO"]
+
+def label_for(code: str) -> str:
+    return f"{code} ({AIRPORT_LABELS.get(code, 'Unknown')})"
+
+# ================== Allowed dates (START + END whitelists) ==================
+ALLOWED_START_DATES = ["2025-09-01", "2025-09-05", "2025-09-08", "2025-09-10", "2025-10-01"]
+ALLOWED_END_DATES   = ["2025-09-01", "2025-09-07", "2025-09-10", "2025-09-15", "2025-10-31", "2025-12-31"]
+
+def _iso_to_dates(xs):
+    return sorted(date.fromisoformat(x) if isinstance(x, str) else x for x in xs)
+
+START_WHITELIST = _iso_to_dates(ALLOWED_START_DATES)
+END_WHITELIST   = _iso_to_dates(ALLOWED_END_DATES)
+
+def _snap_to_allowed(chosen: date, allowed: list[date], *, direction="nearest", min_after: date | None = None) -> date:
+    if not allowed:
+        return chosen
+    cand = allowed
+    if min_after is not None:
+        cand = [d for d in allowed if d >= min_after] or [allowed[-1]]
+    if direction == "up":
+        for d in cand:
+            if d >= chosen:
+                return d
+        return cand[-1]
+    if direction == "down":
+        for d in reversed(cand):
+            if d <= chosen:
+                return d
+        return cand[0]
+    return min(cand, key=lambda d: abs(d - chosen))
+
+# ================== Page config (Logo + Favicon) ==================
+LOGO_PATH    = Path("assets/logo.png")       # your existing paths
+FAVICON_PATH = Path("assets/favicon.png")
+st.set_page_config(
+    page_title="Orchestrator Chat",
+    page_icon=str(FAVICON_PATH) if FAVICON_PATH.exists() else "💬",
+    layout="centered",
+)
+if LOGO_PATH.exists():
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        st.image(str(LOGO_PATH), use_container_width=False)
+st.markdown("<h1 style='text-align:center'>💬 Orchestrator — Conversational Chat</h1>", unsafe_allow_html=True)
+
+# ================== HTTP + normalization helpers ==================
+def post(url: str, payload: dict):
+    r = requests.post(url, json=payload, timeout=TIMEOUT)
+    if r.headers.get("content-type","").startswith("application/json"):
+        return r.status_code, r.json()
+    return r.status_code, r.text
+
+HEADER_RE = re.compile(
+    r'^\s*(?:[*_]{0,2})\s*(air(?:\s*bot)?|hotel(?:\s*bot)?|tdna(?:\s*bot)?)\s*(?:[:\-–—|]+\s*)?(?:[*_]{0,2})\s*$',
+    re.IGNORECASE,
+)
+PREFIX_RE = re.compile(
+    r'^\s*(?:[*_]{0,2})\s*(air(?:\s*bot)?|hotel(?:\s*bot)?|tdna(?:\s*bot)?)\s*(?:[:\-–—|]+\s*)',
+    re.IGNORECASE,
+)
+
+def normalize_answer(text: str) -> str:
+    """
+    1) Drop stand-alone 'Air:' / 'Hotel:' / 'TDNA:' lines (with bold/italics/punctuation).
+    2) Strip those prefixes when they appear at the start of a content line.
+    3) Collapse duplicate/blank lines.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    out = []
+    prev_norm = ""
+
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+
+        if HEADER_RE.match(s):
+            continue
+
+        s = PREFIX_RE.sub("", s)
+
+        norm = " ".join(s.split()).rstrip(" .|").lower()
+        if norm == prev_norm:
+            continue
+        if out and " ".join(out[-1].split()).rstrip(" .|").lower() == norm:
+            continue
+
+        out.append(s)
+        prev_norm = norm
+
+    cleaned = []
+    for s in out:
+        if s == "" and (not cleaned or cleaned[-1] == ""):
+            continue
+        cleaned.append(s)
+
+    return "\n".join(cleaned).strip()
+
+def answer_sig(text: str, payload: dict | None = None) -> str:
+    base = {"a": text}
+    if payload:
+        base["q"] = payload.get("query")
+        base["t"] = payload.get("target") or payload.get("targets")
+        base["sid"] = payload.get("session_id")
+    return hashlib.sha256(json.dumps(base, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+POLICY_OPTIONS = ["In policy", "Out of policy"]
+
+def ensure_state():
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = "user123"
+    if "mode" not in st.session_state:
+        st.session_state.mode = "Agentic AI"
+    if "target" not in st.session_state:
+        st.session_state.target = "air"
+    if "user_name" not in st.session_state:
+        st.session_state.user_name = ""
+    if "user_email" not in st.session_state:
+        st.session_state.user_email = ""
+    if "autonomy" not in st.session_state:
+        st.session_state.autonomy = True
+    if "max_iters" not in st.session_state:
+        st.session_state.max_iters = 3
+
+    # Filters state (end_date included)
+    if "filters" not in st.session_state:
+        st.session_state.filters = {
+            "ond": {"origin": None, "destination": None},
+            "start_date": None,
+            "end_date": None,
+            "policy_status": POLICY_OPTIONS[0],  # default = In policy
+        }
+    else:
+        st.session_state.filters.setdefault("end_date", None)
+        if st.session_state.filters.get("policy_status") not in POLICY_OPTIONS:
+            st.session_state.filters["policy_status"] = POLICY_OPTIONS[0]
+
+    # dedupe/flow guards
+    if "last_answer_hash" not in st.session_state:
+        st.session_state.last_answer_hash = ""
+    if "last_user_sig" not in st.session_state:
+        st.session_state.last_user_sig = ""
+    if "skip_transcript_this_run" not in st.session_state:
+        st.session_state.skip_transcript_this_run = False
+
+ensure_state()
+
+# ----- Query builders for Apply (depend on mode/target) -----
+def _filters_str(fil: dict) -> str:
+    return (
+        f"[Filters] Origin: {fil['ond']['origin'] or '—'}, "
+        f"Destination: {fil['ond']['destination'] or '—'}, "
+        f"Start: {fil['start_date'] or '—'}, "
+        f"End: {fil['end_date'] or '—'}, "
+        f"Policy: {fil['policy_status']}"
+    )
+
+def build_query_combined(fil: dict) -> str:
+    # Agentic AI (combined Air+Hotel+TDNA)
+    return (
+        "Provide me the best flights for the given route from AIR bot and also provide "
+        "best/prefered hotels from HOTEL bot , do check traveller's past history from TDNA bot. "
+        + _filters_str(fil)
+    )
+
+def build_query_hotels_only(fil: dict) -> str:
+    # Direct tool → HOTEL
+    return "Provide me the best /prefered hotels from HOTEL bot , . " + _filters_str(fil)
+
+def build_query_flights_only(fil: dict) -> str:
+    # Direct tool → AIR
+    return "Provide me the best flights for the given route from AIR bot . " + _filters_str(fil)
+
+# ================== Sidebar ==================
+with st.sidebar:
+    st.subheader("User")
+    user_labels = [f"{u['name']} <{u['email']}>" for u in USERS] + ["Other…"]
+    picked = st.selectbox("Choose a user", user_labels, index=0)
+    if picked != "Other…":
+        idx = user_labels.index(picked)
+        chosen = USERS[idx]
+        user_name_default = chosen["name"]
+        user_email_default = chosen["email"]
+    else:
+        user_name_default = ""
+        user_email_default = ""
+
+    st.session_state.user_name = st.text_input("Name", value=user_name_default, placeholder="e.g., Priya Sharma")
+    st.session_state.user_email = st.text_input("Email", value=user_email_default, placeholder="e.g., priya@company.com")
+
+    st.markdown("---")
+    st.subheader("Session")
+    default_session = st.session_state.user_email or st.session_state.session_id
+    new_session_id = st.text_input("Session ID", value=default_session, key="sid_input")
+    if new_session_id != st.session_state.session_id:
+        st.session_state.session_id = new_session_id
+
+    col_a, col_b = st.columns(2)
+    if col_a.button("🆕 New Chat"):
+        sid = f"{(st.session_state.user_email or 'user')}-{uuid.uuid4().hex[:8]}"
+        st.session_state.session_id = sid
+        st.session_state.messages = []
+        st.session_state.last_answer_hash = ""
+        st.success(f"New session id: {sid}")
+
+    st.markdown("---")
+    st.subheader("Mode")
+    st.session_state.mode = st.radio(
+        "How should the next message be handled?",
+        ["Agentic AI", "Direct tool"],
+        captions=["Let the orchestrator plan and call tools", "Call a specific backend directly"]
+    )
+    if st.session_state.mode == "Direct tool":
+        st.session_state.target = st.segmented_control(
+            "Target", options=["air", "hotel", "tdna"], default="air"
+        )
+
+    st.markdown("---")
+    st.subheader("Agent Settings")
+    st.session_state.autonomy = st.checkbox("Enable Autonomy (agent loop)", value=st.session_state.autonomy)
+    st.session_state.max_iters = st.slider("Max Iterations", 1, 8, st.session_state.max_iters)
+
+# ================== Filters (show in ALL except TDNA) ==================
+show_filters = not (st.session_state.mode == "Direct tool" and st.session_state.target == "tdna")
+
+if show_filters:
+    with st.container():
+        st.markdown("### 🔎 Filters")
+        f1, f2, f3, f4, f5 = st.columns([1,1,1,1,1])
+
+        with f1:
+            origin_code = st.selectbox(
+                "Origin",
+                options=ORIGIN_OPTIONS,
+                index=(ORIGIN_OPTIONS.index(st.session_state.filters["ond"]["origin"])
+                       if st.session_state.filters["ond"]["origin"] in ORIGIN_OPTIONS else 0),
+                format_func=label_for,
+            )
+        with f2:
+            dest_code = st.selectbox(
+                "Destination",
+                options=DESTINATION_OPTIONS,
+                index=(DESTINATION_OPTIONS.index(st.session_state.filters["ond"]["destination"])
+                       if st.session_state.filters["ond"]["destination"] in DESTINATION_OPTIONS else 0),
+                format_func=label_for,
+            )
+        with f3:
+            min_start = START_WHITELIST[0]
+            max_start = START_WHITELIST[-1]
+            start_default = (
+                date.fromisoformat(st.session_state.filters["start_date"])
+                if st.session_state.filters["start_date"] else START_WHITELIST[0]
+            )
+            start_default = _snap_to_allowed(start_default, START_WHITELIST, direction="nearest")
+            start_date_input = st.date_input(
+                "Start date",
+                value=start_default,
+                min_value=min_start,
+                max_value=max_start,
+                format="YYYY-MM-DD",
+            )
+        with f4:
+            min_end = END_WHITELIST[0]
+            max_end = END_WHITELIST[-1]
+            end_default = (
+                date.fromisoformat(st.session_state.filters["end_date"])
+                if st.session_state.filters["end_date"] else END_WHITELIST[-1]
+            )
+            end_default = _snap_to_allowed(end_default, END_WHITELIST, direction="up")
+            end_date_input = st.date_input(
+                "End date",
+                value=end_default,
+                min_value=min_end,
+                max_value=max_end,
+                format="YYYY-MM-DD",
+            )
+        with f5:
+            policy_input = st.selectbox(
+                "Policy status",
+                options=POLICY_OPTIONS,
+                index=POLICY_OPTIONS.index(st.session_state.filters["policy_status"]),
+            )
+
+        st.caption(
+            "Allowed start dates: " + ", ".join(d.isoformat() for d in START_WHITELIST) + "  \n"
+            "Allowed end dates: " + ", ".join(d.isoformat() for d in END_WHITELIST)
+        )
+
+        b1, b2 = st.columns(2)
+        with b1:
+            apply = st.button("Apply", use_container_width=True)
+        with b2:
+            clear = st.button("Clear", use_container_width=True)
+
+        if apply:
+            if origin_code == dest_code:
+                st.warning("Origin and Destination cannot be the same.")
+
+            chosen_start = start_date_input if isinstance(start_date_input, date) else START_WHITELIST[0]
+            snapped_start = _snap_to_allowed(chosen_start, START_WHITELIST, direction="nearest")
+
+            chosen_end = end_date_input if isinstance(end_date_input, date) else END_WHITELIST[-1]
+            snapped_end = _snap_to_allowed(chosen_end, END_WHITELIST, direction="up", min_after=snapped_start)
+
+            # save filters (ISO)
+            st.session_state.filters = {
+                "ond": {"origin": origin_code, "destination": dest_code},
+                "start_date": snapped_start.isoformat(),
+                "end_date": snapped_end.isoformat(),
+                "policy_status": policy_input,
+            }
+
+            # ---- Build per-mode request (aligned payloads) ----
+            if st.session_state.mode == "Agentic AI":
+                # Use /route_query with explicit fan-out → orchestrator composes `answer`
+                qtext = build_query_combined(st.session_state.filters)
+                url = ROUTE_URL
+                payload = {
+                    "query": qtext,
+                    "session_id": st.session_state.session_id,
+                    "targets": ["air", "hotel", "tdna"],     # explicit list → matches orchestrator RouteIn
+                    "extra": {
+                        "user_name": st.session_state.user_name.strip(),
+                        "user_email": st.session_state.user_email.strip(),
+                        "filters": st.session_state.filters,
+                        "ui_version": "new-ui-v1",
+                        "source": "filters_apply",
+                    },
+                }
+                response_key = "answer"
+            else:
+                if st.session_state.target == "hotel":
+                    qtext = build_query_hotels_only(st.session_state.filters)
+                    url = ROUTE_URL
+                    payload = {
+                        "query": qtext,
+                        "session_id": st.session_state.session_id,
+                        "target": "hotel",                    # single target → matches RouteIn
+                        "extra": {
+                            "user_name": st.session_state.user_name.strip(),
+                            "user_email": st.session_state.user_email.strip(),
+                            "filters": st.session_state.filters,
+                            "ui_version": "new-ui-v1",
+                            "source": "filters_apply",
+                        },
+                    }
+                    response_key = "answer"
+                elif st.session_state.target == "air":
+                    qtext = build_query_flights_only(st.session_state.filters)
+                    url = ROUTE_URL
+                    payload = {
+                        "query": qtext,
+                        "session_id": st.session_state.session_id,
+                        "target": "air",
+                        "extra": {
+                            "user_name": st.session_state.user_name.strip(),
+                            "user_email": st.session_state.user_email.strip(),
+                            "filters": st.session_state.filters,
+                            "ui_version": "new-ui-v1",
+                            "source": "filters_apply",
+                        },
+                    }
+                    response_key = "answer"
+                else:
+                    st.info("TDNA does not use filters. Please type directly in chat.")
+                    url, payload, response_key = None, None, None
+
+            if url and payload:
+                st.session_state.skip_transcript_this_run = True
+                with st.chat_message("assistant"):
+                    ph = st.empty()
+                    ph.markdown("**Great! Agent is planning your trip…**")
+                    with st.spinner("Processing…"):
+                        status, data = post(url, payload)
+                    raw_answer = data.get(response_key, "") if isinstance(data, dict) else str(data)
+                    final_answer = normalize_answer(raw_answer)
+                    ph.markdown(final_answer)
+
+                sig = answer_sig(final_answer, payload)
+                if st.session_state.last_answer_hash != sig:
+                    st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": None})
+                    st.session_state.last_answer_hash = sig
+
+        if clear:
+            st.session_state.filters = {
+                "ond": {"origin": None, "destination": None},
+                "start_date": None,
+                "end_date": None,
+                "policy_status": POLICY_OPTIONS[0],
+            }
+            st.info("Filters cleared.")
+
+        fil = st.session_state.filters
+        st.caption(
+            f"Active filters → "
+            f"OND: {fil['ond']['origin'] or '—'}→{fil['ond']['destination'] or '—'} | "
+            f"Start: {fil['start_date'] or '—'} | "
+            f"End: {fil['end_date'] or '—'} | "
+            f"Policy: {fil['policy_status']}"
+        )
+else:
+    st.info("Filters are not available when using TDNA directly. Switch to Agentic AI or a different tool to apply filters.")
 
 # ================== Chat input FIRST, then transcript (prevents double renders) ==================
 prompt = st.chat_input("Type a message and press Enter…")
 
 if prompt:
-    # ---- Prevent accidental double-submit (e.g., key repeat) ----
+    # ---- Prevent accidental double-submit in same run ----
     user_sig = hashlib.sha256(prompt.strip().encode()).hexdigest()[:16]
     if st.session_state.last_user_sig == user_sig:
-        st.stop()  # ignore a duplicate keystroke in the same run
+        st.stop()
     st.session_state.last_user_sig = user_sig
 
-    # Show the user bubble right away
+    # user bubble
     st.session_state.messages.append({"role": "user", "content": prompt, "meta": None})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Build extra
+    # common extras (orchestrator passes nested/flat per PASS_EXTRA_MODE)
     extra = {
         "user_name": st.session_state.user_name.strip(),
         "user_email": st.session_state.user_email.strip(),
@@ -32,37 +476,35 @@ if prompt:
                 "destination": st.session_state.filters["ond"]["destination"],
             },
             "start_date": st.session_state.filters["start_date"],
-            "end_date": st.session_state.filters.get("end_date"),
+            "end_date": st.session_state.filters["end_date"],
             "policy_status": st.session_state.filters["policy_status"],
         },
         "ui_version": "new-ui-v1",
         "source": "chat_input",
     }
 
-    # Decide endpoint for this chat turn
+    # Decide endpoint per mode (aligned with orchestrator models)
     if st.session_state.mode == "Agentic AI":
-        # Agentic chat → use AGENT_URL (planner/loop)
         payload = {
             "query": prompt.strip(),
             "session_id": st.session_state.session_id,
             "autonomy": st.session_state.autonomy,
             "max_iters": st.session_state.max_iters,
             "extra": extra,
+            # parallel_cap left to default in server (2), adjust here if needed
         }
         url = AGENT_URL
         response_key = "final_answer"
     else:
-        # Direct tool (AIR/HOTEL/TDNA) → /route_query
         payload = {
             "query": prompt.strip(),
-            "target": st.session_state.target,
+            "target": st.session_state.target,               # "air" | "hotel" | "tdna"
             "extra": extra,
             "session_id": f"{st.session_state.session_id}::{st.session_state.target}",
         }
         url = ROUTE_URL
         response_key = "answer"
 
-    # ---- Single bubble that updates from 'thinking' → final answer; skip transcript this run ----
     st.session_state.skip_transcript_this_run = True
     try:
         with st.chat_message("assistant"):
@@ -73,7 +515,6 @@ if prompt:
             final_answer = normalize_answer(raw_answer)
             ph.markdown(final_answer)
 
-        # Append once to history with a robust signature to avoid duplicates on rerun
         sig = answer_sig(final_answer, payload)
         if st.session_state.last_answer_hash != sig:
             st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": None})
@@ -93,5 +534,9 @@ if not st.session_state.get("skip_transcript_this_run", False):
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
 
-# Reset the skip flag so next rerun shows the updated transcript once
+# Reset flag for next run
 st.session_state.skip_transcript_this_run = False
+
+# footer
+st.markdown("---")
+st.caption("This chat uses the orchestrator’s HTTP endpoints and preserves conversational state via session_id.")
