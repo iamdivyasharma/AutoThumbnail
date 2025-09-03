@@ -8,10 +8,10 @@ import streamlit as st
 from pathlib import Path
 from datetime import date
 
-# ================== Orchestrator endpoints (aligned with your FastAPI) ==================
+# ================== Orchestrator endpoints ==================
 ORCH_BASE = "http://localhost:9000"  # change if deployed
-ROUTE_URL = f"{ORCH_BASE}/route_query"   # expects: query, (target|targets), extra, session_id
-AGENT_URL = f"{ORCH_BASE}/agent_query"   # expects: query, extra, session_id, max_iters, parallel_cap, autonomy
+ROUTE_URL = f"{ORCH_BASE}/route_query"   # -> expects: query, (target|targets), extra, session_id
+AGENT_URL = f"{ORCH_BASE}/agent_query"   # -> expects: query, extra, session_id, max_iters, parallel_cap, autonomy
 TIMEOUT   = 30
 
 # ================== Example users ==================
@@ -21,7 +21,7 @@ USERS = [
     {"name": "Charlie Rao",  "email": "charlie@example.com"},
 ]
 
-# ================== Airports: options + labels ==================
+# ================== Airports ==================
 AIRPORT_LABELS = {
     "DEL": "Delhi — Indira Gandhi Intl",
     "BOM": "Mumbai — Chhatrapati Shivaji Maharaj Intl",
@@ -40,17 +40,14 @@ AIRPORT_LABELS = {
 }
 ORIGIN_OPTIONS      = ["DEL","BLR","MAA","HYD","CCU","PNQ","COK","GOI","BOM","DXB","SIN","LHR","JFK","SFO"]
 DESTINATION_OPTIONS = ["BOM","DEL","BLR","CCU","MAA","HYD","COK","PNQ","GOI","DXB","SIN","LHR","JFK","SFO"]
-
 def label_for(code: str) -> str:
     return f"{code} ({AIRPORT_LABELS.get(code, 'Unknown')})"
 
-# ================== Allowed dates (START + END whitelists) ==================
+# ================== Allowed dates (whitelists) ==================
 ALLOWED_START_DATES = ["2025-09-01", "2025-09-05", "2025-09-08", "2025-09-10", "2025-10-01"]
 ALLOWED_END_DATES   = ["2025-09-01", "2025-09-07", "2025-09-10", "2025-09-15", "2025-10-31", "2025-12-31"]
-
 def _iso_to_dates(xs):
     return sorted(date.fromisoformat(x) if isinstance(x, str) else x for x in xs)
-
 START_WHITELIST = _iso_to_dates(ALLOWED_START_DATES)
 END_WHITELIST   = _iso_to_dates(ALLOWED_END_DATES)
 
@@ -73,7 +70,7 @@ def _snap_to_allowed(chosen: date, allowed: list[date], *, direction="nearest", 
     return min(cand, key=lambda d: abs(d - chosen))
 
 # ================== Page config (Logo + Favicon) ==================
-LOGO_PATH    = Path("assets/logo.png")       # your existing paths
+LOGO_PATH    = Path("assets/logo.png")
 FAVICON_PATH = Path("assets/favicon.png")
 st.set_page_config(
     page_title="Orchestrator Chat",
@@ -101,47 +98,33 @@ PREFIX_RE = re.compile(
     r'^\s*(?:[*_]{0,2})\s*(air(?:\s*bot)?|hotel(?:\s*bot)?|tdna(?:\s*bot)?)\s*(?:[:\-–—|]+\s*)',
     re.IGNORECASE,
 )
-
 def normalize_answer(text: str) -> str:
-    """
-    1) Drop stand-alone 'Air:' / 'Hotel:' / 'TDNA:' lines (with bold/italics/punctuation).
-    2) Strip those prefixes when they appear at the start of a content line.
-    3) Collapse duplicate/blank lines.
-    """
+    """Drop service headers; strip prefixes; collapse duplicates/blank lines."""
     if not isinstance(text, str):
         text = str(text)
-
     lines = [ln.rstrip() for ln in text.splitlines()]
-    out = []
-    prev_norm = ""
-
+    out, prev_norm = [], ""
     for ln in lines:
         s = ln.strip()
         if not s:
             if out and out[-1] != "":
                 out.append("")
             continue
-
         if HEADER_RE.match(s):
             continue
-
         s = PREFIX_RE.sub("", s)
-
         norm = " ".join(s.split()).rstrip(" .|").lower()
         if norm == prev_norm:
             continue
         if out and " ".join(out[-1].split()).rstrip(" .|").lower() == norm:
             continue
-
         out.append(s)
         prev_norm = norm
-
     cleaned = []
     for s in out:
         if s == "" and (not cleaned or cleaned[-1] == ""):
             continue
         cleaned.append(s)
-
     return "\n".join(cleaned).strip()
 
 def answer_sig(text: str, payload: dict | None = None) -> str:
@@ -172,7 +155,7 @@ def ensure_state():
     if "max_iters" not in st.session_state:
         st.session_state.max_iters = 3
 
-    # Filters state (end_date included)
+    # Filters state
     if "filters" not in st.session_state:
         st.session_state.filters = {
             "ond": {"origin": None, "destination": None},
@@ -185,7 +168,7 @@ def ensure_state():
         if st.session_state.filters.get("policy_status") not in POLICY_OPTIONS:
             st.session_state.filters["policy_status"] = POLICY_OPTIONS[0]
 
-    # dedupe/flow guards
+    # de-dupe/flow guards
     if "last_answer_hash" not in st.session_state:
         st.session_state.last_answer_hash = ""
     if "last_user_sig" not in st.session_state:
@@ -239,11 +222,11 @@ with st.sidebar:
     st.session_state.user_email = st.text_input("Email", value=user_email_default, placeholder="e.g., priya@company.com")
 
     st.markdown("---")
-    st.subheader("Session")
+    st.subheader("Session (keep this the same for conversation memory)")
     default_session = st.session_state.user_email or st.session_state.session_id
     new_session_id = st.text_input("Session ID", value=default_session, key="sid_input")
     if new_session_id != st.session_state.session_id:
-        st.session_state.session_id = new_session_id
+        st.session_state.session_id = new_session_id  # <- keep constant to persist memory
 
     col_a, col_b = st.columns(2)
     if col_a.button("🆕 New Chat"):
@@ -258,7 +241,7 @@ with st.sidebar:
     st.session_state.mode = st.radio(
         "How should the next message be handled?",
         ["Agentic AI", "Direct tool"],
-        captions=["Let the orchestrator plan and call tools", "Call a specific backend directly"]
+        captions=["Plan/call tools with memory", "Call one backend directly"]
     )
     if st.session_state.mode == "Direct tool":
         st.session_state.target = st.segmented_control(
@@ -360,21 +343,21 @@ if show_filters:
                 "policy_status": policy_input,
             }
 
-            # ---- Build per-mode request (aligned payloads) ----
+            # ---- Build per-mode request ----
             if st.session_state.mode == "Agentic AI":
-                # Use /route_query with explicit fan-out → orchestrator composes `answer`
                 qtext = build_query_combined(st.session_state.filters)
                 url = ROUTE_URL
                 payload = {
                     "query": qtext,
-                    "session_id": st.session_state.session_id,
-                    "targets": ["air", "hotel", "tdna"],     # explicit list → matches orchestrator RouteIn
+                    "session_id": st.session_state.session_id,   # <-- SAME SID keeps conversation memory
+                    "targets": ["air", "hotel", "tdna"],
                     "extra": {
                         "user_name": st.session_state.user_name.strip(),
                         "user_email": st.session_state.user_email.strip(),
                         "filters": st.session_state.filters,
                         "ui_version": "new-ui-v1",
                         "source": "filters_apply",
+                        "llm_hints": "Use conversation history; keep answers succinct and avoid repetition.",
                     },
                 }
                 response_key = "answer"
@@ -385,7 +368,7 @@ if show_filters:
                     payload = {
                         "query": qtext,
                         "session_id": st.session_state.session_id,
-                        "target": "hotel",                    # single target → matches RouteIn
+                        "target": "hotel",
                         "extra": {
                             "user_name": st.session_state.user_name.strip(),
                             "user_email": st.session_state.user_email.strip(),
@@ -451,11 +434,11 @@ if show_filters:
 else:
     st.info("Filters are not available when using TDNA directly. Switch to Agentic AI or a different tool to apply filters.")
 
-# ================== Chat input FIRST, then transcript (prevents double renders) ==================
+# ================== Chat input FIRST (so we control this run) ==================
 prompt = st.chat_input("Type a message and press Enter…")
 
 if prompt:
-    # ---- Prevent accidental double-submit in same run ----
+    # Prevent accidental double-submit same run
     user_sig = hashlib.sha256(prompt.strip().encode()).hexdigest()[:16]
     if st.session_state.last_user_sig == user_sig:
         st.stop()
@@ -466,7 +449,7 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # common extras (orchestrator passes nested/flat per PASS_EXTRA_MODE)
+    # common extras
     extra = {
         "user_name": st.session_state.user_name.strip(),
         "user_email": st.session_state.user_email.strip(),
@@ -481,25 +464,26 @@ if prompt:
         },
         "ui_version": "new-ui-v1",
         "source": "chat_input",
+        "llm_hints": "Use conversation history (session_id) to maintain context.",
     }
 
-    # Decide endpoint per mode (aligned with orchestrator models)
+    # Decide endpoint per mode (Agentic AI must keep SAME session_id)
     if st.session_state.mode == "Agentic AI":
         payload = {
             "query": prompt.strip(),
-            "session_id": st.session_state.session_id,
+            "session_id": st.session_state.session_id,  # <-- SAME SID => orchestrator sees history
             "autonomy": st.session_state.autonomy,
             "max_iters": st.session_state.max_iters,
             "extra": extra,
-            # parallel_cap left to default in server (2), adjust here if needed
         }
         url = AGENT_URL
         response_key = "final_answer"
     else:
         payload = {
             "query": prompt.strip(),
-            "target": st.session_state.target,               # "air" | "hotel" | "tdna"
+            "target": st.session_state.target,  # "air" | "hotel" | "tdna"
             "extra": extra,
+            # For direct tools you may want per-target threads; if you want global, remove ::target
             "session_id": f"{st.session_state.session_id}::{st.session_state.target}",
         }
         url = ROUTE_URL
