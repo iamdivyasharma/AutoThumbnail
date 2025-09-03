@@ -21,6 +21,29 @@ USERS = [
     {"name": "Charlie Rao",  "email": "charlie@example.com"},
 ]
 
+# ================== Airports: options + labels ==================
+AIRPORT_LABELS = {
+    "DEL": "Delhi — Indira Gandhi Intl",
+    "BOM": "Mumbai — Chhatrapati Shivaji Maharaj Intl",
+    "BLR": "Bengaluru — Kempegowda Intl",
+    "MAA": "Chennai — Chennai Intl",
+    "HYD": "Hyderabad — Rajiv Gandhi Intl",
+    "CCU": "Kolkata — Netaji Subhas Chandra Bose Intl",
+    "PNQ": "Pune — Lohegaon",
+    "COK": "Kochi — Cochin Intl",
+    "GOI": "Goa — Dabolim",
+    "DXB": "Dubai — Dubai Intl",
+    "SIN": "Singapore — Changi",
+    "LHR": "London — Heathrow",
+    "JFK": "New York — John F. Kennedy Intl",
+    "SFO": "San Francisco — SFO",
+}
+ORIGIN_OPTIONS      = ["DEL","BLR","MAA","HYD","CCU","PNQ","COK","GOI","BOM","DXB","SIN","LHR","JFK","SFO"]
+DESTINATION_OPTIONS = ["BOM","DEL","BLR","CCU","MAA","HYD","COK","PNQ","GOI","DXB","SIN","LHR","JFK","SFO"]
+
+def label_for(code: str) -> str:
+    return f"{code} ({AIRPORT_LABELS.get(code, 'Unknown')})"
+
 # ================== Page config (Logo + Favicon) ==================
 LOGO_PATH    = Path("assets/logo.png")       # <-- direct path to your logo file
 FAVICON_PATH = Path("assets/favicon.png")    # <-- direct path to your favicon file
@@ -169,18 +192,23 @@ if show_filters:
         st.markdown("### 🔎 Filters")
         fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns([1,1,1,1,1])
 
+        # 🔽 CHANGED: use dropdowns for origin/destination
         with fcol1:
-            origin_input = st.text_input(
-                "Origin (IATA)",
-                value=(st.session_state.filters["ond"]["origin"] or ""),
-                placeholder="e.g., DEL"
-            ).upper().strip()
+            origin_code = st.selectbox(
+                "Origin",
+                options=ORIGIN_OPTIONS,
+                index=(ORIGIN_OPTIONS.index(st.session_state.filters["ond"]["origin"])
+                       if st.session_state.filters["ond"]["origin"] in ORIGIN_OPTIONS else 0),
+                format_func=label_for,
+            )
         with fcol2:
-            dest_input = st.text_input(
-                "Destination (IATA)",
-                value=(st.session_state.filters["ond"]["destination"] or ""),
-                placeholder="e.g., BOM"
-            ).upper().strip()
+            dest_code = st.selectbox(
+                "Destination",
+                options=DESTINATION_OPTIONS,
+                index=(DESTINATION_OPTIONS.index(st.session_state.filters["ond"]["destination"])
+                       if st.session_state.filters["ond"]["destination"] in DESTINATION_OPTIONS else 0),
+                format_func=label_for,
+            )
         with fcol3:
             start_date_value = (
                 date.fromisoformat(st.session_state.filters["start_date"])
@@ -197,20 +225,12 @@ if show_filters:
             apply = st.button("Apply", use_container_width=True)
             clear = st.button("Clear", use_container_width=True)
 
-        def is_iata(code: str) -> bool:
-            return bool(code) and len(code) == 3 and code.isalpha()
-
         if apply:
-            origin = origin_input if is_iata(origin_input) else None
-            dest = dest_input if is_iata(dest_input) else None
-            if origin_input and not origin:
-                st.warning("Origin must be a 3-letter IATA code (e.g., DEL).")
-            if dest_input and not dest:
-                st.warning("Destination must be a 3-letter IATA code (e.g., BOM).")
-
+            if origin_code == dest_code:
+                st.warning("Origin and Destination cannot be the same.")
             # Save filters
             st.session_state.filters = {
-                "ond": {"origin": origin, "destination": dest},
+                "ond": {"origin": origin_code, "destination": dest_code},
                 "start_date": (start_date_input.isoformat() if isinstance(start_date_input, date) else None),
                 "policy_status": policy_input,
             }
