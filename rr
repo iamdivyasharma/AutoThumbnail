@@ -11,8 +11,6 @@ from datetime import date
 ORCH_BASE = "http://localhost:9000"  # change if deployed
 ROUTE_URL = f"{ORCH_BASE}/route_query"
 AGENT_URL = f"{ORCH_BASE}/agent_query"
-MEM_SHOW  = f"{ORCH_BASE}/memory/show"
-MEM_CLEAR = f"{ORCH_BASE}/memory/clear"
 TIMEOUT   = 30
 
 # ================== Example users ==================
@@ -111,7 +109,6 @@ def normalize_answer(text: str) -> str:
                 out.append("")
             continue
         if s.lower() in headers:
-            # drop naked headers; keep content-only
             continue
         norm = " ".join(s.split()).rstrip(" .|").lower()
         if norm == prev_norm:
@@ -120,7 +117,6 @@ def normalize_answer(text: str) -> str:
             continue
         out.append(s)
         prev_norm = norm
-    # collapse multiple blanks
     cleaned = []
     for ln in out:
         if ln == "" and (not cleaned or cleaned[-1] == ""):
@@ -131,7 +127,6 @@ def normalize_answer(text: str) -> str:
 def answer_sig(text: str, payload: dict | None = None) -> str:
     base = {"a": text}
     if payload:
-        # include a small stable subset to avoid reappends on reruns
         base["q"] = payload.get("query")
         base["t"] = payload.get("target") or payload.get("targets")
         base["sid"] = payload.get("session_id")
@@ -170,7 +165,9 @@ def ensure_state():
             st.session_state.filters["policy_status"] = POLICY_OPTIONS[0]
         st.session_state.filters.setdefault("end_date", None)
 
-    # de-dup guard
+    # one-run skip flag to prevent duplicate rendering
+    if "skip_transcript_this_run" not in st.session_state:
+        st.session_state.skip_transcript_this_run = False
     if "last_answer_hash" not in st.session_state:
         st.session_state.last_answer_hash = ""
 
@@ -231,20 +228,6 @@ with st.sidebar:
         st.session_state.last_answer_hash = ""
         st.success(f"New session id: {sid}")
 
-    if col_b.button("🧹 Clear Server Memory"):
-        try:
-            r = requests.post(MEM_CLEAR, json={"session_id": st.session_state.session_id}, timeout=TIMEOUT)
-            st.success("Server memory cleared." if r.status_code == 200 else r.text)
-        except Exception as e:
-            st.error(f"Clear error: {e}")
-
-    if st.button("👀 Show Server Memory"):
-        try:
-            r = requests.get(MEM_SHOW, params={"session_id": st.session_state.session_id}, timeout=TIMEOUT)
-            st.json(r.json())
-        except Exception as e:
-            st.error(f"Show error: {e}")
-
     st.markdown("---")
     st.subheader("Mode")
     st.session_state.mode = st.radio(
@@ -268,7 +251,6 @@ show_filters = not (st.session_state.mode == "Direct tool" and st.session_state.
 if show_filters:
     with st.container():
         st.markdown("### 🔎 Filters")
-        # Row 1: OND + dates + policy
         f1, f2, f3, f4, f5 = st.columns([1,1,1,1,1])
 
         with f1:
@@ -329,7 +311,6 @@ if show_filters:
             "Allowed end dates: " + ", ".join(d.isoformat() for d in END_WHITELIST)
         )
 
-        # Row 2: buttons
         b1, b2 = st.columns(2)
         with b1:
             apply = st.button("Apply", use_container_width=True)
@@ -346,28 +327,21 @@ if show_filters:
             chosen_end = end_date_input if isinstance(end_date_input, date) else END_WHITELIST[-1]
             snapped_end = _snap_to_allowed(chosen_end, END_WHITELIST, direction="up", min_after=snapped_start)
 
-            # Save filters
             st.session_state.filters = {
                 "ond": {"origin": origin_code, "destination": dest_code},
                 "start_date": snapped_start.isoformat(),
                 "end_date": snapped_end.isoformat(),
                 "policy_status": policy_input,
             }
-            st.success("Filters applied.")
-            if snapped_start != chosen_start:
-                st.info(f"Start date adjusted to allowed date: {snapped_start.isoformat()}")
-            if snapped_end != chosen_end or snapped_end < snapped_start:
-                st.info(f"End date adjusted to allowed date: {snapped_end.isoformat()}")
 
-            # ---- Build per-mode query (not shown in chat) ----
+            # ---- Build per-mode request (Agentic AI uses /route_query w/ targets=all) ----
             if st.session_state.mode == "Agentic AI":
                 qtext = build_query_combined(st.session_state.filters)
-
+                url = ROUTE_URL
                 payload = {
                     "query": qtext,
                     "session_id": st.session_state.session_id,
-                    "autonomy": st.session_state.autonomy,
-                    "max_iters": st.session_state.max_iters,
+                    "targets": ["air", "hotel", "tdna"],   # FORCE all three
                     "extra": {
                         "user_name": st.session_state.user_name.strip(),
                         "user_email": st.session_state.user_email.strip(),
@@ -376,11 +350,11 @@ if show_filters:
                         "source": "filters_apply",
                     },
                 }
-                url = AGENT_URL  # <- use agent for Agentic AI
-                response_key = "final_answer"
+                response_key = "answer"
             else:
                 if st.session_state.target == "hotel":
                     qtext = build_query_hotels_only(st.session_state.filters)
+                    url = ROUTE_URL
                     payload = {
                         "query": qtext,
                         "session_id": st.session_state.session_id,
@@ -393,10 +367,10 @@ if show_filters:
                             "source": "filters_apply",
                         },
                     }
-                    url = ROUTE_URL
                     response_key = "answer"
                 elif st.session_state.target == "air":
                     qtext = build_query_flights_only(st.session_state.filters)
+                    url = ROUTE_URL
                     payload = {
                         "query": qtext,
                         "session_id": st.session_state.session_id,
@@ -409,14 +383,15 @@ if show_filters:
                             "source": "filters_apply",
                         },
                     }
-                    url = ROUTE_URL
                     response_key = "answer"
                 else:
                     st.info("TDNA does not use filters. Please type directly in chat.")
                     url, payload, response_key = None, None, None
 
-            # ---- Send + single bubble that updates from 'planning' → answer ----
             if url and payload:
+                # prevent transcript from rendering this run (to avoid double view)
+                st.session_state.skip_transcript_this_run = True
+
                 with st.chat_message("assistant"):
                     placeholder = st.empty()
                     placeholder.markdown("**Great! Agent is planning your trip…**")
@@ -440,7 +415,6 @@ if show_filters:
             }
             st.info("Filters cleared.")
 
-        # Compact visual summary
         fil = st.session_state.filters
         st.caption(
             f"Active filters → "
@@ -452,10 +426,11 @@ if show_filters:
 else:
     st.info("Filters are not available when using TDNA directly. Switch to Agentic AI or a different tool to apply filters.")
 
-# ================== Chat transcript (no debug) ==================
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
+# ================== Chat transcript (skippable this run) ==================
+if not st.session_state.get("skip_transcript_this_run", False):
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
 
 # ================== Chat input ==================
 prompt = st.chat_input("Type a message and press Enter…")
@@ -511,6 +486,9 @@ if prompt:
     if st.session_state.last_answer_hash != sig:
         st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": None})
         st.session_state.last_answer_hash = sig
+
+# reset the skip flag for the next run
+st.session_state.skip_transcript_this_run = False
 
 # footer
 st.markdown("---")
