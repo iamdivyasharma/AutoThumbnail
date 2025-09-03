@@ -48,7 +48,27 @@ def label_for(code: str) -> str:
 ALLOWED_START_DATES = [
     "2025-09-01", "2025-09-05", "2025-09-08", "2025-09-10", "2025-10-01"
 ]
-START_WHITELIST = sorted(date.fromisoformat(x) for x in ALLOWED_START_DATES)
+
+def _iso_to_dates(xs):
+    return sorted(date.fromisoformat(x) if isinstance(x, str) else x for x in xs)
+
+START_WHITELIST = _iso_to_dates(ALLOWED_START_DATES)
+
+def _snap_to_allowed(chosen: date, allowed: list[date], direction="nearest") -> date:
+    if not allowed:
+        return chosen
+    if direction == "up":
+        for d in allowed:
+            if d >= chosen:
+                return d
+        return allowed[-1]
+    if direction == "down":
+        for d in reversed(allowed):
+            if d <= chosen:
+                return d
+        return allowed[0]
+    # nearest
+    return min(allowed, key=lambda d: abs(d - chosen))
 
 # ================== Page config (Logo + Favicon) ==================
 LOGO_PATH    = Path("assets/logo.png")       # direct path to your logo file
@@ -233,12 +253,23 @@ if show_filters:
                 format_func=label_for,
             )
 
-        # Allowed Start Date (whitelist)
+        # Calendar picker for Start (bounded) + snap to whitelist on Apply
         with fcol3:
-            start_opts = [d.isoformat() for d in START_WHITELIST]
-            start_idx = start_opts.index(st.session_state.filters["start_date"]) \
-                if st.session_state.filters["start_date"] in start_opts else 0
-            start_date_input = st.selectbox("Start date", options=start_opts, index=start_idx)
+            min_start = START_WHITELIST[0]
+            max_start = START_WHITELIST[-1]
+            start_default = (
+                date.fromisoformat(st.session_state.filters["start_date"])
+                if st.session_state.filters["start_date"] else START_WHITELIST[0]
+            )
+            start_default = _snap_to_allowed(start_default, START_WHITELIST, direction="nearest")
+            start_date_input = st.date_input(
+                "Start date",
+                value=start_default,
+                min_value=min_start,
+                max_value=max_start,
+                format="YYYY-MM-DD",
+            )
+            st.caption("Allowed start dates: " + ", ".join(d.isoformat() for d in START_WHITELIST))
 
         with fcol4:
             policy_input = st.selectbox(
@@ -253,13 +284,20 @@ if show_filters:
         if apply:
             if origin_code == dest_code:
                 st.warning("Origin and Destination cannot be the same.")
+
+            # Snap the chosen date to nearest allowed
+            chosen = start_date_input if isinstance(start_date_input, date) else START_WHITELIST[0]
+            snapped_start = _snap_to_allowed(chosen, START_WHITELIST, direction="nearest")
+
             # Save filters
             st.session_state.filters = {
                 "ond": {"origin": origin_code, "destination": dest_code},
-                "start_date": start_date_input,  # ISO from selectbox
+                "start_date": snapped_start.isoformat(),
                 "policy_status": policy_input,
             }
             st.success("Filters applied.")
+            if snapped_start != chosen:
+                st.info(f"Start date adjusted to allowed date: {snapped_start.isoformat()}")
 
             # ---- Build query text per mapping ----
             if st.session_state.mode == "Agentic AI":
@@ -276,8 +314,7 @@ if show_filters:
                         "source": "filters_apply",
                     },
                 }
-                call = ("route", ROUTE_URL, api_payload)
-
+                url = ROUTE_URL
             else:  # Direct tool
                 if st.session_state.target == "hotel":
                     qtext = build_query_hotels_only(st.session_state.filters)
@@ -293,7 +330,7 @@ if show_filters:
                             "source": "filters_apply",
                         },
                     }
-                    call = ("route", ROUTE_URL, api_payload)
+                    url = ROUTE_URL
                 elif st.session_state.target == "air":
                     qtext = build_query_flights_only(st.session_state.filters)
                     api_payload = {
@@ -308,47 +345,37 @@ if show_filters:
                             "source": "filters_apply",
                         },
                     }
-                    call = ("route", ROUTE_URL, api_payload)
+                    url = ROUTE_URL
                 else:
-                    # TDNA has no filters; shouldn't hit Apply, but guard anyway
                     st.info("TDNA does not use filters. Please type directly in chat.")
-                    call = None
+                    url = None
+                    api_payload = None
 
             # ---- Send + chat behavior ----
-            if call:
+            if url and api_payload:
                 st.session_state.last_applied_query = qtext
-                _, url, payload = call
 
                 if not st.session_state.first_apply_done:
                     with st.chat_message("assistant"):
                         st.markdown("**Great! Agent is planning your trip…**")
                         with st.spinner("Processing…"):
-                            status, data = post(url, payload)
-                    # Save and add only assistant answer (no query bubble first time)
+                            status, data = post(url, api_payload)
+
                     st.session_state.apply_status = status
                     st.session_state.apply_response = data
-                    st.session_state.apply_payload = payload
+                    st.session_state.apply_payload = api_payload
 
-                    final_answer = ""
-                    if isinstance(data, dict):
-                        final_answer = data.get("answer", "") or data.get("final_answer", "") or ""
-                    else:
-                        final_answer = str(data)
+                    final_answer = data.get("answer", "") if isinstance(data, dict) else str(data)
                     st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": {"source": "apply:first"}})
                     st.session_state.first_apply_done = True
                 else:
-                    # Subsequent applies: show the query as a user message, then answer
                     st.session_state.messages.append({"role": "user", "content": qtext, "meta": {"source": "apply:repeat"}})
-                    status, data = post(url, payload)
+                    status, data = post(url, api_payload)
                     st.session_state.apply_status = status
                     st.session_state.apply_response = data
-                    st.session_state.apply_payload = payload
+                    st.session_state.apply_payload = api_payload
 
-                    final_answer = ""
-                    if isinstance(data, dict):
-                        final_answer = data.get("answer", "") or data.get("final_answer", "") or ""
-                    else:
-                        final_answer = str(data)
+                    final_answer = data.get("answer", "") if isinstance(data, dict) else str(data)
                     st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": {"source": "apply:repeat"}})
 
         if clear:
@@ -373,22 +400,18 @@ if show_filters:
         )
 
         # Optional debug (kept outside chat area)
-        if st.session_state.last_applied_query:
+        if st.session_state.last_applied_query and st.session_state.apply_response is not None:
             st.markdown("#### 📨 Orchestrator Query (from Apply)")
             st.code(st.session_state.last_applied_query, language="text")
-            if st.session_state.apply_response is not None:
-                if isinstance(st.session_state.apply_response, dict):
-                    if st.session_state.apply_response.get("answer"):
-                        st.markdown("##### ✅ Composed Answer")
-                        st.markdown(st.session_state.apply_response["answer"])
-                    with st.expander("Details / Debug (payload & raw response)", expanded=False):
-                        st.json({
-                            "status": st.session_state.apply_status,
-                            "payload_sent": st.session_state.apply_payload,
-                            "raw": st.session_state.apply_response
-                        })
-                else:
-                    st.write(st.session_state.apply_response)
+            if isinstance(st.session_state.apply_response, dict) and st.session_state.apply_response.get("answer"):
+                st.markdown("##### ✅ Composed Answer")
+                st.markdown(st.session_state.apply_response["answer"])
+            with st.expander("Details / Debug (payload & raw response)", expanded=False):
+                st.json({
+                    "status": st.session_state.apply_status,
+                    "payload_sent": st.session_state.apply_payload,
+                    "raw": st.session_state.apply_response
+                })
 else:
     st.info("Filters are not available when using TDNA directly. Switch to Agentic AI or a different tool to apply filters.")
 
