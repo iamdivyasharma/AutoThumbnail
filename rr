@@ -67,7 +67,6 @@ def _snap_to_allowed(chosen: date, allowed: list[date], direction="nearest") -> 
             if d <= chosen:
                 return d
         return allowed[0]
-    # nearest
     return min(allowed, key=lambda d: abs(d - chosen))
 
 # ================== Page config (Logo + Favicon) ==================
@@ -95,9 +94,11 @@ def post(url: str, payload: dict):
         return r.status_code, r.json()
     return r.status_code, r.text
 
+POLICY_OPTIONS = ["In policy", "Out of policy"]
+
 def ensure_state():
     if "messages" not in st.session_state:
-        st.session_state.messages = []  # list[{"role":"user"|"assistant","content":str,"meta":dict}]
+        st.session_state.messages = []
     if "session_id" not in st.session_state:
         st.session_state.session_id = "user123"
     if "mode" not in st.session_state:
@@ -117,9 +118,13 @@ def ensure_state():
     if "filters" not in st.session_state:
         st.session_state.filters = {
             "ond": {"origin": None, "destination": None},
-            "start_date": None,             # ISO string "YYYY-MM-DD" or None
-            "policy_status": "Any",         # "Any" | "Compliant" | "Non-compliant" | "Pending"
+            "start_date": None,                  # ISO string "YYYY-MM-DD" or None
+            "policy_status": POLICY_OPTIONS[0],  # default to "In policy"
         }
+    else:
+        # sanitize legacy values (e.g., "Any")
+        if st.session_state.filters.get("policy_status") not in POLICY_OPTIONS:
+            st.session_state.filters["policy_status"] = POLICY_OPTIONS[0]
 
     # Apply-query state for first-time behavior
     if "first_apply_done" not in st.session_state:
@@ -271,12 +276,17 @@ if show_filters:
             )
             st.caption("Allowed start dates: " + ", ".join(d.isoformat() for d in START_WHITELIST))
 
+        # Policy status (two options only)
         with fcol4:
+            current_policy = st.session_state.filters["policy_status"]
+            if current_policy not in POLICY_OPTIONS:
+                current_policy = POLICY_OPTIONS[0]
             policy_input = st.selectbox(
                 "Policy status",
-                options=["Any", "Compliant", "Non-compliant", "Pending"],
-                index=["Any", "Compliant", "Non-compliant", "Pending"].index(st.session_state.filters["policy_status"])
+                options=POLICY_OPTIONS,
+                index=POLICY_OPTIONS.index(current_policy),
             )
+
         with fcol5:
             apply = st.button("Apply", use_container_width=True)
             clear = st.button("Clear", use_container_width=True)
@@ -382,7 +392,7 @@ if show_filters:
             st.session_state.filters = {
                 "ond": {"origin": None, "destination": None},
                 "start_date": None,
-                "policy_status": "Any",
+                "policy_status": POLICY_OPTIONS[0],  # reset to "In policy"
             }
             st.session_state.last_applied_query = ""
             st.session_state.apply_response = None
