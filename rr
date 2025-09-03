@@ -144,4 +144,309 @@ def build_query_flights_only(fil: dict) -> str:
 # ================== Sidebar ==================
 with st.sidebar:
     st.subheader("User")
-    user_labels = [f"{u['name']} <{u['email']}>]()_
+    user_labels = [f"{u['name']} <{u['email']}>" for u in USERS] + ["Other…"]
+    picked = st.selectbox("Choose a user", user_labels, index=0)
+    if picked != "Other…":
+        idx = user_labels.index(picked)
+        chosen = USERS[idx]
+        user_name_default = chosen["name"]
+        user_email_default = chosen["email"]
+    else:
+        user_name_default = ""
+        user_email_default = ""
+
+    st.session_state.user_name = st.text_input("Name", value=user_name_default, placeholder="e.g., Priya Sharma")
+    st.session_state.user_email = st.text_input("Email", value=user_email_default, placeholder="e.g., priya@company.com")
+
+    st.markdown("---")
+    st.subheader("Session")
+    default_session = st.session_state.user_email or st.session_state.session_id
+    new_session_id = st.text_input("Session ID", value=default_session, key="sid_input")
+    if new_session_id != st.session_state.session_id:
+        st.session_state.session_id = new_session_id
+
+    col_a, col_b = st.columns(2)
+    if col_a.button("🆕 New Chat"):
+        sid = f"{(st.session_state.user_email or 'user')}-{uuid.uuid4().hex[:8]}"
+        st.session_state.session_id = sid
+        st.session_state.messages = []
+        st.session_state.first_apply_done = False
+        st.success(f"New session id: {sid}")
+
+    if col_b.button("🧹 Clear Server Memory"):
+        try:
+            r = requests.post(MEM_CLEAR, json={"session_id": st.session_state.session_id}, timeout=TIMEOUT)
+            if r.status_code == 200:
+                st.success("Server memory cleared.")
+            else:
+                st.error(r.text)
+        except Exception as e:
+            st.error(f"Clear error: {e}")
+
+    if st.button("👀 Show Server Memory"):
+        try:
+            r = requests.get(MEM_SHOW, params={"session_id": st.session_state.session_id}, timeout=TIMEOUT)
+            st.json(r.json())
+        except Exception as e:
+            st.error(f"Show error: {e}")
+
+    st.markdown("---")
+    st.subheader("Mode")
+    st.session_state.mode = st.radio(
+        "How should the next message be handled?",
+        ["Agentic AI", "Direct tool"],
+        captions=["Let the orchestrator plan and call tools", "Call a specific backend directly"]
+    )
+    if st.session_state.mode == "Direct tool":
+        st.session_state.target = st.segmented_control(
+            "Target", options=["air", "hotel", "tdna"], default="air"
+        )
+
+    st.markdown("---")
+    st.subheader("Agent Settings")
+    st.session_state.autonomy = st.checkbox("Enable Autonomy (agent loop)", value=st.session_state.autonomy)
+    st.session_state.max_iters = st.slider("Max Iterations", 1, 8, st.session_state.max_iters)
+
+# ================== Filters (show in ALL except TDNA) ==================
+show_filters = not (st.session_state.mode == "Direct tool" and st.session_state.target == "tdna")
+
+if show_filters:
+    with st.container():
+        st.markdown("### 🔎 Filters")
+        fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns([1,1,1,1,1])
+
+        # Origin/Destination dropdowns
+        with fcol1:
+            origin_code = st.selectbox(
+                "Origin",
+                options=ORIGIN_OPTIONS,
+                index=(ORIGIN_OPTIONS.index(st.session_state.filters["ond"]["origin"])
+                       if st.session_state.filters["ond"]["origin"] in ORIGIN_OPTIONS else 0),
+                format_func=label_for,
+            )
+        with fcol2:
+            dest_code = st.selectbox(
+                "Destination",
+                options=DESTINATION_OPTIONS,
+                index=(DESTINATION_OPTIONS.index(st.session_state.filters["ond"]["destination"])
+                       if st.session_state.filters["ond"]["destination"] in DESTINATION_OPTIONS else 0),
+                format_func=label_for,
+            )
+
+        # Allowed Start Date (whitelist)
+        with fcol3:
+            start_opts = [d.isoformat() for d in START_WHITELIST]
+            start_idx = start_opts.index(st.session_state.filters["start_date"]) \
+                if st.session_state.filters["start_date"] in start_opts else 0
+            start_date_input = st.selectbox("Start date", options=start_opts, index=start_idx)
+
+        with fcol4:
+            policy_input = st.selectbox(
+                "Policy status",
+                options=["Any", "Compliant", "Non-compliant", "Pending"],
+                index=["Any", "Compliant", "Non-compliant", "Pending"].index(st.session_state.filters["policy_status"])
+            )
+        with fcol5:
+            apply = st.button("Apply", use_container_width=True)
+            clear = st.button("Clear", use_container_width=True)
+
+        if apply:
+            if origin_code == dest_code:
+                st.warning("Origin and Destination cannot be the same.")
+            # Save filters
+            st.session_state.filters = {
+                "ond": {"origin": origin_code, "destination": dest_code},
+                "start_date": start_date_input,  # ISO from selectbox
+                "policy_status": policy_input,
+            }
+            st.success("Filters applied.")
+
+            # ---- Build query text per mapping ----
+            if st.session_state.mode == "Agentic AI":
+                qtext = build_query_combined(st.session_state.filters)
+                api_payload = {
+                    "query": qtext,
+                    "session_id": st.session_state.session_id,
+                    "targets": ["air", "hotel", "tdna"],   # combined fan-out
+                    "extra": {
+                        "user_name": st.session_state.user_name.strip(),
+                        "user_email": st.session_state.user_email.strip(),
+                        "filters": st.session_state.filters,
+                        "ui_version": "new-ui-v1",
+                        "source": "filters_apply",
+                    },
+                }
+                call = ("route", ROUTE_URL, api_payload)
+
+            else:  # Direct tool
+                if st.session_state.target == "hotel":
+                    qtext = build_query_hotels_only(st.session_state.filters)
+                    api_payload = {
+                        "query": qtext,
+                        "session_id": st.session_state.session_id,
+                        "target": "hotel",
+                        "extra": {
+                            "user_name": st.session_state.user_name.strip(),
+                            "user_email": st.session_state.user_email.strip(),
+                            "filters": st.session_state.filters,
+                            "ui_version": "new-ui-v1",
+                            "source": "filters_apply",
+                        },
+                    }
+                    call = ("route", ROUTE_URL, api_payload)
+                elif st.session_state.target == "air":
+                    qtext = build_query_flights_only(st.session_state.filters)
+                    api_payload = {
+                        "query": qtext,
+                        "session_id": st.session_state.session_id,
+                        "target": "air",
+                        "extra": {
+                            "user_name": st.session_state.user_name.strip(),
+                            "user_email": st.session_state.user_email.strip(),
+                            "filters": st.session_state.filters,
+                            "ui_version": "new-ui-v1",
+                            "source": "filters_apply",
+                        },
+                    }
+                    call = ("route", ROUTE_URL, api_payload)
+                else:
+                    # TDNA has no filters; shouldn't hit Apply, but guard anyway
+                    st.info("TDNA does not use filters. Please type directly in chat.")
+                    call = None
+
+            # ---- Send + chat behavior ----
+            if call:
+                st.session_state.last_applied_query = qtext
+                _, url, payload = call
+
+                if not st.session_state.first_apply_done:
+                    with st.chat_message("assistant"):
+                        st.markdown("**Great! Agent is planning your trip…**")
+                        with st.spinner("Processing…"):
+                            status, data = post(url, payload)
+                    # Save and add only assistant answer (no query bubble first time)
+                    st.session_state.apply_status = status
+                    st.session_state.apply_response = data
+                    st.session_state.apply_payload = payload
+
+                    final_answer = ""
+                    if isinstance(data, dict):
+                        final_answer = data.get("answer", "") or data.get("final_answer", "") or ""
+                    else:
+                        final_answer = str(data)
+                    st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": {"source": "apply:first"}})
+                    st.session_state.first_apply_done = True
+                else:
+                    # Subsequent applies: show the query as a user message, then answer
+                    st.session_state.messages.append({"role": "user", "content": qtext, "meta": {"source": "apply:repeat"}})
+                    status, data = post(url, payload)
+                    st.session_state.apply_status = status
+                    st.session_state.apply_response = data
+                    st.session_state.apply_payload = payload
+
+                    final_answer = ""
+                    if isinstance(data, dict):
+                        final_answer = data.get("answer", "") or data.get("final_answer", "") or ""
+                    else:
+                        final_answer = str(data)
+                    st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": {"source": "apply:repeat"}})
+
+        if clear:
+            st.session_state.filters = {
+                "ond": {"origin": None, "destination": None},
+                "start_date": None,
+                "policy_status": "Any",
+            }
+            st.session_state.last_applied_query = ""
+            st.session_state.apply_response = None
+            st.session_state.apply_payload = None
+            st.session_state.first_apply_done = False
+            st.info("Filters cleared.")
+
+        # Tiny visual summary
+        fil = st.session_state.filters
+        st.caption(
+            f"Active filters → "
+            f"OND: {fil['ond']['origin'] or '—'}→{fil['ond']['destination'] or '—'} | "
+            f"Start: {fil['start_date'] or '—'} | "
+            f"Policy: {fil['policy_status']}"
+        )
+
+        # Optional debug (kept outside chat area)
+        if st.session_state.last_applied_query:
+            st.markdown("#### 📨 Orchestrator Query (from Apply)")
+            st.code(st.session_state.last_applied_query, language="text")
+            if st.session_state.apply_response is not None:
+                if isinstance(st.session_state.apply_response, dict):
+                    if st.session_state.apply_response.get("answer"):
+                        st.markdown("##### ✅ Composed Answer")
+                        st.markdown(st.session_state.apply_response["answer"])
+                    with st.expander("Details / Debug (payload & raw response)", expanded=False):
+                        st.json({
+                            "status": st.session_state.apply_status,
+                            "payload_sent": st.session_state.apply_payload,
+                            "raw": st.session_state.apply_response
+                        })
+                else:
+                    st.write(st.session_state.apply_response)
+else:
+    st.info("Filters are not available when using TDNA directly. Switch to Agentic AI or a different tool to apply filters.")
+
+# ================== Chat transcript (no debug expanders) ==================
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+# ================== Chat input (unchanged) ==================
+prompt = st.chat_input("Type a message and press Enter…")
+if prompt:
+    st.session_state.messages.append({"role": "user", "content": prompt, "meta": None})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    extra = {
+        "user_name": st.session_state.user_name.strip(),
+        "user_email": st.session_state.user_email.strip(),
+        "filters": {
+            "ond": {
+                "origin": st.session_state.filters["ond"]["origin"],
+                "destination": st.session_state.filters["ond"]["destination"],
+            },
+            "start_date": st.session_state.filters["start_date"],   # "YYYY-MM-DD" or None
+            "policy_status": st.session_state.filters["policy_status"],
+        },
+        "ui_version": "new-ui-v1"
+    }
+
+    try:
+        if st.session_state.mode == "Agentic AI":
+            payload = {
+                "query": prompt.strip(),
+                "session_id": st.session_state.session_id,
+                "autonomy": st.session_state.autonomy,
+                "max_iters": st.session_state.max_iters,
+                "extra": extra,
+            }
+            status, data = post(AGENT_URL, payload)
+            final_answer = data.get("final_answer", "") if isinstance(data, dict) else str(data)
+        else:
+            target = st.session_state.target
+            payload = {
+                "query": prompt.strip(),
+                "target": target,
+                "extra": extra,
+                "session_id": f"{st.session_state.session_id}::{target}",
+            }
+            status, data = post(ROUTE_URL, payload)
+            final_answer = data.get("answer", "") if isinstance(data, dict) else str(data)
+    except Exception as e:
+        final_answer = f"Request error: {e}"
+
+    with st.chat_message("assistant"):
+        st.markdown(final_answer)
+
+    st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": None})
+
+# footer
+st.markdown("---")
+st.caption("This chat uses the orchestrator’s HTTP endpoints and preserves conversational state via session_id.")
