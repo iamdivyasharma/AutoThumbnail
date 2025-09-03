@@ -1,6 +1,7 @@
 # filtered_new_ui.py
 import json
 import uuid
+import hashlib
 import requests
 import streamlit as st
 from pathlib import Path
@@ -70,7 +71,6 @@ def _snap_to_allowed(chosen: date, allowed: list[date], *, direction="nearest", 
             if d <= chosen:
                 return d
         return cand[0]
-    # nearest
     return min(cand, key=lambda d: abs(d - chosen))
 
 # ================== Page config (Logo + Favicon) ==================
@@ -93,6 +93,49 @@ def post(url: str, payload: dict):
     if r.headers.get("content-type","").startswith("application/json"):
         return r.status_code, r.json()
     return r.status_code, r.text
+
+def normalize_answer(text: str) -> str:
+    """
+    Remove service headers like 'Air:', 'Hotel:', 'TDNA:' and collapse duplicate lines.
+    """
+    if not isinstance(text, str):
+        return str(text)
+    headers = {"air:", "air bot:", "hotel:", "hotel bot:", "tdna:", "tdna bot:"}
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    out = []
+    prev_norm = ""
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        if s.lower() in headers:
+            # drop naked headers; keep content-only
+            continue
+        norm = " ".join(s.split()).rstrip(" .|").lower()
+        if norm == prev_norm:
+            continue
+        if out and " ".join(out[-1].split()).rstrip(" .|").lower() == norm:
+            continue
+        out.append(s)
+        prev_norm = norm
+    # collapse multiple blanks
+    cleaned = []
+    for ln in out:
+        if ln == "" and (not cleaned or cleaned[-1] == ""):
+            continue
+        cleaned.append(ln)
+    return "\n".join(cleaned).strip()
+
+def answer_sig(text: str, payload: dict | None = None) -> str:
+    base = {"a": text}
+    if payload:
+        # include a small stable subset to avoid reappends on reruns
+        base["q"] = payload.get("query")
+        base["t"] = payload.get("target") or payload.get("targets")
+        base["sid"] = payload.get("session_id")
+    return hashlib.sha256(json.dumps(base, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 POLICY_OPTIONS = ["In policy", "Out of policy"]
 
@@ -125,8 +168,11 @@ def ensure_state():
     else:
         if st.session_state.filters.get("policy_status") not in POLICY_OPTIONS:
             st.session_state.filters["policy_status"] = POLICY_OPTIONS[0]
-        # ensure keys exist
         st.session_state.filters.setdefault("end_date", None)
+
+    # de-dup guard
+    if "last_answer_hash" not in st.session_state:
+        st.session_state.last_answer_hash = ""
 
 ensure_state()
 
@@ -141,7 +187,6 @@ def _filters_str(fil: dict) -> str:
     )
 
 def build_query_combined(fil: dict) -> str:
-    # Agentic AI (Combined Air+Hotel+TDNA)
     return (
         "Provide me the best flights for the given route from AIR bot and also provide "
         "best/prefered hotels from HOTEL bot , do check traveller's past history from TDNA bot. "
@@ -149,11 +194,9 @@ def build_query_combined(fil: dict) -> str:
     )
 
 def build_query_hotels_only(fil: dict) -> str:
-    # Direct tool → HOTEL
     return "Provide me the best /prefered hotels from HOTEL bot , . " + _filters_str(fil)
 
 def build_query_flights_only(fil: dict) -> str:
-    # Direct tool → AIR
     return "Provide me the best flights for the given route from AIR bot . " + _filters_str(fil)
 
 # ================== Sidebar ==================
@@ -185,6 +228,7 @@ with st.sidebar:
         sid = f"{(st.session_state.user_email or 'user')}-{uuid.uuid4().hex[:8]}"
         st.session_state.session_id = sid
         st.session_state.messages = []
+        st.session_state.last_answer_hash = ""
         st.success(f"New session id: {sid}")
 
     if col_b.button("🧹 Clear Server Memory"):
@@ -265,7 +309,6 @@ if show_filters:
                 date.fromisoformat(st.session_state.filters["end_date"])
                 if st.session_state.filters["end_date"] else END_WHITELIST[-1]
             )
-            # Snap end upward; we'll also enforce >= start at apply time
             end_default = _snap_to_allowed(end_default, END_WHITELIST, direction="up")
             end_date_input = st.date_input(
                 "End date",
@@ -275,13 +318,10 @@ if show_filters:
                 format="YYYY-MM-DD",
             )
         with f5:
-            current_policy = st.session_state.filters["policy_status"]
-            if current_policy not in POLICY_OPTIONS:
-                current_policy = POLICY_OPTIONS[0]
             policy_input = st.selectbox(
                 "Policy status",
                 options=POLICY_OPTIONS,
-                index=POLICY_OPTIONS.index(current_policy),
+                index=POLICY_OPTIONS.index(st.session_state.filters["policy_status"]),
             )
 
         st.caption(
@@ -303,7 +343,6 @@ if show_filters:
             chosen_start = start_date_input if isinstance(start_date_input, date) else START_WHITELIST[0]
             snapped_start = _snap_to_allowed(chosen_start, START_WHITELIST, direction="nearest")
 
-            # End must be >= snapped_start; snap upward with min_after
             chosen_end = end_date_input if isinstance(end_date_input, date) else END_WHITELIST[-1]
             snapped_end = _snap_to_allowed(chosen_end, END_WHITELIST, direction="up", min_after=snapped_start)
 
@@ -323,11 +362,12 @@ if show_filters:
             # ---- Build per-mode query (not shown in chat) ----
             if st.session_state.mode == "Agentic AI":
                 qtext = build_query_combined(st.session_state.filters)
-                url = ROUTE_URL
+
                 payload = {
                     "query": qtext,
                     "session_id": st.session_state.session_id,
-                    "targets": ["air", "hotel", "tdna"],   # combined fan-out
+                    "autonomy": st.session_state.autonomy,
+                    "max_iters": st.session_state.max_iters,
                     "extra": {
                         "user_name": st.session_state.user_name.strip(),
                         "user_email": st.session_state.user_email.strip(),
@@ -336,10 +376,11 @@ if show_filters:
                         "source": "filters_apply",
                     },
                 }
+                url = AGENT_URL  # <- use agent for Agentic AI
+                response_key = "final_answer"
             else:
                 if st.session_state.target == "hotel":
                     qtext = build_query_hotels_only(st.session_state.filters)
-                    url = ROUTE_URL
                     payload = {
                         "query": qtext,
                         "session_id": st.session_state.session_id,
@@ -352,9 +393,10 @@ if show_filters:
                             "source": "filters_apply",
                         },
                     }
+                    url = ROUTE_URL
+                    response_key = "answer"
                 elif st.session_state.target == "air":
                     qtext = build_query_flights_only(st.session_state.filters)
-                    url = ROUTE_URL
                     payload = {
                         "query": qtext,
                         "session_id": st.session_state.session_id,
@@ -367,9 +409,11 @@ if show_filters:
                             "source": "filters_apply",
                         },
                     }
+                    url = ROUTE_URL
+                    response_key = "answer"
                 else:
                     st.info("TDNA does not use filters. Please type directly in chat.")
-                    url, payload = None, None
+                    url, payload, response_key = None, None, None
 
             # ---- Send + single bubble that updates from 'planning' → answer ----
             if url and payload:
@@ -378,11 +422,14 @@ if show_filters:
                     placeholder.markdown("**Great! Agent is planning your trip…**")
                     with st.spinner("Processing…"):
                         status, data = post(url, payload)
-                    final_answer = data.get("answer", "") if isinstance(data, dict) else str(data)
+                    raw_answer = data.get(response_key, "") if isinstance(data, dict) else str(data)
+                    final_answer = normalize_answer(raw_answer)
                     placeholder.markdown(final_answer)
-                # Append only once to transcript (avoid duplicates on rerun)
-                if not st.session_state.messages or st.session_state.messages[-1].get("content") != final_answer or st.session_state.messages[-1].get("role") != "assistant":
+
+                sig = answer_sig(final_answer, payload)
+                if st.session_state.last_answer_hash != sig:
                     st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": None})
+                    st.session_state.last_answer_hash = sig
 
         if clear:
             st.session_state.filters = {
@@ -442,7 +489,7 @@ if prompt:
                 "extra": extra,
             }
             status, data = post(AGENT_URL, payload)
-            final_answer = data.get("final_answer", "") if isinstance(data, dict) else str(data)
+            raw_answer = data.get("final_answer", "") if isinstance(data, dict) else str(data)
         else:
             target = st.session_state.target
             payload = {
@@ -452,15 +499,18 @@ if prompt:
                 "session_id": f"{st.session_state.session_id}::{target}",
             }
             status, data = post(ROUTE_URL, payload)
-            final_answer = data.get("answer", "") if isinstance(data, dict) else str(data)
+            raw_answer = data.get("answer", "") if isinstance(data, dict) else str(data)
     except Exception as e:
-        final_answer = f"Request error: {e}"
+        raw_answer = f"Request error: {e}"
 
+    final_answer = normalize_answer(raw_answer)
     with st.chat_message("assistant"):
         st.markdown(final_answer)
-    # Append only once if not identical to last assistant message
-    if not st.session_state.messages or st.session_state.messages[-1].get("content") != final_answer or st.session_state.messages[-1].get("role") != "assistant":
+
+    sig = answer_sig(final_answer, payload if isinstance(payload, dict) else None)
+    if st.session_state.last_answer_hash != sig:
         st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": None})
+        st.session_state.last_answer_hash = sig
 
 # footer
 st.markdown("---")
