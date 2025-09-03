@@ -48,10 +48,8 @@ def label_for(code: str) -> str:
 ALLOWED_START_DATES = [
     "2025-09-01", "2025-09-05", "2025-09-08", "2025-09-10", "2025-10-01"
 ]
-
 def _iso_to_dates(xs):
     return sorted(date.fromisoformat(x) if isinstance(x, str) else x for x in xs)
-
 START_WHITELIST = _iso_to_dates(ALLOWED_START_DATES)
 
 def _snap_to_allowed(chosen: date, allowed: list[date], direction="nearest") -> date:
@@ -70,21 +68,17 @@ def _snap_to_allowed(chosen: date, allowed: list[date], direction="nearest") -> 
     return min(allowed, key=lambda d: abs(d - chosen))
 
 # ================== Page config (Logo + Favicon) ==================
-LOGO_PATH    = Path("assets/logo.png")       # direct path to your logo file
-FAVICON_PATH = Path("assets/favicon.png")    # direct path to your favicon file
-
+LOGO_PATH    = Path("assets/logo.png")
+FAVICON_PATH = Path("assets/favicon.png")
 st.set_page_config(
     page_title="Orchestrator Chat",
     page_icon=str(FAVICON_PATH) if FAVICON_PATH.exists() else "💬",
     layout="centered",
 )
-
-# Top-centered logo + title
 if LOGO_PATH.exists():
     c1, c2, c3 = st.columns([1, 2, 1])
     with c2:
         st.image(str(LOGO_PATH), use_container_width=False)
-
 st.markdown("<h1 style='text-align:center'>💬 Orchestrator — Conversational Chat</h1>", unsafe_allow_html=True)
 
 # ================== Helpers ==================
@@ -118,25 +112,12 @@ def ensure_state():
     if "filters" not in st.session_state:
         st.session_state.filters = {
             "ond": {"origin": None, "destination": None},
-            "start_date": None,                  # ISO string "YYYY-MM-DD" or None
-            "policy_status": POLICY_OPTIONS[0],  # default to "In policy"
+            "start_date": None,                  # ISO "YYYY-MM-DD" or None
+            "policy_status": POLICY_OPTIONS[0],  # default "In policy"
         }
     else:
-        # sanitize legacy values (e.g., "Any")
         if st.session_state.filters.get("policy_status") not in POLICY_OPTIONS:
             st.session_state.filters["policy_status"] = POLICY_OPTIONS[0]
-
-    # Apply-query state for first-time behavior
-    if "first_apply_done" not in st.session_state:
-        st.session_state.first_apply_done = False
-    if "last_applied_query" not in st.session_state:
-        st.session_state.last_applied_query = ""
-    if "apply_response" not in st.session_state:
-        st.session_state.apply_response = None
-    if "apply_status" not in st.session_state:
-        st.session_state.apply_status = None
-    if "apply_payload" not in st.session_state:
-        st.session_state.apply_payload = None
 
 ensure_state()
 
@@ -195,16 +176,12 @@ with st.sidebar:
         sid = f"{(st.session_state.user_email or 'user')}-{uuid.uuid4().hex[:8]}"
         st.session_state.session_id = sid
         st.session_state.messages = []
-        st.session_state.first_apply_done = False
         st.success(f"New session id: {sid}")
 
     if col_b.button("🧹 Clear Server Memory"):
         try:
             r = requests.post(MEM_CLEAR, json={"session_id": st.session_state.session_id}, timeout=TIMEOUT)
-            if r.status_code == 200:
-                st.success("Server memory cleared.")
-            else:
-                st.error(r.text)
+            st.success("Server memory cleared." if r.status_code == 200 else r.text)
         except Exception as e:
             st.error(f"Clear error: {e}")
 
@@ -258,7 +235,7 @@ if show_filters:
                 format_func=label_for,
             )
 
-        # Calendar picker for Start (bounded) + snap to whitelist on Apply
+        # Calendar (bounded) + snap to whitelist on Apply
         with fcol3:
             min_start = START_WHITELIST[0]
             max_start = START_WHITELIST[-1]
@@ -295,11 +272,9 @@ if show_filters:
             if origin_code == dest_code:
                 st.warning("Origin and Destination cannot be the same.")
 
-            # Snap the chosen date to nearest allowed
             chosen = start_date_input if isinstance(start_date_input, date) else START_WHITELIST[0]
             snapped_start = _snap_to_allowed(chosen, START_WHITELIST, direction="nearest")
 
-            # Save filters
             st.session_state.filters = {
                 "ond": {"origin": origin_code, "destination": dest_code},
                 "start_date": snapped_start.isoformat(),
@@ -309,10 +284,11 @@ if show_filters:
             if snapped_start != chosen:
                 st.info(f"Start date adjusted to allowed date: {snapped_start.isoformat()}")
 
-            # ---- Build query text per mapping ----
+            # ---- Build per-mode query (not shown in chat) ----
             if st.session_state.mode == "Agentic AI":
                 qtext = build_query_combined(st.session_state.filters)
-                api_payload = {
+                url = ROUTE_URL
+                payload = {
                     "query": qtext,
                     "session_id": st.session_state.session_id,
                     "targets": ["air", "hotel", "tdna"],   # combined fan-out
@@ -324,11 +300,11 @@ if show_filters:
                         "source": "filters_apply",
                     },
                 }
-                url = ROUTE_URL
-            else:  # Direct tool
+            else:
                 if st.session_state.target == "hotel":
                     qtext = build_query_hotels_only(st.session_state.filters)
-                    api_payload = {
+                    url = ROUTE_URL
+                    payload = {
                         "query": qtext,
                         "session_id": st.session_state.session_id,
                         "target": "hotel",
@@ -340,10 +316,10 @@ if show_filters:
                             "source": "filters_apply",
                         },
                     }
-                    url = ROUTE_URL
                 elif st.session_state.target == "air":
                     qtext = build_query_flights_only(st.session_state.filters)
-                    api_payload = {
+                    url = ROUTE_URL
+                    payload = {
                         "query": qtext,
                         "session_id": st.session_state.session_id,
                         "target": "air",
@@ -355,52 +331,31 @@ if show_filters:
                             "source": "filters_apply",
                         },
                     }
-                    url = ROUTE_URL
                 else:
                     st.info("TDNA does not use filters. Please type directly in chat.")
-                    url = None
-                    api_payload = None
+                    url, payload = None, None
 
-            # ---- Send + chat behavior ----
-            if url and api_payload:
-                st.session_state.last_applied_query = qtext
-
-                if not st.session_state.first_apply_done:
-                    with st.chat_message("assistant"):
-                        st.markdown("**Great! Agent is planning your trip…**")
-                        with st.spinner("Processing…"):
-                            status, data = post(url, api_payload)
-
-                    st.session_state.apply_status = status
-                    st.session_state.apply_response = data
-                    st.session_state.apply_payload = api_payload
-
+            # ---- Send + single bubble that updates from 'planning' → answer ----
+            if url and payload:
+                with st.chat_message("assistant"):
+                    placeholder = st.empty()
+                    placeholder.markdown("**Great! Agent is planning your trip…**")
+                    with st.spinner("Processing…"):
+                        status, data = post(url, payload)
                     final_answer = data.get("answer", "") if isinstance(data, dict) else str(data)
-                    st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": {"source": "apply:first"}})
-                    st.session_state.first_apply_done = True
-                else:
-                    st.session_state.messages.append({"role": "user", "content": qtext, "meta": {"source": "apply:repeat"}})
-                    status, data = post(url, api_payload)
-                    st.session_state.apply_status = status
-                    st.session_state.apply_response = data
-                    st.session_state.apply_payload = api_payload
-
-                    final_answer = data.get("answer", "") if isinstance(data, dict) else str(data)
-                    st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": {"source": "apply:repeat"}})
+                    placeholder.markdown(final_answer)
+                # persist final answer only
+                st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": None})
 
         if clear:
             st.session_state.filters = {
                 "ond": {"origin": None, "destination": None},
                 "start_date": None,
-                "policy_status": POLICY_OPTIONS[0],  # reset to "In policy"
+                "policy_status": POLICY_OPTIONS[0],
             }
-            st.session_state.last_applied_query = ""
-            st.session_state.apply_response = None
-            st.session_state.apply_payload = None
-            st.session_state.first_apply_done = False
             st.info("Filters cleared.")
 
-        # Tiny visual summary
+        # Compact visual summary (no debug/answers shown)
         fil = st.session_state.filters
         st.caption(
             f"Active filters → "
@@ -408,31 +363,18 @@ if show_filters:
             f"Start: {fil['start_date'] or '—'} | "
             f"Policy: {fil['policy_status']}"
         )
-
-        # Optional debug (kept outside chat area)
-        if st.session_state.last_applied_query and st.session_state.apply_response is not None:
-            st.markdown("#### 📨 Orchestrator Query (from Apply)")
-            st.code(st.session_state.last_applied_query, language="text")
-            if isinstance(st.session_state.apply_response, dict) and st.session_state.apply_response.get("answer"):
-                st.markdown("##### ✅ Composed Answer")
-                st.markdown(st.session_state.apply_response["answer"])
-            with st.expander("Details / Debug (payload & raw response)", expanded=False):
-                st.json({
-                    "status": st.session_state.apply_status,
-                    "payload_sent": st.session_state.apply_payload,
-                    "raw": st.session_state.apply_response
-                })
 else:
     st.info("Filters are not available when using TDNA directly. Switch to Agentic AI or a different tool to apply filters.")
 
-# ================== Chat transcript (no debug expanders) ==================
+# ================== Chat transcript (no debug) ==================
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# ================== Chat input (unchanged) ==================
+# ================== Chat input ==================
 prompt = st.chat_input("Type a message and press Enter…")
 if prompt:
+    # Only user-typed chat shows the user bubble
     st.session_state.messages.append({"role": "user", "content": prompt, "meta": None})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -445,7 +387,7 @@ if prompt:
                 "origin": st.session_state.filters["ond"]["origin"],
                 "destination": st.session_state.filters["ond"]["destination"],
             },
-            "start_date": st.session_state.filters["start_date"],   # "YYYY-MM-DD" or None
+            "start_date": st.session_state.filters["start_date"],
             "policy_status": st.session_state.filters["policy_status"],
         },
         "ui_version": "new-ui-v1"
@@ -477,7 +419,6 @@ if prompt:
 
     with st.chat_message("assistant"):
         st.markdown(final_answer)
-
     st.session_state.messages.append({"role": "assistant", "content": final_answer, "meta": None})
 
 # footer
