@@ -1,172 +1,730 @@
-if show_filters:
-    # ✅ Box around filters (requires Streamlit >= 1.25). If your version is older, just remove border=True.
-    with st.container(border=True):
-        st.markdown("### 🔎 Filters")
+from __future__ import annotations
+"""
+Agentic Orchestrator (MCP over HTTP JSON)
+----------------------------------------
+Key upgrades vs your original file:
+- Planning → Execution → Reflection loop with a DAG of tool steps
+- Unified, strongly typed LLM JSON outputs (robust JSON extraction + validation)
+- Tool introspection (fetches tools/list metadata per service to guide planning)
+- Observation scoring + result selection before composition
+- Composer with optional answer_schema (force JSON outputs to callers if desired)
+- Critic pass to self-check final answer and auto-revise once if needed
+- Deterministic caches + simple cost/latency hints per tool to help the planner
+- Safer answer sanitization and history compression when memory grows
+- Backoff/retry around HTTP and MCP calls, plus clearer traces in responses
+- NEW: Cross-tool consistency validator: if multi-bot answers are misaligned with filters or contradict each other,
+       return a single fallback (“database does not have a consistent answer for this request”).
 
-        # --- Filter inputs row ---
-        fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns(5, gap="medium")
+Endpoints remain:
+- POST /route_query (same signature; internal improvements only)
+- POST /agent_query (now “more agentic”; supports DAG plans, reflection, critic)
 
-        with fcol1:
-            origin_code = st.selectbox(
-                "Origin",
-                options=ORIGIN_OPTIONS,
-                index=(ORIGIN_OPTIONS.index(st.session_state.filters["ond"]["origin"])
-                       if st.session_state.filters["ond"]["origin"] in ORIGIN_OPTIONS else 0),
-                format_func=label_for,
-            )
-        with fcol2:
-            dest_code = st.selectbox(
-                "Destination",
-                options=DESTINATION_OPTIONS,
-                index=(DESTINATION_OPTIONS.index(st.session_state.filters["ond"]["destination"])
-                       if st.session_state.filters["ond"]["destination"] in DESTINATION_OPTIONS else 0),
-                format_func=label_for,
-            )
-        with fcol3:
-            start_default = date.fromisoformat(st.session_state.filters["start_date"])
-            start_default = _snap_to_allowed(start_default, START_WHITELIST, direction="nearest")
-            start_input = st.date_input(
-                "Start date",
-                value=start_default,
-                min_value=START_WHITELIST[0],
-                max_value=START_WHITELIST[-1],
-                format="YYYY-MM-DD",
-                key="start_date_picker",
-            )
-        with fcol4:
-            end_default = date.fromisoformat(st.session_state.filters["end_date"])
-            end_default = _snap_to_allowed(end_default, END_WHITELIST, direction="up", min_after=start_input)
-            end_input = st.date_input(
-                "End date",
-                value=end_default,
-                min_value=END_WHITELIST[0],
-                max_value=END_WHITELIST[-1],
-                format="YYYY-MM-DD",
-                key="end_date_picker",
-            )
-        with fcol5:
-            policy_input = st.selectbox(
-                "Policy status",
-                options=["In policy", "Out of policy"],
-                index=["In policy", "Out of policy"].index(st.session_state.filters["policy_status"])
-            )
+Environment variables (all optional):
+- ORCH_PORT, PASS_EXTRA_MODE, CACHE_TTL_SEC
+- BEDROCK_REGION, BEDROCK_MODEL_ID (Claude 3.5 Sonnet default)
+- *_MCP_URL and *_FIELD like before
 
-        st.write("")  # small vertical spacing
+"""
+import os, json, asyncio, hashlib, re, math, random
+from typing import Dict, Any, Optional, List, Tuple, Set
+from collections import defaultdict, deque
+from time import time
 
-        # --- Centered button row with space between ---
-        padL, center, padR = st.columns([1, 2, 1])  # center the buttons block
-        with center:
-            btn_left, btn_right = st.columns(2, gap="large")
-            apply = btn_left.button("Apply", use_container_width=True)
-            clear = btn_right.button("Clear", use_container_width=True)
+import httpx  # pip install httpx
+from fastapi import FastAPI, Body
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ValidationError
+from fastapi_mcp import FastApiMCP
 
-        # ----- your existing Apply / Clear logic stays the same below -----
-        if apply:
-            if origin_code == dest_code:
-                st.error("Origin and Destination cannot be the same. Please change one and click Apply again.")
-            else:
-                chosen_start = start_input if isinstance(start_input, date) else START_WHITELIST[0]
-                snapped_start = _snap_to_allowed(chosen_start, START_WHITELIST, direction="nearest")
+import boto3
+from botocore.config import Config
 
-                chosen_end = end_input if isinstance(end_input, date) else END_WHITELIST[-1]
-                snapped_end = _snap_to_allowed(chosen_end, END_WHITELIST, direction="up", min_after=snapped_start)
+# ==================== Config ====================
+ORCH_PORT = int(os.getenv("ORCH_PORT", "9000"))
 
-                st.session_state.filters = {
-                    "ond": {"origin": origin_code, "destination": dest_code},
-                    "start_date": snapped_start.isoformat(),
-                    "end_date": snapped_end.isoformat(),
-                    "policy_status": policy_input,
-                }
+HOTEL_MCP_URL = os.getenv("HOTEL_MCP_URL", "http://127.0.0.1:9001/mcp")
+AIR_MCP_URL   = os.getenv("AIR_MCP_URL",   "http://127.0.0.1:9003/mcp")
+TDNA_MCP_URL  = os.getenv("TDNA_MCP_URL",  "http://127.0.0.1:9002/mcp")
 
-                # ---------- First-time-only Apply behavior ----------
-                def _call_orchestrator(url: str, payload: dict, response_key: str):
-                    # Show status, but don't double-render in transcript
-                    with st.status("Agent is planning your trip…", expanded=False) as s:
-                        status, data = post(url, payload)
-                        raw_answer = data.get(response_key, "") if isinstance(data, dict) else str(data)
-                        s.update(label="Done", state="complete")
-                    # Persist exactly once
-                    sig = answer_sig(str(raw_answer), payload)
-                    if st.session_state.last_answer_hash != sig:
-                        st.session_state.messages.append({"role": "assistant", "content": str(raw_answer)})
-                        st.session_state.last_answer_hash = sig
-                        st.rerun()
+SERVICES: Dict[str, Dict[str, str]] = {
+    "hotel": {"url": HOTEL_MCP_URL, "tool": "hotel_query_tool", "field": os.getenv("HOTEL_FIELD", "query")},
+    "air":   {"url": AIR_MCP_URL,   "tool": "air_query_tool",   "field": os.getenv("AIR_FIELD",   "query")},
+    "tdna":  {"url": TDNA_MCP_URL,  "tool": "tdna_query_tool",  "field": os.getenv("TDNA_FIELD",  "query")},
+}
 
-                if st.session_state.mode == "Agentic AI":
-                    if not st.session_state.boot_agentic:
-                        qtext = build_query_combined(st.session_state.filters)
-                        payload = {
-                            "query": qtext,
-                            "session_id": st.session_state.session_id,
-                            "targets": ["air", "hotel", "tdna"],
-                            "extra": {
-                                "user_name": st.session_state.user_name.strip(),
-                                "user_email": st.session_state.user_email.strip(),
-                                "filters": st.session_state.filters,
-                                "ui_version": "new-ui-v1",
-                                "source": "filters_apply",
-                                "llm_hints": "Use conversation history; avoid repetition.",
-                            },
-                        }
-                        _call_orchestrator(ROUTE_URL, payload, response_key="answer")
-                        st.session_state.boot_agentic = True
-                    else:
-                        st.info("Filters updated. They’ll be used for your next message.", icon="✅")
-                else:
-                    if st.session_state.target == "hotel":
-                        if not st.session_state.boot_hotel:
-                            qtext = build_query_hotels_only(st.session_state.filters)
-                            payload = {
-                                "query": qtext,
-                                "session_id": st.session_state.session_id,
-                                "target": "hotel",
-                                "extra": {
-                                    "user_name": st.session_state.user_name.strip(),
-                                    "user_email": st.session_state.user_email.strip(),
-                                    "filters": st.session_state.filters,
-                                    "ui_version": "new-ui-v1",
-                                    "source": "filters_apply",
-                                },
-                            }
-                            _call_orchestrator(ROUTE_URL, payload, response_key="answer")
-                            st.session_state.boot_hotel = True
-                        else:
-                            st.info("Filters updated. They’ll be used for your next message.", icon="✅")
-                    elif st.session_state.target == "air":
-                        if not st.session_state.boot_air:
-                            qtext = build_query_flights_only(st.session_state.filters)
-                            payload = {
-                                "query": qtext,
-                                "session_id": st.session_state.session_id,
-                                "target": "air",
-                                "extra": {
-                                    "user_name": st.session_state.user_name.strip(),
-                                    "user_email": st.session_state.user_email.strip(),
-                                    "filters": st.session_state.filters,
-                                    "ui_version": "new-ui-v1",
-                                    "source": "filters_apply",
-                                },
-                            }
-                            _call_orchestrator(ROUTE_URL, payload, response_key="answer")
-                            st.session_state.boot_air = True
-                        else:
-                            st.info("Filters updated. They’ll be used for your next message.", icon="✅")
-                    else:
-                        st.info("TDNA does not use filters. Please type directly in chat.", icon="ℹ️")
+# optional planning hints (latency/cost weights ~ lower is better)
+PLANNING_HINTS = {
+    "hotel": {"latency": 2.0, "cost": 1.0, "reliability": 0.9},
+    "air":   {"latency": 2.5, "cost": 1.1, "reliability": 0.9},
+    "tdna":  {"latency": 1.8, "cost": 1.3, "reliability": 0.85},
+}
 
-        if clear:
-            st.session_state.filters = {
-                "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
-                "start_date": START_WHITELIST[0].isoformat(),
-                "end_date": END_WHITELIST[-1].isoformat(),
-                "policy_status": "In policy",
-            }
-            st.info("Filters cleared.")
+# How to pass extras downstream (nested | flat | both)
+PASS_EXTRA_MODE = os.getenv("PASS_EXTRA_MODE", "both").lower().strip()
 
-        fil = st.session_state.filters
-        st.caption(
-            f"Active filters → {label_for(fil['ond']['origin'])} → {label_for(fil['ond']['destination'])} | "
-            f"Start: {fil['start_date']} | End: {fil['end_date']} | Policy: {fil['policy_status']}"
+# ==================== Bedrock Claude (routing + composing) ====================
+BEDROCK_REGION    = os.getenv("BEDROCK_REGION", "us-east-1")
+CLAUDE_MODEL_ID   = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0")
+ANTHROPIC_VERSION = "bedrock-2023-05-31"
+
+bedrock = boto3.client(
+    "bedrock-runtime",
+    region_name=BEDROCK_REGION,
+    config=Config(connect_timeout=5, read_timeout=45, retries={"max_attempts": 3, "mode": "standard"}),
+)
+
+def _invoke_bedrock(body: dict) -> dict:
+    resp = bedrock.invoke_model(modelId=CLAUDE_MODEL_ID, body=json.dumps(body))
+    return json.loads(resp["body"].read().decode("utf-8"))
+
+# ---- robust JSON helpers ----
+_JSON_BLOCK = re.compile(r"\{[\s\S]*\}")
+
+def extract_json(text: str) -> Any:
+    if isinstance(text, dict):
+        return text
+    if not isinstance(text, str):
+        return text
+    try:
+        return json.loads(text)
+    except Exception:
+        m = _JSON_BLOCK.search(text)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
+    raise ValueError("Could not parse JSON from LLM output")
+
+# ---- LLM wrappers ----
+def claude_json(system: str, user_obj: dict, max_tokens=256, temperature=0) -> dict:
+    payload = _invoke_bedrock({
+        "anthropic_version": ANTHROPIC_VERSION,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "system": system,
+        "messages": [{"role":"user","content":[{"type":"text","text": json.dumps(user_obj)}]}],
+    })
+    return extract_json(payload["content"][0]["text"])  # may raise
+
+def claude_text(system: str, user_obj: dict, max_tokens=512, temperature=0) -> str:
+    payload = _invoke_bedrock({
+        "anthropic_version": ANTHROPIC_VERSION,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "system": system,
+        "messages": [{"role":"user","content":[{"type":"text","text": json.dumps(user_obj)}]}],
+    })
+    return payload["content"][0]["text"].strip()
+
+# ==================== MCP HTTP client (JSON-RPC over HTTP, JSON response) ====================
+class MCPHTTPClient:
+    def __init__(self, base_url: str, timeout: float = 30.0, headers: Optional[Dict[str, str]] = None):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self._id = 0
+        self.headers = {
+            "content-type": "application/json",
+            "accept": "application/json",
+            "cache-control": "no-cache",
+            "connection": "keep-alive",
+        }
+        if headers:
+            merged = {**self.headers, **headers}
+            merged["accept"] = "application/json"
+            self.headers = merged
+
+    def _next_id(self) -> str:
+        self._id += 1
+        return str(self._id)
+
+    async def _rpc(self, method: str, params: Dict[str, Any]) -> Any:
+        payload = {"jsonrpc": "2.0", "id": self._next_id(), "method": method, "params": params}
+        # basic retry with jitter
+        last_ex = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    r = await client.post(self.base_url, json=payload, headers=self.headers)
+                    r.raise_for_status()
+                    data = r.json()
+                if "error" in data:
+                    raise RuntimeError(f"RPC error: {data['error']}")
+                return data.get("result")
+            except Exception as e:
+                last_ex = e
+                await asyncio.sleep(0.2 * (2 ** attempt) + random.random() * 0.1)
+        raise last_ex
+
+    async def tools_list(self) -> Dict[str, Any]:
+        return await self._rpc("tools/list", {})
+
+    async def tools_call(self, name: str, arguments: Dict[str, Any]) -> Any:
+        return await self._rpc("tools/call", {"name": name, "arguments": arguments})
+
+MCP_CLIENTS: Dict[str, MCPHTTPClient] = {svc: MCPHTTPClient(info["url"]) for svc, info in SERVICES.items()}
+
+# discovered tool metadata per service (filled lazily)
+TOOL_CAPS: Dict[str, Dict[str, Any]] = defaultdict(dict)
+
+# ==================== Memory & Cache ====================
+MEMORY: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"history": deque(maxlen=50), "created": time()})
+
+def mem_append(sid: str, role: str, content: Any):
+    MEMORY[sid]["history"].append({"role": role, "content": content, "ts": time()})
+
+def mem_get(sid: str, k: int = 12) -> List[Dict[str, Any]]:
+    hist = list(MEMORY[sid]["history"])
+    return hist[-k:] if k else hist
+
+def mem_clear(sid: str):
+    MEMORY.pop(sid, None)
+
+def compress_history_if_needed(sid: str, keep: int = 16):
+    hist = MEMORY[sid]["history"]
+    if len(hist) <= keep:
+        return
+    recent = list(hist)[-keep:]
+    summary = claude_text(
+        "Summarize earlier chat for future context (routes, dates, constraints, user prefs). 6 lines max.",
+        {"history": list(hist)[:-keep]}
+    )
+    MEMORY[sid]["history"] = deque([{"role":"system","content":{"summary": summary},"ts": time()}] + recent, maxlen=50)
+
+CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "300"))
+_CACHE: Dict[str, Tuple[float, Any]] = {}
+
+def _h(obj: Any) -> str:
+    try:
+        s = json.dumps(obj, sort_keys=True, default=str)
+    except Exception:
+        s = str(obj)
+    return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+def cache_get(k: str):
+    rec = _CACHE.get(k)
+    if not rec:
+        return None
+    exp, val = rec
+    if exp < time():
+        _CACHE.pop(k, None)
+        return None
+    return val
+
+def cache_set(k: str, v: Any, ttl: int = CACHE_TTL_SEC):
+    _CACHE[k] = (time() + ttl, v)
+
+# ==================== Answer sanitization & helpers ====================
+_GREET = re.compile(r"(?mi)^\s*(?:hello|hi|hey|greetings)\b[\s\S]*?(?:\n|$)")
+_TOOL_PREFIX = re.compile(r"(?mi)^(?:air|hotel|tdna)\s*:\s*")
+
+def sanitize_answer(text: Any) -> str:
+    s = text if isinstance(text, str) else str(text)
+    s = _TOOL_PREFIX.sub("", s)
+    for _ in range(2):
+        s2 = _GREET.sub("", s)
+        if s2 == s:
+            break
+        s = s2
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s
+
+def sanitize_map(m: Dict[str, Any]) -> Dict[str, str]:
+    return {k: sanitize_answer(v) for k, v in m.items()}
+
+# ==================== Prompts ====================
+CONTEXTUALIZER_SYSTEM = (
+    "Rewrite the latest user message into a standalone, explicit query for downstream tools. "
+    "Use chat_history ONLY to resolve references (dates, airports, hotels, constraints, policies). "
+    "If sticky_filters exist, incorporate them. Do NOT answer; return only the rewritten query text."
+)
+
+ROUTER_SYSTEM = (
+    "You are a strict router for a multi-tool system. Tools: air, hotel, tdna. "
+    "Given a query and (optionally) recent history, decide which tools to call. "
+    "Return ONLY JSON like {\"targets\":[\"air\"|\"hotel\"|\"tdna\", ...]} with unique items."
+)
+
+PLANNER_SYSTEM = (
+    "Plan a minimal DAG of tool calls to satisfy the user. Tools: air, hotel, tdna. "
+    "Use steps: [{target, input, after?}] where 'after' is a list of prior step indexes this step depends on. "
+    "Prefer low latency and high reliability; avoid redundant calls. No greetings. "
+    "Return ONLY JSON: {\"steps\":[{...}], \"finish\": false, \"final_answer\": \"\"}"
+)
+
+FINISHER_SYSTEM = (
+    'If observations + memory satisfy the goal, return {"finish": true, "final_answer": "..."} '
+    'Else return {"finish": false}. Keep it JSON only.'
+)
+
+COMPOSER_SYSTEM = (
+    "You are a response composer. Combine multiple tool answers (air/hotel/tdna) into ONE coherent, concise reply. "
+    "Synthesize and prioritize; resolve conflicts; respect filters and prior choices. "
+    "If answer_schema is provided, output STRICT JSON following it (no prose). Otherwise produce clean prose. "
+    "No greetings or tool prefixes."
+)
+
+CRITIC_SYSTEM = (
+    'You are a strict reviewer. Check final_answer against user_query and observations for relevance, contradictions, '
+    'missing steps, or unsafe promises. If okay, return {"ok": true}. If revision needed, return {"ok": false, "revise": ""} with a fixed answer.'
+)
+
+# NEW: Cross-tool consistency validator
+VALIDATOR_SYSTEM = (
+    'You are a strict cross-tool validator. Check if answers from tools (air, hotel, tdna) logically align with the '
+    'user_query and filters (origin, destination, dates, policy). Flag contradictions like: origin/destination mismatch, '
+    'dates outside range, city mismatch between hotel and destination, empty/unsupported results combined with confident claims, '
+    'or policy violations presented as "in policy". Return ONLY JSON: {'
+    '"ok": true|false, '
+    '"reasons": ["..."], '
+    '"which": {"air":"ok|empty|contradicts|irrelevant","hotel":"ok|empty|contradicts|irrelevant","tdna":"ok|empty|contradicts|irrelevant"}'
+    "}"
+)
+
+INCOHERENT_MSG = (
+    "Sorry — our sources don’t agree for these filters or we have incomplete data. "
+    "The database does not have a consistent answer for this request."
+)
+
+# ==================== Rewriter ====================
+def rewrite_with_history(sid: str, user_query: str, extra: Optional[dict] = None) -> str:
+    history = mem_get(sid, 10)
+    hist_min = [
+        {"role": h["role"], "content": h["content"] if isinstance(h["content"], str) else str(h["content"])}
+        for h in history
+    ]
+    payload = {
+        "latest_user_query": user_query,
+        "chat_history": hist_min,
+        "sticky_filters": (extra or {}).get("filters", {}),
+    }
+    try:
+        txt = claude_text(CONTEXTUALIZER_SYSTEM, payload, max_tokens=180, temperature=0)
+        return txt.strip().strip('"')
+    except Exception:
+        return user_query
+
+# ==================== Routing & composition ====================
+def llm_decide_targets(query: str, sid: Optional[str] = None) -> List[str]:
+    try:
+        payload = {"query": query}
+        if sid:
+            payload["history"] = mem_get(sid, 6)
+        out = claude_json(ROUTER_SYSTEM, payload, max_tokens=128)
+        picks = [t for t in out.get("targets", []) if t in SERVICES]
+        return list(dict.fromkeys(picks)) or ["hotel"]
+    except Exception:
+        return ["hotel"]
+
+def compose_final(user_query: str, answers_by_target: Dict[str, Any], answer_schema: Optional[dict] = None) -> str:
+    if not answers_by_target:
+        return ""
+    cleaned = sanitize_map(answers_by_target)
+    ckey = f"compose:{_h({'q':user_query,'a':cleaned,'schema':answer_schema})}"
+    hit = cache_get(ckey)
+    if hit is not None:
+        return hit
+    try:
+        txt = claude_text(
+            COMPOSER_SYSTEM,
+            {"user_query": user_query, "answers_by_target": cleaned, "answer_schema": answer_schema},
+            max_tokens=900
         )
-else:
-    st.info("Filters are not available when using TDNA directly. Switch to Agentic AI or a different tool to apply filters.")
+        final_txt = sanitize_answer(txt)
+        cache_set(ckey, final_txt)
+        return final_txt
+    except Exception:
+        parts = [f"{k}: {v}" for k, v in cleaned.items()]
+        final_txt = sanitize_answer(" | ".join(map(str, parts)))
+        cache_set(ckey, final_txt)
+        return final_txt
+
+# ==================== Build tool call arguments ====================
+def _build_tool_arguments(target: str, query: str, extra: Optional[Dict[str, Any]], sid: str, field_name: str) -> Dict[str, Any]:
+    args: Dict[str, Any] = {field_name: query}
+    args["context"] = {"session_id": sid, "target": target}
+    if isinstance(extra, dict) and extra:
+        if PASS_EXTRA_MODE in ("nested", "both"):
+            args["extra"] = extra
+        if PASS_EXTRA_MODE in ("flat", "both"):
+            for k, v in extra.items():
+                if k not in (field_name, "context", "extra"):
+                    args[k] = v
+    return args
+
+# ==================== Tool metadata introspection ====================
+async def ensure_tool_caps(target: str):
+    if TOOL_CAPS.get(target):
+        return
+    client = MCP_CLIENTS[target]
+    try:
+        info = await client.tools_list()
+    except Exception:
+        info = {"tools": []}
+    TOOL_CAPS[target] = {"tools": info.get("tools", []), "hints": PLANNING_HINTS.get(target, {})}
+
+# ==================== Downstream MCP calls ====================
+async def call_backend(target: str, query: str, extra: Optional[Dict[str, Any]], sid: str):
+    await ensure_tool_caps(target)
+    svc = SERVICES[target]
+    client = MCP_CLIENTS[target]
+    args = _build_tool_arguments(target=target, query=query, extra=extra, sid=sid, field_name=svc["field"])
+
+    ckey = f"bot:{target}:{_h({'q':query,'x':extra,'sid':sid,'mode':PASS_EXTRA_MODE})}"
+    hit = cache_get(ckey)
+    if hit is not None:
+        return hit
+
+    # retry for tool call
+    last_ex = None
+    for attempt in range(3):
+        try:
+            result = await client.tools_call(name=svc["tool"], arguments=args)
+            if isinstance(result, dict):
+                val = result.get("answer") or result.get("result") or result.get("output") or result.get("content") or result
+            else:
+                val = result
+            cache_set(ckey, val)
+            return val
+        except Exception as e:
+            last_ex = e
+            await asyncio.sleep(0.25 * (2 ** attempt) + random.random() * 0.2)
+    return f"{type(last_ex).__name__}: {last_ex}"
+
+# ==================== Models ====================
+class Step(BaseModel):
+    target: str = Field(..., description="one of: air, hotel, tdna")
+    input: str
+    after: Optional[List[int]] = None  # indices of dependent steps
+
+class Plan(BaseModel):
+    steps: List[Step] = Field(default_factory=list)
+    finish: bool = False
+    final_answer: str = ""
+
+class FinishDecision(BaseModel):
+    finish: bool
+    final_answer: Optional[str] = None
+
+# ==================== Execution helpers ====================
+def topo_batches(steps: List[Step]) -> List[List[int]]:
+    # Kahn-style batching by dependencies
+    deps: Dict[int, Set[int]] = {i: set(s.after or []) for i, s in enumerate(steps)}
+    remaining: Set[int] = set(range(len(steps)))
+    batches: List[List[int]] = []
+    while remaining:
+        ready = [i for i in sorted(remaining) if not deps[i]]
+        if not ready:
+            # cycle fallback: execute smallest index
+            i = min(remaining)
+            ready = [i]
+        batches.append(ready)
+        for i in ready:
+            remaining.remove(i)
+        for j in remaining:
+            deps[j] -= set(ready)
+    return batches
+
+async def execute_steps(steps: List[Step], q: str, extra_aug: dict, sid: str, parallel_cap: int) -> List[Dict[str, Any]]:
+    """Execute DAG steps in batches. Returns list of observations (ordered by execution)."""
+    observations: List[Dict[str, Any]] = []
+    batches = topo_batches(steps)
+    for batch_idxs in batches:
+        if not batch_idxs:
+            continue
+        # obey parallel cap
+        slice_idxs = [batch_idxs[i:i+parallel_cap] for i in range(0, len(batch_idxs), parallel_cap)]
+        for idxs in slice_idxs:
+            coros = []
+            idx_map = []
+            for i in idxs:
+                s = steps[i]
+                if s.target not in SERVICES:
+                    observations.append({"step_index": i, "step": s.dict(), "error": f"Unknown target {s.target}"})
+                    continue
+                idx_map.append(i)
+                coros.append(call_backend(s.target, s.input or q, extra_aug, sid))
+            outs = await asyncio.gather(*coros, return_exceptions=True)
+            for i, out in zip(idx_map, outs):
+                s = steps[i]
+                if isinstance(out, Exception):
+                    observations.append({"step_index": i, "step": s.dict(), "error": f"{type(out).__name__}: {out}"})
+                else:
+                    observations.append({"step_index": i, "step": s.dict(), "result": out})
+    return observations
+
+# ==================== Scoring & Selection ====================
+def score_observations(user_query: str, observations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Ask LLM to score each observation's relevance; returns per-target best pick."""
+    try:
+        scored = claude_json(
+            "Score each observation 0-1 for relevance to the user_query; group by target and pick best per target. Return JSON {best:{target: {index:int, score:float}}}",
+            {"user_query": user_query, "observations": observations}, max_tokens=220
+        )
+    except Exception:
+        # trivial fallback: first success per target
+        best: Dict[str, Dict[str, Any]] = {}
+        for ob in observations:
+            tgt = ob.get("step", {}).get("target")
+            if tgt and "result" in ob and tgt not in best:
+                best[tgt] = {"index": ob.get("step_index", 0), "score": 0.6}
+        scored = {"best": best}
+
+    # materialize best results map
+    latest: Dict[str, Any] = {}
+    for tgt, meta in (scored.get("best") or {}).items():
+        idx = meta.get("index")
+        if isinstance(idx, int) and 0 <= idx < len(observations):
+            ob = observations[idx]
+            if "result" in ob:
+                latest[tgt] = ob["result"]
+    if not latest:  # last-resort sweep
+        for ob in reversed(observations):
+            tgt = ob.get("step", {}).get("target")
+            if tgt and "result" in ob and tgt not in latest:
+                latest[tgt] = ob["result"]
+    return latest
+
+# ==================== Validator ====================
+def validate_consistency(user_query: str, answers_by_target: Dict[str, Any], filters: Optional[dict]) -> dict:
+    cleaned = sanitize_map(answers_by_target or {})
+    try:
+        out = claude_json(
+            VALIDATOR_SYSTEM,
+            {"user_query": user_query, "filters": filters or {}, "answers_by_target": cleaned},
+            max_tokens=256
+        )
+        ok = bool(out.get("ok", True))
+        reasons = out.get("reasons") or []
+        which = out.get("which") or {}
+        return {"ok": ok, "reasons": reasons, "which": which}
+    except Exception:
+        # If validator fails, do not block a valid answer
+        return {"ok": True, "reasons": [], "which": {}}
+
+# ==================== FastAPI ====================
+app = FastAPI(title="Agentic Orchestrator (MCP over HTTP JSON)")
+
+# ----- Schemas -----
+class RouteIn(BaseModel):
+    query: str
+    extra: Optional[Dict[str, Any]] = None
+    target: Optional[str] = None
+    targets: Optional[List[str]] = None
+    session_id: str = "default"
+
+class RouteOut(BaseModel):
+    tool: str = "route_query_tool"
+    targets: List[str]
+    routed_by: str
+    answer: Any
+    answers_by_target: Optional[Dict[str, Any]] = None
+    errors: Optional[Dict[str, str]] = None
+
+class AgentIn(BaseModel):
+    query: str
+    extra: Optional[Dict[str, Any]] = None
+    session_id: str = "default"
+    max_iters: int = 3
+    parallel_cap: int = 2
+    autonomy: bool = True
+    answer_schema: Optional[Dict[str, Any]] = None  # if provided, composer returns strict JSON
+
+class AgentOut(BaseModel):
+    tool: str = "agent_query_tool"
+    session_id: str
+    iterations: int
+    final_answer: Any
+    observations: List[Dict[str, Any]]
+    autonomy: bool
+    trace_id: str
+
+# ==================== Route Endpoint ====================
+@app.post("/route_query", operation_id="route_query_tool", response_model=RouteOut)
+async def route_query(inp: RouteIn = Body(...)):
+    q_orig, extra, sid = inp.query, inp.extra, inp.session_id
+    mem_append(sid, "user", q_orig)
+    compress_history_if_needed(sid)
+
+    # Rewrite with history + sticky filters
+    q = rewrite_with_history(sid, q_orig, extra)
+
+    # include a small conversation window for tools
+    extra_aug = dict(extra or {})
+    extra_aug["conversation_window"] = mem_get(sid, 6)
+
+    # Target selection
+    if inp.targets:
+        targets, routed_by = [t for t in inp.targets if t in SERVICES], "hint:list"
+    elif inp.target in SERVICES:
+        targets, routed_by = [inp.target], "hint:single"
+    elif inp.target == "both":
+        targets, routed_by = ["hotel", "air"], "hint:both"
+    else:
+        targets, routed_by = llm_decide_targets(q, sid), "llm+history"
+
+    results: Dict[str, Any] = {}
+    errors: Dict[str, str] = {}
+
+    if len(targets) <= 1:
+        tgt = targets[0] if targets else "hotel"
+        out = await call_backend(tgt, q, extra_aug, sid)
+        results[tgt] = out
+    else:
+        coros = [call_backend(t, q, extra_aug, sid) for t in targets]
+        outs = await asyncio.gather(*coros, return_exceptions=True)
+        for t, out in zip(targets, outs):
+            if isinstance(out, Exception):
+                errors[t] = f"{type(out).__name__}: {out}"
+            else:
+                results[t] = out
+
+    # NEW: Cross-tool validation before composing (only when multiple tools are called)
+    if len(results) > 1:
+        verdict = validate_consistency(q, results, (extra_aug or {}).get("filters"))
+        if not verdict.get("ok"):
+            answer = INCOHERENT_MSG
+            answers_by_target = sanitize_map(results)
+            mem_append(sid, "assistant", answer)
+            return RouteOut(
+                targets=targets, routed_by=routed_by, answer=answer,
+                answers_by_target=answers_by_target or None,
+                errors=(errors or None)
+            )
+
+    # Compose or return single
+    if len(results) > 1:
+        answer = compose_final(q, results, answer_schema=None)
+        answers_by_target = sanitize_map(results)
+    else:
+        answer = sanitize_answer(next(iter(results.values()), ""))
+        answers_by_target = None
+
+    mem_append(sid, "assistant", answer)
+
+    return RouteOut(
+        targets=targets, routed_by=routed_by, answer=answer,
+        answers_by_target=answers_by_target or None,
+        errors=(errors or None)
+    )
+
+# ==================== Agent Endpoint ====================
+@app.post("/agent_query", operation_id="agent_query_tool", response_model=AgentOut)
+async def agent_query(inp: AgentIn = Body(...)):
+    q_raw, extra, sid = inp.query, inp.extra, inp.session_id
+    trace_id = _h({"sid": sid, "t": time(), "nonce": random.random()})
+
+    mem_append(sid, "user", q_raw)
+    compress_history_if_needed(sid)
+
+    # Rewrite vague follow-ups with history + sticky filters
+    q = rewrite_with_history(sid, q_raw, extra)
+
+    extra_aug = dict(extra or {})
+    extra_aug["conversation_window"] = mem_get(sid, 6)
+
+    observations: List[Dict[str, Any]] = []
+    final_answer: Optional[str] = None
+
+    # ---- Planning loop ----
+    for _iter in range(max(1, min(inp.max_iters, 6))):
+        # Ask the planner for a DAG of minimal steps
+        try:
+            plan_raw = claude_json(
+                PLANNER_SYSTEM,
+                {"user_query": q, "memory": mem_get(sid, 6), "observations": observations[-4:], "tool_caps": TOOL_CAPS, "hints": PLANNING_HINTS},
+                max_tokens=300
+            )
+            plan = Plan(**plan_raw)
+        except Exception:
+            # fallback to router if planner fails
+            targets = llm_decide_targets(q, sid)
+            plan = Plan(steps=[Step(target=targets[0] if targets else "hotel", input=q)])
+
+        if plan.finish and plan.final_answer:
+            final_answer = plan.final_answer
+            break
+
+        # Execute plan DAG
+        batch_obs = await execute_steps(plan.steps, q, extra_aug, sid, inp.parallel_cap)
+        observations.extend(batch_obs)
+
+        if not inp.autonomy:
+            latest = score_observations(q, observations)
+            # NEW: Validate multi-tool coherence before composing
+            if len(latest) > 1:
+                verdict = validate_consistency(q, latest, (extra_aug or {}).get("filters"))
+                if not verdict.get("ok"):
+                    final_answer = INCOHERENT_MSG
+                else:
+                    final_answer = compose_final(q, latest, inp.answer_schema)
+            else:
+                final_answer = compose_final(q, latest, inp.answer_schema) if latest else "No result."
+            break
+
+        # Decide whether we can finish after this wave
+        try:
+            fin_raw = claude_json(
+                FINISHER_SYSTEM,
+                {"user_query": q, "memory": mem_get(sid, 6), "observations": batch_obs}, max_tokens=180
+            )
+            fin = FinishDecision(**fin_raw)
+        except Exception:
+            fin = FinishDecision(finish=False)
+        if fin.finish:
+            final_answer = fin.final_answer or ""
+            break
+
+    # If still no final answer, compose from best observed results
+    if final_answer is None:
+        latest = score_observations(q, observations)
+        if latest:
+            if len(latest) > 1:
+                verdict = validate_consistency(q, latest, (extra_aug or {}).get("filters"))
+                if not verdict.get("ok"):
+                    final_answer = INCOHERENT_MSG
+                else:
+                    final_answer = compose_final(q, latest, inp.answer_schema)
+            else:
+                final_answer = compose_final(q, latest, inp.answer_schema)
+        else:
+            final_answer = "No result."
+
+    # Critic pass (single attempt) for safety/consistency
+    try:
+        critic = claude_json(CRITIC_SYSTEM, {"user_query": q, "final_answer": final_answer, "observations": observations[-6:]}, max_tokens=220)
+        if not critic.get("ok") and critic.get("revise"):
+            final_answer = critic.get("revise")
+    except Exception:
+        pass
+
+    final_answer = sanitize_answer(final_answer)
+    mem_append(sid, "assistant", final_answer)
+
+    return AgentOut(
+        session_id=sid,
+        iterations=len([ob for ob in observations if "result" in ob or "error" in ob]),
+        final_answer=final_answer,
+        observations=observations[-8:],
+        autonomy=inp.autonomy,
+        trace_id=trace_id,
+    )
+
+# ---------------- Optional memory utils ----------------
+@app.post("/memory/clear")
+def memory_clear(payload: Dict[str, Any] = Body(...)):
+    sid = payload.get("session_id","default")
+    mem_clear(sid)
+    return JSONResponse({"ok": True, "session_id": sid})
+
+@app.get("/memory/show")
+def memory_show(session_id: str = "default"):
+    return JSONResponse({"session_id": session_id, "history": mem_get(session_id, 0)})
+
+# Expose orchestrator itself as an MCP server at /mcp (optional)
+mcp_server = FastApiMCP(app, name="orchestrator-mcp-agentic")
+mcp_server.mount()
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=ORCH_PORT)
