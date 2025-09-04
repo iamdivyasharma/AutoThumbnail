@@ -1,454 +1,103 @@
-# orchestrator_fastapi_mcp_http_json.py
-from __future__ import annotations
-import os, json, asyncio, hashlib, re
-from typing import Dict, Any, Optional, List, Tuple
-from collections import defaultdict, deque
-from time import time
+# pip install -U langchain langchain-aws langchain-community langchain-text-splitters chromadb boto3
 
-import httpx  # pip install httpx
-from fastapi import FastAPI, Body
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from fastapi_mcp import FastApiMCP
-
+import os
 import boto3
-from botocore.config import Config
+from typing import Optional
 
-# ==================== Config ====================
-ORCH_PORT = int(os.getenv("ORCH_PORT", "9000"))
+# --- LangChain imports ---
+from langchain_aws import ChatBedrock, BedrockEmbeddings           # or use legacy BedrockChat if you must
+from langchain_community.document_loaders import TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import PromptTemplate
+from langchain.chains import ConversationalRetrievalChain, LLMChain
+from langchain.chains.question_answering import load_qa_chain
 
-HOTEL_MCP_URL = os.getenv("HOTEL_MCP_URL", "http://127.0.0.1:9001/mcp")
-AIR_MCP_URL   = os.getenv("AIR_MCP_URL",   "http://127.0.0.1:9003/mcp")
-TDNA_MCP_URL  = os.getenv("TDNA_MCP_URL",  "http://127.0.0.1:9002/mcp")
+# ---------- LLM + Embeddings (Bedrock Claude Haiku + Titan Embeddings) ----------
+bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
 
-SERVICES: Dict[str, Dict[str, str]] = {
-    "hotel": {"url": HOTEL_MCP_URL, "tool": "hotel_query_tool", "field": os.getenv("HOTEL_FIELD", "query")},
-    "air":   {"url": AIR_MCP_URL,   "tool": "air_query_tool",   "field": os.getenv("AIR_FIELD",   "query")},
-    "tdna":  {"url": TDNA_MCP_URL,  "tool": "tdna_query_tool",  "field": os.getenv("TDNA_FIELD",  "query")},
-}
-
-# How to pass extras downstream (nested | flat | both)
-PASS_EXTRA_MODE = os.getenv("PASS_EXTRA_MODE", "both").lower().strip()
-
-# ==================== Bedrock Claude (routing + composing) ====================
-BEDROCK_REGION    = os.getenv("BEDROCK_REGION", "us-east-1")
-CLAUDE_MODEL_ID   = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0")
-ANTHROPIC_VERSION = "bedrock-2023-05-31"
-
-bedrock = boto3.client(
-    "bedrock-runtime",
-    region_name=BEDROCK_REGION,
-    config=Config(connect_timeout=5, read_timeout=30, retries={"max_attempts": 2, "mode": "standard"}),
+llm = ChatBedrock(
+    client=bedrock,
+    model_id="anthropic.claude-3-haiku-20240307-v1:0",
+    model_kwargs={"temperature": 0.1, "max_tokens": 1024},
 )
 
-def _invoke_bedrock(body: dict) -> dict:
-    resp = bedrock.invoke_model(modelId=CLAUDE_MODEL_ID, body=json.dumps(body))
-    return json.loads(resp["body"].read().decode("utf-8"))
-
-def claude_json(system: str, user_obj: dict, max_tokens=256, temperature=0):
-    payload = _invoke_bedrock({
-        "anthropic_version": ANTHROPIC_VERSION,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "system": system,
-        "messages": [{"role":"user","content":[{"type":"text","text": json.dumps(user_obj)}]}],
-    })
-    return json.loads(payload["content"][0]["text"])
-
-def claude_text(system: str, user_obj: dict, max_tokens=512, temperature=0) -> str:
-    payload = _invoke_bedrock({
-        "anthropic_version": ANTHROPIC_VERSION,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "system": system,
-        "messages": [{"role":"user","content":[{"type":"text","text": json.dumps(user_obj)}]}],
-    })
-    return payload["content"][0]["text"].strip()
-
-# ==================== MCP HTTP client (JSON-RPC over HTTP, JSON response) ====================
-class MCPHTTPClient:
-    def __init__(self, base_url: str, timeout: float = 30.0, headers: Optional[Dict[str, str]] = None):
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-        self._id = 0
-        self.headers = {
-            "content-type": "application/json",
-            "accept": "application/json",
-            "cache-control": "no-cache",
-            "connection": "keep-alive",
-        }
-        if headers:
-            merged = {**self.headers, **headers}
-            merged["accept"] = "application/json"
-            self.headers = merged
-
-    def _next_id(self) -> str:
-        self._id += 1
-        return str(self._id)
-
-    async def _rpc(self, method: str, params: Dict[str, Any]) -> Any:
-        payload = {"jsonrpc": "2.0", "id": self._next_id(), "method": method, "params": params}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(self.base_url, json=payload, headers=self.headers)
-            r.raise_for_status()
-            data = r.json()
-        if "error" in data:
-            raise RuntimeError(f"RPC error: {data['error']}")
-        return data.get("result")
-
-    async def tools_list(self) -> Dict[str, Any]:
-        return await self._rpc("tools/list", {})
-
-    async def tools_call(self, name: str, arguments: Dict[str, Any]) -> Any:
-        return await self._rpc("tools/call", {"name": name, "arguments": arguments})
-
-MCP_CLIENTS: Dict[str, MCPHTTPClient] = {svc: MCPHTTPClient(info["url"]) for svc, info in SERVICES.items()}
-
-# ==================== Memory & Cache ====================
-MEMORY: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"history": deque(maxlen=20), "created": time()})
-def mem_append(sid: str, role: str, content: Any):
-    MEMORY[sid]["history"].append({"role": role, "content": content, "ts": time()})
-def mem_get(sid: str, k: int = 10) -> List[Dict[str, Any]]:
-    hist = list(MEMORY[sid]["history"])
-    return hist[-k:] if k else hist
-def mem_clear(sid: str): MEMORY.pop(sid, None)
-
-CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "300"))
-_CACHE: Dict[str, Tuple[float, Any]] = {}
-def _h(obj: Any) -> str: return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
-def cache_get(k: str):
-    rec = _CACHE.get(k)
-    if not rec: return None
-    exp, val = rec
-    if exp < time():
-        _CACHE.pop(k, None)
-        return None
-    return val
-def cache_set(k: str, v: Any, ttl: int = CACHE_TTL_SEC): _CACHE[k] = (time()+ttl, v)
-
-# ==================== Answer sanitization & helpers ====================
-def sanitize_answer(text: Any) -> str:
-    """Remove greetings and tool-name prefixes; tidy spacing."""
-    s = text if isinstance(text, str) else str(text)
-    s = re.sub(r'(?mi)^\s*(air|hotel|tdna)\s*:\s*', '', s)
-    lead = re.compile(
-        r'^(?:\s*(?:hello|hi|hey|greetings)\b[^\n]*\n+|\s*i[\'’]?m .*assistant[^\n]*\n+|\s*based on (?:your|the) request[^\n]*\n+)',
-        flags=re.IGNORECASE
-    )
-    for _ in range(2):
-        s2 = lead.sub('', s)
-        if s2 == s:
-            break
-        s = s2
-    s = re.sub(r'\n{3,}', '\n\n', s).strip()
-    return s
-
-def sanitize_map(m: Dict[str, Any]) -> Dict[str, str]:
-    return {k: sanitize_answer(v) for k, v in m.items()}
-
-# ==================== Prompts ====================
-CONTEXTUALIZER_SYSTEM = (
-    "Rewrite the latest user message into a standalone, explicit query for downstream tools. "
-    "Use the provided chat_history (recent turns) ONLY to resolve references like dates, route, constraints, or prior choices. "
-    "If sticky_filters are provided (origin, destination, dates, policy), incorporate them when relevant. "
-    "Do NOT answer; return only the rewritten query text."
+embeddings = BedrockEmbeddings(
+    client=bedrock,
+    model_id="amazon.titan-embed-text-v1",
 )
 
-ROUTER_SYSTEM = (
-    "You are a strict router for a multi-tool system. Tools: air, hotel, tdna. "
-    "Given a query and (optionally) recent history, decide which tools to call. "
-    "Return ONLY JSON like {\"targets\":[\"air\"|\"hotel\"|\"tdna\", ...]} with unique items."
-)
+# ---------- Build or load Chroma once ----------
+def _load_or_build_chroma(persist_dir: str = "./data") -> Chroma:
+    if os.path.exists(persist_dir) and os.listdir(persist_dir):
+        return Chroma(persist_directory=persist_dir, embedding_function=embeddings)
+    loader = TextLoader("details.txt", encoding="utf-8")
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_documents(docs)
+    vdb = Chroma.from_documents(chunks, embedding=embeddings, persist_directory=persist_dir)
+    vdb.persist()
+    return vdb
 
-COMPOSER_SYSTEM = (
-    "You are a response composer. Combine multiple tool answers (air/hotel/tdna) into ONE coherent, concise reply. "
-    "Synthesize and prioritize: resolve conflicts, highlight best options, and incorporate policy/filters or traveler history when present. "
-    "Avoid duplication and boilerplate; include next actions only if helpful. "
-    "Do NOT include greetings or self-intro. Do NOT prefix with tool names ('Air:', 'Hotel:', 'TDNA:'). "
-    "Write a single polished answer the user would want to read."
-)
+_vectordb = _load_or_build_chroma("./data")
 
-# ==================== Rewriter ====================
-def rewrite_with_history(sid: str, user_query: str, extra: Optional[dict] = None) -> str:
-    history = mem_get(sid, 8)
-    hist_min = [
-        {"role": h["role"], "content": h["content"] if isinstance(h["content"], str) else str(h["content"])}
-        for h in history
-    ]
-    payload = {
-        "latest_user_query": user_query,
-        "chat_history": hist_min,
-        "sticky_filters": (extra or {}).get("filters", {}),
-    }
-    try:
-        txt = claude_text(CONTEXTUALIZER_SYSTEM, payload, max_tokens=180, temperature=0)
-        return txt.strip().strip('"')
-    except Exception:
-        return user_query
+# ---------- Prompts ----------
+CONDENSE_TPL = """Given the following conversation and a follow up question, rephrase the follow up
+question to be a standalone question without changing its meaning.
 
-# ==================== Routing & composition ====================
-def llm_decide_targets(query: str, sid: Optional[str] = None) -> List[str]:
-    try:
-        payload = {"query": query}
-        if sid:
-            payload["history"] = mem_get(sid, 6)
-        out = claude_json(ROUTER_SYSTEM, payload, max_tokens=128)
-        picks = [t for t in out.get("targets", []) if t in SERVICES]
-        # default to hotel if nothing chosen
-        return list(dict.fromkeys(picks)) or ["hotel"]
-    except Exception:
-        return ["hotel"]
+Chat History:
+{chat_history}
+Follow Up Input: {question}
+Standalone question:"""
+condense_question_prompt = PromptTemplate.from_template(CONDENSE_TPL)
 
-def compose_final(user_query: str, answers_by_target: Dict[str, Any]) -> str:
-    if not answers_by_target:
-        return ""
-    # sanitize individual tool answers first so composer doesn't see prefixes/boilerplate
-    cleaned = sanitize_map(answers_by_target)
-    ckey = f"compose:{_h({'q':user_query,'a':cleaned})}"
-    hit = cache_get(ckey)
-    if hit is not None:
-        return hit
-    try:
-        txt = claude_text(COMPOSER_SYSTEM, {"user_query": user_query, "answers_by_target": cleaned}, max_tokens=700)
-        final_txt = sanitize_answer(txt)
-        cache_set(ckey, final_txt)
-        return final_txt
-    except Exception:
-        parts = [f"{k}: {v}" for k, v in cleaned.items()]
-        final_txt = sanitize_answer(" | ".join(map(str, parts)))
-        cache_set(ckey, final_txt)
-        return final_txt
+ANSWER_TPL = """You are a helpful QA system. Answer ONLY using the information in the context below.
+If the answer isn't in the context, say you don't know.
 
-# ==================== Build tool call arguments ====================
-def _build_tool_arguments(target: str, query: str, extra: Optional[Dict[str, Any]], sid: str, field_name: str) -> Dict[str, Any]:
-    args: Dict[str, Any] = {field_name: query}
-    args["context"] = {"session_id": sid, "target": target}
+{context}
 
-    if isinstance(extra, dict) and extra:
-        if PASS_EXTRA_MODE in ("nested", "both"):
-            args["extra"] = extra
-        if PASS_EXTRA_MODE in ("flat", "both"):
-            for k, v in extra.items():
-                if k not in (field_name, "context", "extra"):
-                    args[k] = v
-    return args
+Question: {question}
+Helpful Answer:"""
+qa_prompt = PromptTemplate(template=ANSWER_TPL, input_variables=["context", "question"])
 
-# ==================== Downstream MCP calls ====================
-async def call_backend(target: str, query: str, extra: Optional[Dict[str, Any]], sid: str):
-    svc = SERVICES[target]
-    client = MCP_CLIENTS[target]
-    args = _build_tool_arguments(target=target, query=query, extra=extra, sid=sid, field_name=svc["field"])
+# ---------- User-scoped memory (single active user; clears on change) ----------
+_current_user: Optional[str] = None
+_memory: Optional[ConversationBufferMemory] = None
+_qa_chain: Optional[ConversationalRetrievalChain] = None
 
-    ckey = f"bot:{target}:{_h({'q':query,'x':extra,'sid':sid,'mode':PASS_EXTRA_MODE})}"
-    hit = cache_get(ckey)
-    if hit is not None:
-        return hit
+def _ensure_chain_for(user_name: str) -> ConversationalRetrievalChain:
+    """
+    Keep memory if same user; reset memory & rebuild chain when user changes.
+    """
+    global _current_user, _memory, _qa_chain
 
-    try:
-        result = await client.tools_call(name=svc["tool"], arguments=args)
-        if isinstance(result, dict):
-            val = result.get("answer") or result.get("result") or result.get("output") or result.get("content") or result
-        else:
-            val = result
-        cache_set(ckey, val)
-        return val
-    except Exception as e:
-        return f"{type(e).__name__}: {e}"
+    if _qa_chain is None or _current_user != user_name:
+        _current_user = user_name
+        _memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
-# ==================== FastAPI ====================
-app = FastAPI(title="Orchestrator (MCP over HTTP JSON)")
+        question_generator = LLMChain(llm=llm, prompt=condense_question_prompt, memory=_memory)
+        doc_chain = load_qa_chain(llm, chain_type="stuff", prompt=qa_prompt)
 
-# ----- Schemas -----
-class RouteIn(BaseModel):
-    query: str
-    extra: Optional[Dict[str, Any]] = None
-    target: Optional[str] = None
-    targets: Optional[List[str]] = None
-    session_id: str = "default"
-
-class RouteOut(BaseModel):
-    tool: str = "route_query_tool"
-    targets: List[str]
-    routed_by: str
-    answer: Any
-    answers_by_target: Optional[Dict[str, Any]] = None
-    errors: Optional[Dict[str, str]] = None
-
-class AgentIn(BaseModel):
-    query: str
-    extra: Optional[Dict[str, Any]] = None
-    session_id: str = "default"
-    max_iters: int = 2
-    parallel_cap: int = 2
-    autonomy: bool = True
-
-class AgentOut(BaseModel):
-    tool: str = "agent_query_tool"
-    session_id: str
-    iterations: int
-    final_answer: Any
-    observations: List[Dict[str, Any]]
-    autonomy: bool
-
-# ----- Endpoints -----
-@app.post("/route_query", operation_id="route_query_tool", response_model=RouteOut)
-async def route_query(inp: RouteIn = Body(...)):
-    q_orig, extra, sid = inp.query, inp.extra, inp.session_id
-    mem_append(sid, "user", q_orig)
-
-    # Rewrite with history + sticky filters
-    q = rewrite_with_history(sid, q_orig, extra)
-
-    # include a small conversation window for tools
-    extra_aug = dict(extra or {})
-    extra_aug["conversation_window"] = mem_get(sid, 6)
-
-    # Target selection
-    if inp.targets:
-        targets, routed_by = [t for t in inp.targets if t in SERVICES], "hint:list"
-    elif inp.target in SERVICES:
-        targets, routed_by = [inp.target], "hint:single"
-    elif inp.target == "both":
-        targets, routed_by = ["hotel", "air"], "hint:both"
-    else:
-        targets, routed_by = llm_decide_targets(q, sid), "llm+history"
-
-    results: Dict[str, Any] = {}
-    errors: Dict[str, str] = {}
-
-    if len(targets) <= 1:
-        tgt = targets[0] if targets else "hotel"
-        out = await call_backend(tgt, q, extra_aug, sid)
-        results[tgt] = out
-    else:
-        coros = [call_backend(t, q, extra_aug, sid) for t in targets]
-        outs = await asyncio.gather(*coros, return_exceptions=True)
-        for t, out in zip(targets, outs):
-            if isinstance(out, Exception):
-                errors[t] = f"{type(out).__name__}: {out}"
-            else:
-                results[t] = out
-
-    # Compose or return single
-    if len(results) > 1:
-        answer = compose_final(q, results)
-        answers_by_target = sanitize_map(results)
-    else:
-        answer = sanitize_answer(next(iter(results.values()), ""))
-        answers_by_target = None
-
-    mem_append(sid, "assistant", answer)
-
-    return RouteOut(
-        targets=targets, routed_by=routed_by, answer=answer,
-        answers_by_target=answers_by_target or None,
-        errors=(errors or None)
-    )
-
-@app.post("/agent_query", operation_id="agent_query_tool", response_model=AgentOut)
-async def agent_query(inp: AgentIn = Body(...)):
-    q_raw, extra, sid = inp.query, inp.extra, inp.session_id
-    mem_append(sid, "user", q_raw)
-
-    # Rewrite vague follow-ups with history + sticky filters
-    q = rewrite_with_history(sid, q_raw, extra)
-
-    extra_aug = dict(extra or {})
-    extra_aug["conversation_window"] = mem_get(sid, 6)
-
-    observations: List[Dict[str, Any]] = []
-    final_answer: Optional[str] = None
-
-    async def execute(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        steps = [s for s in steps if s.get("target") in SERVICES][:inp.parallel_cap]
-        if not steps:
-            return []
-        outs = await asyncio.gather(
-            *[call_backend(s["target"], s.get("input", q), extra_aug, sid) for s in steps],
-            return_exceptions=True
+        _qa_chain = ConversationalRetrievalChain(
+            retriever=_vectordb.as_retriever(search_kwargs={"k": 6}),
+            question_generator=question_generator,
+            combine_docs_chain=doc_chain,
+            memory=_memory,
         )
-        batch: List[Dict[str, Any]] = []
-        for s, out in zip(steps, outs):
-            if isinstance(out, Exception):
-                batch.append({"step": s, "error": f"{type(out).__name__}: {out}"})
-            else:
-                batch.append({"step": s, "result": out})
-        return batch
+    return _qa_chain
 
-    for _ in range(max(1, min(inp.max_iters, 6))):
-        try:
-            plan = claude_json(
-                "Plan minimal tool calls (no greetings). Return ONLY JSON "
-                '{"steps":[{"target":"air|hotel|tdna","input":"..."}],"finish":false,"final_answer":""}',
-                {"user_query": q, "memory": mem_get(sid, 6), "observations": observations[-2:]},
-                max_tokens=256
-            )
-        except Exception:
-            targets = llm_decide_targets(q, sid)
-            plan = {"steps":[{"target": targets[0] if targets else "hotel", "input": q}], "finish": False, "final_answer": ""}
+# ---------- Your handler that receives a payload with user_name ----------
+def qasystem(payload: dict) -> str:
+    """
+    payload = {
+        "user_name": "alice",
+        "query": "your question here"
+    }
+    """
+    user_name = (payload.get("user_name") or "anonymous").strip()
+    query = (payload.get("query") or payload.get("question") or "").strip()
 
-        if plan.get("finish") and plan.get("final_answer"):
-            final_answer = plan["final_answer"]
-            break
-
-        steps = plan.get("steps", [])
-        if not steps:
-            break
-
-        batch = await execute(steps)
-        observations.extend(batch)
-
-        if not inp.autonomy:
-            latest = {ob["step"]["target"]: ob.get("result") for ob in observations if "result" in ob}
-            final_answer = compose_final(q, latest) if latest else "No result."
-            break
-
-        try:
-            fin = claude_json(
-                'If observations+memory satisfy the goal, return {"finish": true, "final_answer": "..."} '
-                'else {"finish": false}.',
-                {"user_query": q, "memory": mem_get(sid, 6), "observations": batch}, max_tokens=196
-            )
-        except Exception:
-            fin = {"finish": False}
-        if fin.get("finish"):
-            final_answer = fin.get("final_answer")
-            break
-
-    if final_answer is None:
-        latest: Dict[str, Any] = {}
-        for ob in reversed(observations):
-            tgt = ob.get("step",{}).get("target")
-            if tgt and "result" in ob and tgt not in latest:
-                latest[tgt] = ob["result"]
-        final_answer = compose_final(q, latest) if latest else "No result."
-
-    final_answer = sanitize_answer(final_answer)
-    mem_append(sid, "assistant", final_answer)
-
-    return AgentOut(
-        session_id=sid,
-        iterations=min(len(observations), inp.max_iters),
-        final_answer=final_answer,
-        observations=observations[-6:],
-        autonomy=inp.autonomy
-    )
-
-# ---------------- Optional memory utils ----------------
-@app.post("/memory/clear")
-def memory_clear(payload: Dict[str, Any] = Body(...)):
-    sid = payload.get("session_id","default")
-    mem_clear(sid)
-    return JSONResponse({"ok": True, "session_id": sid})
-
-@app.get("/memory/show")
-def memory_show(session_id: str = "default"):
-    return JSONResponse({"session_id": session_id, "history": mem_get(session_id, 0)})
-
-# Expose orchestrator itself as an MCP server at /mcp (optional)
-mcp_server = FastApiMCP(app, name="orchestrator-mcp")
-mcp_server.mount()
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=ORCH_PORT)
+    qa_chain = _ensure_chain_for(user_name)
+    result = qa_chain({"question": query})
+    return result["answer"]
