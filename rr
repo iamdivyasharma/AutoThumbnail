@@ -1,495 +1,678 @@
-# filtered_new_ui.py
-import json
-import uuid
-import hashlib
-import requests
-import streamlit as st
-from pathlib import Path
-from datetime import date
+from __future__ import annotations
+"""
+Agentic Orchestrator (MCP over HTTP JSON)
+----------------------------------------
+Key upgrades vs your original file:
+- Planning → Execution → Reflection loop with a DAG of tool steps
+- Unified, strongly typed LLM JSON outputs (robust JSON extraction + validation)
+- Tool introspection (fetches tools/list metadata per service to guide planning)
+- Observation scoring + result selection before composition
+- Composer with optional answer_schema (force JSON outputs to callers if desired)
+- Critic pass to self-check final answer and auto-revise once if needed
+- Deterministic caches + simple cost/latency hints per tool to help the planner
+- Safer answer sanitization and history compression when memory grows
+- Backoff/retry around HTTP and MCP calls, plus clearer traces in responses
 
-# ================== Orchestrator endpoints ==================
-ORCH_BASE = "http://localhost:9000"  # change if deployed
-ROUTE_URL = f"{ORCH_BASE}/route_query"
-AGENT_URL = f"{ORCH_BASE}/agent_query"
-MEM_CLEAR = f"{ORCH_BASE}/memory/clear"
-TIMEOUT   = 30
+Endpoints remain:
+- POST /route_query (same signature; internal improvements only)
+- POST /agent_query (now “more agentic”; supports DAG plans, reflection, critic)
 
-# ================== Example users ==================
-USERS = [
-    {"name": "Alice Singh",  "email": "alice@example.com"},
-    {"name": "Bob Kumar",    "email": "bob@example.com"},
-    {"name": "Charlie Rao",  "email": "charlie@example.com"},
-]
+Environment variables (all optional):
+- ORCH_PORT, PASS_EXTRA_MODE, CACHE_TTL_SEC
+- BEDROCK_REGION, BEDROCK_MODEL_ID (Claude 3.5 Sonnet default)
+- *_MCP_URL and *_FIELD like before
 
-# ================== Airports: options + labels ==================
-AIRPORT_LABELS = {
-    "DEL": "Delhi — Indira Gandhi Intl",
-    "BOM": "Mumbai — Chhatrapati Shivaji Maharaj Intl",
-    "BLR": "Bengaluru — Kempegowda Intl",
-    "MAA": "Chennai — Chennai Intl",
-    "HYD": "Hyderabad — Rajiv Gandhi Intl",
-    "CCU": "Kolkata — Netaji Subhas Chandra Bose Intl",
-    "PNQ": "Pune — Lohegaon",
-    "COK": "Kochi — Cochin Intl",
-    "GOI": "Goa — Dabolim",
-    "DXB": "Dubai — Dubai Intl",
-    "SIN": "Singapore — Changi",
-    "LHR": "London — Heathrow",
-    "JFK": "New York — John F. Kennedy Intl",
-    "SFO": "San Francisco — SFO",
+"""
+import os, json, asyncio, hashlib, re, math, random
+from typing import Dict, Any, Optional, List, Tuple, Set
+from collections import defaultdict, deque
+from time import time
+
+import httpx  # pip install httpx
+from fastapi import FastAPI, Body
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ValidationError
+from fastapi_mcp import FastApiMCP
+
+import boto3
+from botocore.config import Config
+
+# ==================== Config ====================
+ORCH_PORT = int(os.getenv("ORCH_PORT", "9000"))
+
+HOTEL_MCP_URL = os.getenv("HOTEL_MCP_URL", "http://127.0.0.1:9001/mcp")
+AIR_MCP_URL   = os.getenv("AIR_MCP_URL",   "http://127.0.0.1:9003/mcp")
+TDNA_MCP_URL  = os.getenv("TDNA_MCP_URL",  "http://127.0.0.1:9002/mcp")
+
+SERVICES: Dict[str, Dict[str, str]] = {
+    "hotel": {"url": HOTEL_MCP_URL, "tool": "hotel_query_tool", "field": os.getenv("HOTEL_FIELD", "query")},
+    "air":   {"url": AIR_MCP_URL,   "tool": "air_query_tool",   "field": os.getenv("AIR_FIELD",   "query")},
+    "tdna":  {"url": TDNA_MCP_URL,  "tool": "tdna_query_tool",  "field": os.getenv("TDNA_FIELD",  "query")},
 }
-ORIGIN_OPTIONS      = ["DEL","BLR","MAA","HYD","CCU","PNQ","COK","GOI","BOM","DXB","SIN","LHR","JFK","SFO"]
-DESTINATION_OPTIONS = ["BOM","DEL","BLR","CCU","MAA","HYD","COK","PNQ","GOI","DXB","SIN","LHR","JFK","SFO"]
 
-def label_for(code: str) -> str:
-    return f"{code} ({AIRPORT_LABELS.get(code, 'Unknown')})"
+# optional planning hints (latency/cost weights ~ lower is better)
+PLANNING_HINTS = {
+    "hotel": {"latency": 2.0, "cost": 1.0, "reliability": 0.9},
+    "air":   {"latency": 2.5, "cost": 1.1, "reliability": 0.9},
+    "tdna":  {"latency": 1.8, "cost": 1.3, "reliability": 0.85},
+}
 
-# ================== Allowed dates (whitelists) ==================
-ALLOWED_START_DATES = ["2025-09-01", "2025-09-05", "2025-09-08", "2025-09-10", "2025-10-01"]
-ALLOWED_END_DATES   = ["2025-09-01", "2025-09-07", "2025-09-10", "2025-09-15", "2025-10-31", "2025-12-31"]
+# How to pass extras downstream (nested | flat | both)
+PASS_EXTRA_MODE = os.getenv("PASS_EXTRA_MODE", "both").lower().strip()
 
-def _iso_to_dates(xs):
-    return sorted(date.fromisoformat(x) if isinstance(x, str) else x for x in xs)
+# ==================== Bedrock Claude (routing + composing) ====================
+BEDROCK_REGION    = os.getenv("BEDROCK_REGION", "us-east-1")
+CLAUDE_MODEL_ID   = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0")
+ANTHROPIC_VERSION = "bedrock-2023-05-31"
 
-START_WHITELIST = _iso_to_dates(ALLOWED_START_DATES)
-END_WHITELIST   = _iso_to_dates(ALLOWED_END_DATES)
-
-def _snap_to_allowed(chosen: date, allowed: list[date], *, direction="nearest", min_after: date | None = None) -> date:
-    if not allowed:
-        return chosen
-    xs = allowed
-    if min_after is not None:
-        xs = [d for d in xs if d >= min_after] or [allowed[-1]]
-    if direction == "up":
-        for d in xs:
-            if d >= chosen:
-                return d
-        return xs[-1]
-    if direction == "down":
-        for d in reversed(xs):
-            if d <= chosen:
-                return d
-        return xs[0]
-    return min(xs, key=lambda d: abs(d - chosen))
-
-# ================== Page config (Logo + Favicon) ==================
-LOGO_PATH    = Path("assets/logo.png")       # direct path to your logo
-FAVICON_PATH = Path("assets/favicon.png")    # direct path to your favicon
-
-st.set_page_config(
-    page_title="Orchestrator Chat",
-    page_icon=str(FAVICON_PATH) if FAVICON_PATH.exists() else "💬",
-    layout="centered",
+bedrock = boto3.client(
+    "bedrock-runtime",
+    region_name=BEDROCK_REGION,
+    config=Config(connect_timeout=5, read_timeout=45, retries={"max_attempts": 3, "mode": "standard"}),
 )
 
-# Top-centered logo + title
-if LOGO_PATH.exists():
-    c1, c2, c3 = st.columns([1, 2, 1])
-    with c2:
-        st.image(str(LOGO_PATH), use_container_width=False)
+def _invoke_bedrock(body: dict) -> dict:
+    resp = bedrock.invoke_model(modelId=CLAUDE_MODEL_ID, body=json.dumps(body))
+    return json.loads(resp["body"].read().decode("utf-8"))
 
-st.markdown("<h1 style='text-align:center'>💬 Orchestrator — Conversational Chat</h1>", unsafe_allow_html=True)
+# ---- robust JSON helpers ----
+_JSON_BLOCK = re.compile(r"\{[\s\S]*\}")
 
-# ================== Helpers ==================
-def post(url: str, payload: dict):
-    r = requests.post(url, json=payload, timeout=TIMEOUT)
-    if r.headers.get("content-type","").startswith("application/json"):
-        return r.status_code, r.json()
-    return r.status_code, r.text
-
-def answer_sig(text: str, payload: dict) -> str:
-    blob = json.dumps({"t": text, "p": payload}, sort_keys=True, default=str)
-    return hashlib.sha256(blob.encode()).hexdigest()[:16]
-
-def ensure_state():
-    ss = st.session_state
-    if "messages" not in ss: ss.messages = []  # [{"role":"user"|"assistant","content":str}]
-    if "session_id" not in ss: ss.session_id = "user123"
-    if "mode" not in ss: ss.mode = "Agentic AI"
-    if "target" not in ss: ss.target = "air"
-    if "user_name" not in ss: ss.user_name = ""
-    if "user_email" not in ss: ss.user_email = ""
-    if "prev_picked" not in ss: ss.prev_picked = None           # track last preset user selection
-    if "prev_user_name" not in ss: ss.prev_user_name = ""
-    if "prev_user_email" not in ss: ss.prev_user_email = ""
-    if "autonomy" not in ss: ss.autonomy = True
-    if "max_iters" not in ss: ss.max_iters = 3
-    if "filters" not in ss:
-        ss.filters = {
-            "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
-            "start_date": START_WHITELIST[0].isoformat(),
-            "end_date": END_WHITELIST[-1].isoformat(),
-            "policy_status": "In policy",  # "In policy" | "Out of policy"
-        }
-    # first-Apply flags per mode/target
-    if "boot_agentic" not in ss: ss.boot_agentic = False
-    if "boot_air" not in ss: ss.boot_air = False
-    if "boot_hotel" not in ss: ss.boot_hotel = False
-    # duplicate guard
-    if "last_answer_hash" not in ss: ss.last_answer_hash = None
-
-ensure_state()
-
-# ============== Query builders (for first-time Apply only) ==============
-def build_query_combined(fil: dict) -> str:
-    return (
-        "Provide me the best flights for the given route from AIR bot and also provide "
-        "best/preferred hotels from HOTEL bot, and check traveller's past history from TDNA bot. "
-        f"[Filters] Origin: {fil['ond']['origin']}, Destination: {fil['ond']['destination']}, "
-        f"Start: {fil['start_date']}, End: {fil['end_date']}, Policy: {fil['policy_status']}"
-    )
-
-def build_query_hotels_only(fil: dict) -> str:
-    return (
-        "Provide me the best/preferred hotels from HOTEL bot. "
-        f"[Filters] Origin: {fil['ond']['origin']}, Destination: {fil['ond']['destination']}, "
-        f"Start: {fil['start_date']}, End: {fil['end_date']}, Policy: {fil['policy_status']}"
-    )
-
-def build_query_flights_only(fil: dict) -> str:
-    return (
-        "Provide me the best flights for the given route from AIR bot. "
-        f"[Filters] Origin: {fil['ond']['origin']}, Destination: {fil['ond']['destination']}, "
-        f"Start: {fil['start_date']}, End: {fil['end_date']}, Policy: {fil['policy_status']}"
-    )
-
-# ================== Sidebar ==================
-with st.sidebar:
-    st.subheader("User")
-    user_labels = [f"{u['name']} <{u['email']}>" for u in USERS] + ["Other…"]
-    picked = st.selectbox("Choose a user", user_labels, index=(0 if st.session_state.prev_picked is None else user_labels.index(st.session_state.prev_picked) if st.session_state.prev_picked in user_labels else 0))
-
-    # Defaults from preset or blanks for Other…
-    if picked != "Other…":
-        idx = user_labels.index(picked)
-        chosen = USERS[idx]
-        name_default = chosen["name"]
-        email_default = chosen["email"]
-    else:
-        name_default = st.session_state.prev_user_name or ""
-        email_default = st.session_state.prev_user_email or ""
-
-    name_val = st.text_input("Name", value=name_default, placeholder="e.g., Priya Sharma", key="user_name_input")
-    email_val = st.text_input("Email", value=email_default, placeholder="e.g., priya@company.com", key="user_email_input")
-
-    # ---- Identity switching logic ----
-    def _switch_to_identity(name: str, email: str, reason: str):
-        # Use email as stable session id if present; else name; else random
-        new_sid = (email.strip() or name.strip() or f"user-{uuid.uuid4().hex[:8]}")
-        st.session_state.session_id = new_sid
-        st.session_state.messages = []
-        st.session_state.boot_agentic = False
-        st.session_state.boot_air = False
-        st.session_state.boot_hotel = False
-        st.session_state.user_name = name.strip()
-        st.session_state.user_email = email.strip()
-        st.session_state.prev_picked = picked
-        st.session_state.prev_user_name = name.strip()
-        st.session_state.prev_user_email = email.strip()
-        st.success(f"Switched user ({reason}). New session id: {new_sid}")
-
-    # Auto-switch for preset change
-    if st.session_state.prev_picked is None:
-        st.session_state.prev_picked = picked
-        st.session_state.user_name = name_default
-        st.session_state.user_email = email_default
-        if (email_default or name_default):
-            st.session_state.session_id = (email_default or name_default)
-    elif picked != st.session_state.prev_picked and picked != "Other…":
-        _switch_to_identity(name_default, email_default, reason="preset")
-
-    # Manual switch for 'Other…' (avoid resets on every keystroke)
-    if picked == "Other…":
-        if st.button("🔁 Switch User"):
-            _switch_to_identity(name_val, email_val, reason="manual (Other…)")
-
-    st.markdown("---")
-    st.subheader("Session")
-    # You can still override the session id if needed
-    new_session_id = st.text_input("Session ID", value=st.session_state.session_id, key="sid_input")
-    if new_session_id != st.session_state.session_id:
-        st.session_state.session_id = new_session_id
-        st.info("Session id changed. Context will follow this id.")
-
-    col_a, col_b = st.columns(2)
-    if col_a.button("🆕 New Chat"):
-        sid = f"{(st.session_state.user_email or st.session_state.user_name or 'user')}-{uuid.uuid4().hex[:8]}"
-        st.session_state.session_id = sid
-        st.session_state.messages = []
-        st.session_state.boot_agentic = False
-        st.session_state.boot_air = False
-        st.session_state.boot_hotel = False
-        st.success(f"New session id: {sid}")
-
-    if col_b.button("🧹 Clear Server Memory"):
-        try:
-            r = requests.post(MEM_CLEAR, json={"session_id": st.session_state.session_id}, timeout=TIMEOUT)
-            if r.status_code == 200:
-                st.success("Server memory cleared for this session id.")
-            else:
-                st.error(r.text)
-        except Exception as e:
-            st.error(f"Clear error: {e}")
-
-    st.markdown("---")
-    st.subheader("Mode")
-    st.session_state.mode = st.radio(
-        "How should the next message be handled?",
-        ["Agentic AI", "Direct tool"],
-        captions=["Let the orchestrator plan and compose", "Call a specific backend directly"]
-    )
-    if st.session_state.mode == "Direct tool":
-        st.session_state.target = st.segmented_control(
-            "Target", options=["air", "hotel", "tdna"], default="air"
-        )
-
-    st.markdown("---")
-    st.subheader("Agent Settings")
-    st.session_state.autonomy = st.checkbox("Enable Autonomy (agent loop)", value=st.session_state.autonomy)
-    st.session_state.max_iters = st.slider("Max Iterations", 1, 8, st.session_state.max_iters)
-
-# ============== Filters (hidden only for Direct→TDNA) ==============
-def compose_filters_caption(fil: dict) -> str:
-    return (f"{label_for(fil['ond']['origin'])} → {label_for(fil['ond']['destination'])} | "
-            f"Start: {fil['start_date']} | End: {fil['end_date']} | Policy: {fil['policy_status']}")
-
-show_filters = not (st.session_state.mode == "Direct tool" and st.session_state.target == "tdna")
-
-if show_filters:
-    with st.container():
-        st.markdown("### 🔎 Filters")
-        fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns([1,1,1,1,1])
-
-        with fcol1:
-            origin_code = st.selectbox(
-                "Origin",
-                options=ORIGIN_OPTIONS,
-                index=(ORIGIN_OPTIONS.index(st.session_state.filters["ond"]["origin"])
-                       if st.session_state.filters["ond"]["origin"] in ORIGIN_OPTIONS else 0),
-                format_func=label_for,
-            )
-        with fcol2:
-            dest_code = st.selectbox(
-                "Destination",
-                options=DESTINATION_OPTIONS,
-                index=(DESTINATION_OPTIONS.index(st.session_state.filters["ond"]["destination"])
-                       if st.session_state.filters["ond"]["destination"] in DESTINATION_OPTIONS else 0),
-                format_func=label_for,
-            )
-        with fcol3:
-            start_default = date.fromisoformat(st.session_state.filters["start_date"])
-            start_default = _snap_to_allowed(start_default, START_WHITELIST, direction="nearest")
-            start_input = st.date_input(
-                "Start date",
-                value=start_default,
-                min_value=START_WHITELIST[0],
-                max_value=START_WHITELIST[-1],
-                format="YYYY-MM-DD",
-                key="start_date_picker",
-            )
-        with fcol4:
-            end_default = date.fromisoformat(st.session_state.filters["end_date"])
-            end_default = _snap_to_allowed(end_default, END_WHITELIST, direction="up", min_after=start_input)
-            end_input = st.date_input(
-                "End date",
-                value=end_default,
-                min_value=END_WHITELIST[0],
-                max_value=END_WHITELIST[-1],
-                format="YYYY-MM-DD",
-                key="end_date_picker",
-            )
-        with fcol5:
-            policy_input = st.selectbox(
-                "Policy status",
-                options=["In policy", "Out of policy"],
-                index=["In policy", "Out of policy"].index(st.session_state.filters["policy_status"])
-            )
-            apply = st.button("Apply", use_container_width=True)
-            clear = st.button("Clear", use_container_width=True)
-
-        if apply:
-            if origin_code == dest_code:
-                st.warning("Origin and Destination cannot be the same.")
-
-            chosen_start = start_input if isinstance(start_input, date) else START_WHITELIST[0]
-            snapped_start = _snap_to_allowed(chosen_start, START_WHITELIST, direction="nearest")
-
-            chosen_end = end_input if isinstance(end_input, date) else END_WHITELIST[-1]
-            snapped_end = _snap_to_allowed(chosen_end, END_WHITELIST, direction="up", min_after=snapped_start)
-
-            st.session_state.filters = {
-                "ond": {"origin": origin_code, "destination": dest_code},
-                "start_date": snapped_start.isoformat(),
-                "end_date": snapped_end.isoformat(),
-                "policy_status": policy_input,
-            }
-
-            # ---------- First-time-only Apply behavior ----------
-            def _call_orchestrator(url: str, payload: dict, response_key: str):
-                with st.chat_message("assistant"):
-                    ph = st.empty()
-                    ph.markdown("**Great! Agent is planning your trip…**")
-                    with st.spinner("Processing…"):
-                        status, data = post(url, payload)
-                    raw_answer = data.get(response_key, "") if isinstance(data, dict) else str(data)
-                    ph.markdown(str(raw_answer))
-                sig = answer_sig(str(raw_answer), payload)
-                if st.session_state.last_answer_hash != sig:
-                    st.session_state.messages.append({"role": "assistant", "content": str(raw_answer)})
-                    st.session_state.last_answer_hash = sig
-
-            if st.session_state.mode == "Agentic AI":
-                if not st.session_state.boot_agentic:
-                    qtext = (
-                        "Provide me the best flights for the given route from AIR bot and also provide "
-                        "best/preferred hotels from HOTEL bot, and check traveller's past history from TDNA bot. "
-                        f"[Filters] Origin: {origin_code}, Destination: {dest_code}, "
-                        f"Start: {snapped_start.isoformat()}, End: {snapped_end.isoformat()}, Policy: {policy_input}"
-                    )
-                    payload = {
-                        "query": qtext,
-                        "session_id": st.session_state.session_id,
-                        "targets": ["air", "hotel", "tdna"],
-                        "extra": {
-                            "user_name": st.session_state.user_name.strip(),
-                            "user_email": st.session_state.user_email.strip(),
-                            "filters": st.session_state.filters,
-                            "ui_version": "new-ui-v1",
-                            "source": "filters_apply",
-                            "llm_hints": "Use conversation history; avoid repetition.",
-                        },
-                    }
-                    _call_orchestrator(ROUTE_URL, payload, response_key="answer")
-                    st.session_state.boot_agentic = True
-                else:
-                    st.info("Filters updated. They’ll be used for your next message.", icon="✅")
-
-            else:
-                if st.session_state.target == "hotel":
-                    if not st.session_state.boot_hotel:
-                        qtext = build_query_hotels_only(st.session_state.filters)
-                        payload = {
-                            "query": qtext,
-                            "session_id": st.session_state.session_id,
-                            "target": "hotel",
-                            "extra": {
-                                "user_name": st.session_state.user_name.strip(),
-                                "user_email": st.session_state.user_email.strip(),
-                                "filters": st.session_state.filters,
-                                "ui_version": "new-ui-v1",
-                                "source": "filters_apply",
-                            },
-                        }
-                        _call_orchestrator(ROUTE_URL, payload, response_key="answer")
-                        st.session_state.boot_hotel = True
-                    else:
-                        st.info("Filters updated. They’ll be used for your next message.", icon="✅")
-
-                elif st.session_state.target == "air":
-                    if not st.session_state.boot_air:
-                        qtext = build_query_flights_only(st.session_state.filters)
-                        payload = {
-                            "query": qtext,
-                            "session_id": st.session_state.session_id,
-                            "target": "air",
-                            "extra": {
-                                "user_name": st.session_state.user_name.strip(),
-                                "user_email": st.session_state.user_email.strip(),
-                                "filters": st.session_state.filters,
-                                "ui_version": "new-ui-v1",
-                                "source": "filters_apply",
-                            },
-                        }
-                        _call_orchestrator(ROUTE_URL, payload, response_key="answer")
-                        st.session_state.boot_air = True
-                    else:
-                        st.info("Filters updated. They’ll be used for your next message.", icon="✅")
-
-                else:
-                    st.info("TDNA does not use filters. Please type directly in chat.", icon="ℹ️")
-
-        if clear:
-            st.session_state.filters = {
-                "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
-                "start_date": START_WHITELIST[0].isoformat(),
-                "end_date": END_WHITELIST[-1].isoformat(),
-                "policy_status": "In policy",
-            }
-            st.info("Filters cleared.")
-
-        st.caption("Active filters → " + compose_filters_caption(st.session_state.filters))
-else:
-    st.info("Filters are not available when using TDNA directly. Switch to Agentic AI or a different tool to apply filters.")
-
-# ================== Chat transcript (oldest → newest) ==================
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
-
-# ================== Chat input ==================
-prompt = st.chat_input("Type a message and press Enter…")
-if prompt:
-    # show user message now
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    # build extra (include filters always; TDNA may ignore)
-    extra = {
-        "user_name": st.session_state.user_name.strip(),
-        "user_email": st.session_state.user_email.strip(),
-        "filters": {
-            "ond": {
-                "origin": st.session_state.filters["ond"]["origin"],
-                "destination": st.session_state.filters["ond"]["destination"],
-            },
-            "start_date": st.session_state.filters["start_date"],
-            "end_date": st.session_state.filters["end_date"],
-            "policy_status": st.session_state.filters["policy_status"],
-        },
-        "ui_version": "new-ui-v1"
-    }
-
+def extract_json(text: str) -> Any:
+    if isinstance(text, dict):
+        return text
+    if not isinstance(text, str):
+        return text
     try:
-        if st.session_state.mode == "Agentic AI":
-            payload = {
-                "query": prompt.strip(),
-                "session_id": st.session_state.session_id,  # keep stable across turns!
-                "autonomy": st.session_state.autonomy,
-                "max_iters": st.session_state.max_iters,
-                "extra": extra,
-            }
-            with st.chat_message("assistant"):
-                with st.spinner("Processing…"):
-                    status, data = post(AGENT_URL, payload)
-                final_answer = data.get("final_answer", "") if isinstance(data, dict) else str(data)
-                st.markdown(final_answer)
+        return json.loads(text)
+    except Exception:
+        m = _JSON_BLOCK.search(text)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
+    raise ValueError("Could not parse JSON from LLM output")
 
-        else:
-            target = st.session_state.target
-            payload = {
-                "query": prompt.strip(),
-                "target": target,
-                "session_id": st.session_state.session_id,  # no tool suffix → preserves context
-                "extra": extra,
-            }
-            with st.chat_message("assistant"):
-                with st.spinner("Processing…"):
-                    status, data = post(ROUTE_URL, payload)
-                final_answer = data.get("answer", "") if isinstance(data, dict) else str(data)
-                st.markdown(final_answer)
+# ---- LLM wrappers ----
 
-        sig = answer_sig(final_answer, payload)
-        if st.session_state.last_answer_hash != sig:
-            st.session_state.messages.append({"role": "assistant", "content": final_answer})
-            st.session_state.last_answer_hash = sig
+def claude_json(system: str, user_obj: dict, max_tokens=256, temperature=0) -> dict:
+    payload = _invoke_bedrock({
+        "anthropic_version": ANTHROPIC_VERSION,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "system": system,
+        "messages": [{"role":"user","content":[{"type":"text","text": json.dumps(user_obj)}]}],
+    })
+    return extract_json(payload["content"][0]["text"])  # may raise
 
-    except Exception as e:
-        err = f"Request error: {e}"
-        with st.chat_message("assistant"):
-            st.error(err)
-        st.session_state.messages.append({"role": "assistant", "content": err})
 
-# footer
-st.markdown("---")
-st.caption("Conversational Orchestrator UI — history persists per user until you switch users or start a new chat.")
+def claude_text(system: str, user_obj: dict, max_tokens=512, temperature=0) -> str:
+    payload = _invoke_bedrock({
+        "anthropic_version": ANTHROPIC_VERSION,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "system": system,
+        "messages": [{"role":"user","content":[{"type":"text","text": json.dumps(user_obj)}]}],
+    })
+    return payload["content"][0]["text"].strip()
+
+# ==================== MCP HTTP client (JSON-RPC over HTTP, JSON response) ====================
+class MCPHTTPClient:
+    def __init__(self, base_url: str, timeout: float = 30.0, headers: Optional[Dict[str, str]] = None):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self._id = 0
+        self.headers = {
+            "content-type": "application/json",
+            "accept": "application/json",
+            "cache-control": "no-cache",
+            "connection": "keep-alive",
+        }
+        if headers:
+            merged = {**self.headers, **headers}
+            merged["accept"] = "application/json"
+            self.headers = merged
+
+    def _next_id(self) -> str:
+        self._id += 1
+        return str(self._id)
+
+    async def _rpc(self, method: str, params: Dict[str, Any]) -> Any:
+        payload = {"jsonrpc": "2.0", "id": self._next_id(), "method": method, "params": params}
+        # basic retry with jitter
+        last_ex = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    r = await client.post(self.base_url, json=payload, headers=self.headers)
+                    r.raise_for_status()
+                    data = r.json()
+                if "error" in data:
+                    raise RuntimeError(f"RPC error: {data['error']}")
+                return data.get("result")
+            except Exception as e:
+                last_ex = e
+                await asyncio.sleep(0.2 * (2 ** attempt) + random.random() * 0.1)
+        raise last_ex
+
+    async def tools_list(self) -> Dict[str, Any]:
+        return await self._rpc("tools/list", {})
+
+    async def tools_call(self, name: str, arguments: Dict[str, Any]) -> Any:
+        return await self._rpc("tools/call", {"name": name, "arguments": arguments})
+
+MCP_CLIENTS: Dict[str, MCPHTTPClient] = {svc: MCPHTTPClient(info["url"]) for svc, info in SERVICES.items()}
+
+# discovered tool metadata per service (filled lazily)
+TOOL_CAPS: Dict[str, Dict[str, Any]] = defaultdict(dict)
+
+# ==================== Memory & Cache ====================
+MEMORY: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"history": deque(maxlen=50), "created": time()})
+
+def mem_append(sid: str, role: str, content: Any):
+    MEMORY[sid]["history"].append({"role": role, "content": content, "ts": time()})
+
+
+def mem_get(sid: str, k: int = 12) -> List[Dict[str, Any]]:
+    hist = list(MEMORY[sid]["history"]) 
+    return hist[-k:] if k else hist
+
+
+def mem_clear(sid: str):
+    MEMORY.pop(sid, None)
+
+
+def compress_history_if_needed(sid: str, keep: int = 16):
+    hist = MEMORY[sid]["history"]
+    if len(hist) <= keep:
+        return
+    recent = list(hist)[-keep:]
+    summary = claude_text(
+        "Summarize earlier chat for future context (routes, dates, constraints, user prefs). 6 lines max.",
+        {"history": list(hist)[:-keep]}
+    )
+    MEMORY[sid]["history"] = deque([{"role":"system","content":{"summary": summary},"ts": time()}] + recent, maxlen=50)
+
+CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "300"))
+_CACHE: Dict[str, Tuple[float, Any]] = {}
+
+def _h(obj: Any) -> str:
+    try:
+        s = json.dumps(obj, sort_keys=True, default=str)
+    except Exception:
+        s = str(obj)
+    return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+
+def cache_get(k: str):
+    rec = _CACHE.get(k)
+    if not rec:
+        return None
+    exp, val = rec
+    if exp < time():
+        _CACHE.pop(k, None)
+        return None
+    return val
+
+
+def cache_set(k: str, v: Any, ttl: int = CACHE_TTL_SEC):
+    _CACHE[k] = (time() + ttl, v)
+
+# ==================== Answer sanitization & helpers ====================
+_GREET = re.compile(r"(?mi)^\s*(?:hello|hi|hey|greetings)\b[\s\S]*?(?:\n|$)")
+_TOOL_PREFIX = re.compile(r"(?mi)^(?:air|hotel|tdna)\s*:\s*")
+
+
+def sanitize_answer(text: Any) -> str:
+    s = text if isinstance(text, str) else str(text)
+    s = _TOOL_PREFIX.sub("", s)
+    for _ in range(2):
+        s2 = _GREET.sub("", s)
+        if s2 == s:
+            break
+        s = s2
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s
+
+
+def sanitize_map(m: Dict[str, Any]) -> Dict[str, str]:
+    return {k: sanitize_answer(v) for k, v in m.items()}
+
+# ==================== Prompts ====================
+CONTEXTUALIZER_SYSTEM = (
+    "Rewrite the latest user message into a standalone, explicit query for downstream tools. "
+    "Use chat_history ONLY to resolve references (dates, airports, hotels, constraints, policies). "
+    "If sticky_filters exist, incorporate them. Do NOT answer; return only the rewritten query text."
+)
+
+ROUTER_SYSTEM = (
+    "You are a strict router for a multi-tool system. Tools: air, hotel, tdna. "
+    "Given a query and (optionally) recent history, decide which tools to call. "
+    "Return ONLY JSON like {\"targets\":[\"air\"|\"hotel\"|\"tdna\", ...]} with unique items."
+)
+
+PLANNER_SYSTEM = (
+    "Plan a minimal DAG of tool calls to satisfy the user. Tools: air, hotel, tdna. "
+    "Use steps: [{target, input, after?}] where 'after' is a list of prior step indexes this step depends on. "
+    "Prefer low latency and high reliability; avoid redundant calls. No greetings. "
+    "Return ONLY JSON: {\"steps\":[{...}], \"finish\": false, \"final_answer\": ""}"
+)
+
+FINISHER_SYSTEM = (
+    "If observations + memory satisfy the goal, return {\"finish\": true, \"final_answer\": "..."} "
+    "Else return {\"finish\": false}. Keep it JSON only."
+)
+
+COMPOSER_SYSTEM = (
+    "You are a response composer. Combine multiple tool answers (air/hotel/tdna) into ONE coherent, concise reply. "
+    "Synthesize and prioritize; resolve conflicts; respect filters and prior choices. "
+    "If answer_schema is provided, output STRICT JSON following it (no prose). Otherwise produce clean prose. "
+    "No greetings or tool prefixes."
+)
+
+CRITIC_SYSTEM = (
+    "You are a strict reviewer. Check final_answer against user_query and observations for relevance, contradictions, "
+    "missing steps, or unsafe promises. If okay, return {\"ok\": true}. If revision needed, return {\"ok\": false, \"revise\": ""} with a fixed answer."
+)
+
+# ==================== Rewriter ====================
+
+def rewrite_with_history(sid: str, user_query: str, extra: Optional[dict] = None) -> str:
+    history = mem_get(sid, 10)
+    hist_min = [
+        {"role": h["role"], "content": h["content"] if isinstance(h["content"], str) else str(h["content"])}
+        for h in history
+    ]
+    payload = {
+        "latest_user_query": user_query,
+        "chat_history": hist_min,
+        "sticky_filters": (extra or {}).get("filters", {}),
+    }
+    try:
+        txt = claude_text(CONTEXTUALIZER_SYSTEM, payload, max_tokens=180, temperature=0)
+        return txt.strip().strip('"')
+    except Exception:
+        return user_query
+
+# ==================== Routing & composition ====================
+
+def llm_decide_targets(query: str, sid: Optional[str] = None) -> List[str]:
+    try:
+        payload = {"query": query}
+        if sid:
+            payload["history"] = mem_get(sid, 6)
+        out = claude_json(ROUTER_SYSTEM, payload, max_tokens=128)
+        picks = [t for t in out.get("targets", []) if t in SERVICES]
+        return list(dict.fromkeys(picks)) or ["hotel"]
+    except Exception:
+        return ["hotel"]
+
+
+def compose_final(user_query: str, answers_by_target: Dict[str, Any], answer_schema: Optional[dict] = None) -> str:
+    if not answers_by_target:
+        return ""
+    cleaned = sanitize_map(answers_by_target)
+    ckey = f"compose:{_h({'q':user_query,'a':cleaned,'schema':answer_schema})}"
+    hit = cache_get(ckey)
+    if hit is not None:
+        return hit
+    try:
+        txt = claude_text(
+            COMPOSER_SYSTEM,
+            {"user_query": user_query, "answers_by_target": cleaned, "answer_schema": answer_schema},
+            max_tokens=900
+        )
+        final_txt = sanitize_answer(txt)
+        cache_set(ckey, final_txt)
+        return final_txt
+    except Exception:
+        parts = [f"{k}: {v}" for k, v in cleaned.items()]
+        final_txt = sanitize_answer(" | ".join(map(str, parts)))
+        cache_set(ckey, final_txt)
+        return final_txt
+
+# ==================== Build tool call arguments ====================
+
+def _build_tool_arguments(target: str, query: str, extra: Optional[Dict[str, Any]], sid: str, field_name: str) -> Dict[str, Any]:
+    args: Dict[str, Any] = {field_name: query}
+    args["context"] = {"session_id": sid, "target": target}
+    if isinstance(extra, dict) and extra:
+        if PASS_EXTRA_MODE in ("nested", "both"):
+            args["extra"] = extra
+        if PASS_EXTRA_MODE in ("flat", "both"):
+            for k, v in extra.items():
+                if k not in (field_name, "context", "extra"):
+                    args[k] = v
+    return args
+
+# ==================== Tool metadata introspection ====================
+async def ensure_tool_caps(target: str):
+    if TOOL_CAPS.get(target):
+        return
+    client = MCP_CLIENTS[target]
+    try:
+        info = await client.tools_list()
+    except Exception:
+        info = {"tools": []}
+    TOOL_CAPS[target] = {"tools": info.get("tools", []), "hints": PLANNING_HINTS.get(target, {})}
+
+# ==================== Downstream MCP calls ====================
+async def call_backend(target: str, query: str, extra: Optional[Dict[str, Any]], sid: str):
+    await ensure_tool_caps(target)
+    svc = SERVICES[target]
+    client = MCP_CLIENTS[target]
+    args = _build_tool_arguments(target=target, query=query, extra=extra, sid=sid, field_name=svc["field"])
+
+    ckey = f"bot:{target}:{_h({'q':query,'x':extra,'sid':sid,'mode':PASS_EXTRA_MODE})}"
+    hit = cache_get(ckey)
+    if hit is not None:
+        return hit
+
+    # retry for tool call
+    last_ex = None
+    for attempt in range(3):
+        try:
+            result = await client.tools_call(name=svc["tool"], arguments=args)
+            if isinstance(result, dict):
+                val = result.get("answer") or result.get("result") or result.get("output") or result.get("content") or result
+            else:
+                val = result
+            cache_set(ckey, val)
+            return val
+        except Exception as e:
+            last_ex = e
+            await asyncio.sleep(0.25 * (2 ** attempt) + random.random() * 0.2)
+    return f"{type(last_ex).__name__}: {last_ex}"
+
+# ==================== Models ====================
+class Step(BaseModel):
+    target: str = Field(..., description="one of: air, hotel, tdna")
+    input: str
+    after: Optional[List[int]] = None  # indices of dependent steps
+
+class Plan(BaseModel):
+    steps: List[Step] = Field(default_factory=list)
+    finish: bool = False
+    final_answer: str = ""
+
+class FinishDecision(BaseModel):
+    finish: bool
+    final_answer: Optional[str] = None
+
+# ==================== Execution helpers ====================
+
+def topo_batches(steps: List[Step]) -> List[List[int]]:
+    # Kahn-style batching by dependencies
+    deps: Dict[int, Set[int]] = {i: set(s.after or []) for i, s in enumerate(steps)}
+    remaining: Set[int] = set(range(len(steps)))
+    batches: List[List[int]] = []
+    while remaining:
+        ready = [i for i in sorted(remaining) if not deps[i]]
+        if not ready:
+            # cycle fallback: execute smallest index
+            i = min(remaining)
+            ready = [i]
+        batches.append(ready)
+        for i in ready:
+            remaining.remove(i)
+        for j in remaining:
+            deps[j] -= set(ready)
+    return batches
+
+async def execute_steps(steps: List[Step], q: str, extra_aug: dict, sid: str, parallel_cap: int) -> List[Dict[str, Any]]:
+    """Execute DAG steps in batches. Returns list of observations (ordered by execution)."""
+    observations: List[Dict[str, Any]] = []
+    batches = topo_batches(steps)
+    for batch_idxs in batches:
+        if not batch_idxs:
+            continue
+        # obey parallel cap
+        slice_idxs = [batch_idxs[i:i+parallel_cap] for i in range(0, len(batch_idxs), parallel_cap)]
+        for idxs in slice_idxs:
+            coros = []
+            idx_map = []
+            for i in idxs:
+                s = steps[i]
+                if s.target not in SERVICES:
+                    observations.append({"step_index": i, "step": s.dict(), "error": f"Unknown target {s.target}"})
+                    continue
+                idx_map.append(i)
+                coros.append(call_backend(s.target, s.input or q, extra_aug, sid))
+            outs = await asyncio.gather(*coros, return_exceptions=True)
+            for i, out in zip(idx_map, outs):
+                s = steps[i]
+                if isinstance(out, Exception):
+                    observations.append({"step_index": i, "step": s.dict(), "error": f"{type(out).__name__}: {out}"})
+                else:
+                    observations.append({"step_index": i, "step": s.dict(), "result": out})
+    return observations
+
+# ==================== Scoring & Selection ====================
+
+def score_observations(user_query: str, observations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Ask LLM to score each observation's relevance; returns per-target best pick."""
+    try:
+        scored = claude_json(
+            "Score each observation 0-1 for relevance to the user_query; group by target and pick best per target. Return JSON {best:{target: {index:int, score:float}}}",
+            {"user_query": user_query, "observations": observations}, max_tokens=220
+        )
+    except Exception:
+        # trivial fallback: first success per target
+        best: Dict[str, Dict[str, Any]] = {}
+        for ob in observations:
+            tgt = ob.get("step", {}).get("target")
+            if tgt and "result" in ob and tgt not in best:
+                best[tgt] = {"index": ob.get("step_index", 0), "score": 0.6}
+        scored = {"best": best}
+
+    # materialize best results map
+    latest: Dict[str, Any] = {}
+    for tgt, meta in (scored.get("best") or {}).items():
+        idx = meta.get("index")
+        if isinstance(idx, int) and 0 <= idx < len(observations):
+            ob = observations[idx]
+            if "result" in ob:
+                latest[tgt] = ob["result"]
+    if not latest:  # last-resort sweep
+        for ob in reversed(observations):
+            tgt = ob.get("step", {}).get("target")
+            if tgt and "result" in ob and tgt not in latest:
+                latest[tgt] = ob["result"]
+    return latest
+
+# ==================== FastAPI ====================
+app = FastAPI(title="Agentic Orchestrator (MCP over HTTP JSON)")
+
+# ----- Schemas -----
+class RouteIn(BaseModel):
+    query: str
+    extra: Optional[Dict[str, Any]] = None
+    target: Optional[str] = None
+    targets: Optional[List[str]] = None
+    session_id: str = "default"
+
+class RouteOut(BaseModel):
+    tool: str = "route_query_tool"
+    targets: List[str]
+    routed_by: str
+    answer: Any
+    answers_by_target: Optional[Dict[str, Any]] = None
+    errors: Optional[Dict[str, str]] = None
+
+class AgentIn(BaseModel):
+    query: str
+    extra: Optional[Dict[str, Any]] = None
+    session_id: str = "default"
+    max_iters: int = 3
+    parallel_cap: int = 2
+    autonomy: bool = True
+    answer_schema: Optional[Dict[str, Any]] = None  # if provided, composer returns strict JSON
+
+class AgentOut(BaseModel):
+    tool: str = "agent_query_tool"
+    session_id: str
+    iterations: int
+    final_answer: Any
+    observations: List[Dict[str, Any]]
+    autonomy: bool
+    trace_id: str
+
+# ==================== Route Endpoint ====================
+@app.post("/route_query", operation_id="route_query_tool", response_model=RouteOut)
+async def route_query(inp: RouteIn = Body(...)):
+    q_orig, extra, sid = inp.query, inp.extra, inp.session_id
+    mem_append(sid, "user", q_orig)
+    compress_history_if_needed(sid)
+
+    # Rewrite with history + sticky filters
+    q = rewrite_with_history(sid, q_orig, extra)
+
+    # include a small conversation window for tools
+    extra_aug = dict(extra or {})
+    extra_aug["conversation_window"] = mem_get(sid, 6)
+
+    # Target selection
+    if inp.targets:
+        targets, routed_by = [t for t in inp.targets if t in SERVICES], "hint:list"
+    elif inp.target in SERVICES:
+        targets, routed_by = [inp.target], "hint:single"
+    elif inp.target == "both":
+        targets, routed_by = ["hotel", "air"], "hint:both"
+    else:
+        targets, routed_by = llm_decide_targets(q, sid), "llm+history"
+
+    results: Dict[str, Any] = {}
+    errors: Dict[str, str] = {}
+
+    if len(targets) <= 1:
+        tgt = targets[0] if targets else "hotel"
+        out = await call_backend(tgt, q, extra_aug, sid)
+        results[tgt] = out
+    else:
+        coros = [call_backend(t, q, extra_aug, sid) for t in targets]
+        outs = await asyncio.gather(*coros, return_exceptions=True)
+        for t, out in zip(targets, outs):
+            if isinstance(out, Exception):
+                errors[t] = f"{type(out).__name__}: {out}"
+            else:
+                results[t] = out
+
+    # Compose or return single
+    if len(results) > 1:
+        answer = compose_final(q, results, answer_schema=None)
+        answers_by_target = sanitize_map(results)
+    else:
+        answer = sanitize_answer(next(iter(results.values()), ""))
+        answers_by_target = None
+
+    mem_append(sid, "assistant", answer)
+
+    return RouteOut(
+        targets=targets, routed_by=routed_by, answer=answer,
+        answers_by_target=answers_by_target or None,
+        errors=(errors or None)
+    )
+
+# ==================== Agent Endpoint ====================
+@app.post("/agent_query", operation_id="agent_query_tool", response_model=AgentOut)
+async def agent_query(inp: AgentIn = Body(...)):
+    q_raw, extra, sid = inp.query, inp.extra, inp.session_id
+    trace_id = _h({"sid": sid, "t": time(), "nonce": random.random()})
+
+    mem_append(sid, "user", q_raw)
+    compress_history_if_needed(sid)
+
+    # Rewrite vague follow-ups with history + sticky filters
+    q = rewrite_with_history(sid, q_raw, extra)
+
+    extra_aug = dict(extra or {})
+    extra_aug["conversation_window"] = mem_get(sid, 6)
+
+    observations: List[Dict[str, Any]] = []
+    final_answer: Optional[str] = None
+
+    # ---- Planning loop ----
+    for _iter in range(max(1, min(inp.max_iters, 6))):
+        # Ask the planner for a DAG of minimal steps
+        try:
+            plan_raw = claude_json(
+                PLANNER_SYSTEM,
+                {"user_query": q, "memory": mem_get(sid, 6), "observations": observations[-4:], "tool_caps": TOOL_CAPS, "hints": PLANNING_HINTS},
+                max_tokens=300
+            )
+            plan = Plan(**plan_raw)
+        except Exception:
+            # fallback to router if planner fails
+            targets = llm_decide_targets(q, sid)
+            plan = Plan(steps=[Step(target=targets[0] if targets else "hotel", input=q)])
+
+        if plan.finish and plan.final_answer:
+            final_answer = plan.final_answer
+            break
+
+        # Execute plan DAG
+        batch_obs = await execute_steps(plan.steps, q, extra_aug, sid, inp.parallel_cap)
+        observations.extend(batch_obs)
+
+        if not inp.autonomy:
+            latest = score_observations(q, observations)
+            final_answer = compose_final(q, latest, inp.answer_schema) if latest else "No result."
+            break
+
+        # Decide whether we can finish after this wave
+        try:
+            fin_raw = claude_json(
+                FINISHER_SYSTEM,
+                {"user_query": q, "memory": mem_get(sid, 6), "observations": batch_obs}, max_tokens=180
+            )
+            fin = FinishDecision(**fin_raw)
+        except Exception:
+            fin = FinishDecision(finish=False)
+        if fin.finish:
+            final_answer = fin.final_answer or ""
+            break
+
+    # If still no final answer, compose from best observed results
+    if final_answer is None:
+        latest = score_observations(q, observations)
+        final_answer = compose_final(q, latest, inp.answer_schema) if latest else "No result."
+
+    # Critic pass (single attempt) for safety/consistency
+    try:
+        critic = claude_json(CRITIC_SYSTEM, {"user_query": q, "final_answer": final_answer, "observations": observations[-6:]}, max_tokens=220)
+        if not critic.get("ok") and critic.get("revise"):
+            final_answer = critic.get("revise")
+    except Exception:
+        pass
+
+    final_answer = sanitize_answer(final_answer)
+    mem_append(sid, "assistant", final_answer)
+
+    return AgentOut(
+        session_id=sid,
+        iterations=len([ob for ob in observations if "result" in ob or "error" in ob]),
+        final_answer=final_answer,
+        observations=observations[-8:],
+        autonomy=inp.autonomy,
+        trace_id=trace_id,
+    )
+
+# ---------------- Optional memory utils ----------------
+@app.post("/memory/clear")
+def memory_clear(payload: Dict[str, Any] = Body(...)):
+    sid = payload.get("session_id","default")
+    mem_clear(sid)
+    return JSONResponse({"ok": True, "session_id": sid})
+
+@app.get("/memory/show")
+def memory_show(session_id: str = "default"):
+    return JSONResponse({"session_id": session_id, "history": mem_get(session_id, 0)})
+
+# Expose orchestrator itself as an MCP server at /mcp (optional)
+mcp_server = FastApiMCP(app, name="orchestrator-mcp-agentic")
+mcp_server.mount()
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=ORCH_PORT)
