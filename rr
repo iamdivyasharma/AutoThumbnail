@@ -15,6 +15,8 @@ Key upgrades vs your original file:
 - NEW: Cross-tool consistency validator: if multi-bot answers are misaligned with filters or contradict each other,
        return a single fallback (“database does not have a consistent answer for this request”).
 - NEW: Removed implicit "hotel" fallbacks in routing/planning; added route heuristic (origin/destination ⇒ air+hotel).
+- NEW: Tool-lock (“allowed_targets”) — lets a message restrict which tools the agent may use,
+       detected from natural language (“air only”, “no hotel”) or passed via extra.allowed_targets.
 
 Endpoints remain:
 - POST /route_query (same signature; internal improvements only)
@@ -250,6 +252,7 @@ PLANNER_SYSTEM = (
     "Plan a minimal DAG of tool calls to satisfy the user. Tools: air, hotel, tdna. "
     "If filters include an origin and destination (route), include at least one 'air' step. "
     "If lodging or dates imply a stay, include at least one 'hotel' step. "
+    "Use ONLY tools listed in allowed_targets when provided; never call others. "
     "Use steps: [{target, input, after?}] where 'after' is a list of prior step indexes this step depends on. "
     "Prefer low latency and high reliability; avoid redundant calls. No greetings. "
     "Return ONLY JSON: {\"steps\":[{...}], \"finish\": false, \"final_answer\": \"\"}"
@@ -308,16 +311,55 @@ def rewrite_with_history(sid: str, user_query: str, extra: Optional[dict] = None
         return user_query
 
 # ==================== Routing helpers ====================
-def heuristic_targets_from_filters(extra: Optional[dict]) -> List[str]:
-    """If filters contain a valid O/D route, default to air+hotel."""
+def heuristic_targets_from_filters(extra: Optional[dict], allowed: Optional[List[str]] = None) -> List[str]:
+    """If filters contain a valid O/D route, default to air+hotel (intersect with allowed if present)."""
     try:
         fil = (extra or {}).get("filters", {}) or {}
         ond = fil.get("ond") or {}
         o, d = ond.get("origin"), ond.get("destination")
         if o and d and o != d:
-            return ["air", "hotel"]
+            default = ["air", "hotel"]
+            if allowed:
+                return [t for t in default if t in allowed]
+            return default
     except Exception:
         pass
+    return []
+
+# Natural-language & explicit tool-lock
+_TOOL_LOCK_REGEX = {
+    "air": r"(?:air|flight|flights|airline)",
+    "hotel": r"(?:hotel|hotels|stay|accommodation)",
+    "tdna": r"(?:tdna|history|traveller|traveler|profile)",
+}
+
+def get_allowed_targets(user_query: str, extra: Optional[dict]) -> List[str]:
+    """Detect 'only X' / 'X only' or explicit extra.allowed_targets; also supports negatives like 'no hotel'."""
+    allowed: set[str] = set()
+    blocked: set[str] = set()
+    q = (user_query or "").lower()
+
+    # natural-language 'only' locks
+    for t, pat in _TOOL_LOCK_REGEX.items():
+        if re.search(rf"\bonly\s+{pat}\b", q) or re.search(rf"\b{pat}\s+only\b", q):
+            allowed.add(t)
+
+    # explicit allowed from extra
+    if isinstance(extra, dict):
+        xs = (extra.get("allowed_targets") or extra.get("targets") or []) or []
+        allowed |= {t for t in xs if t in SERVICES}
+        if isinstance(extra.get("target"), str) and extra["target"] in SERVICES:
+            allowed.add(extra["target"])
+
+    # negatives
+    for t, pat in _TOOL_LOCK_REGEX.items():
+        if re.search(rf"\b(?:no|avoid|don't use)\s+{pat}\b", q):
+            blocked.add(t)
+
+    if allowed:
+        return list(allowed)
+    if blocked:
+        return [t for t in SERVICES if t not in blocked]
     return []
 
 # ==================== Routing & composition ====================
@@ -569,17 +611,25 @@ async def route_query(inp: RouteIn = Body(...)):
     extra_aug = dict(extra or {})
     extra_aug["conversation_window"] = mem_get(sid, 6)
 
-    # Target selection
+    # === Tool-lock detection ===
+    allowed = get_allowed_targets(q, extra_aug)  # [] means no lock
+
+    # Target selection (respect 'allowed' at every branch)
     if inp.targets:
-        targets, routed_by = [t for t in inp.targets if t in SERVICES], "hint:list"
+        base = [t for t in inp.targets if t in SERVICES]
+        targets, routed_by = ( [t for t in base if (not allowed or t in allowed)], "hint:list" )
     elif inp.target in SERVICES:
-        targets, routed_by = [inp.target], "hint:single"
+        base = [inp.target]
+        targets, routed_by = ( [t for t in base if (not allowed or t in allowed)], "hint:single" )
     elif inp.target == "both":
-        targets, routed_by = ["hotel", "air"], "hint:both"
+        base = ["hotel", "air"]
+        targets, routed_by = ( [t for t in base if (not allowed or t in allowed)], "hint:both" )
     else:
         targets, routed_by = llm_decide_targets(q, sid), "llm+history"
+        if allowed:
+            targets = [t for t in targets if t in allowed]
         if not targets:
-            ht = heuristic_targets_from_filters(extra_aug)
+            ht = heuristic_targets_from_filters(extra_aug, allowed)
             if ht:
                 targets, routed_by = ht, "heuristic:ond_present"
 
@@ -649,6 +699,9 @@ async def agent_query(inp: AgentIn = Body(...)):
     extra_aug = dict(extra or {})
     extra_aug["conversation_window"] = mem_get(sid, 6)
 
+    # === Tool-lock detection for agent ===
+    allowed = get_allowed_targets(q, extra_aug)  # [] means no lock
+
     observations: List[Dict[str, Any]] = []
     final_answer: Optional[str] = None
 
@@ -658,15 +711,28 @@ async def agent_query(inp: AgentIn = Body(...)):
         try:
             plan_raw = claude_json(
                 PLANNER_SYSTEM,
-                {"user_query": q, "memory": mem_get(sid, 6), "observations": observations[-4:], "tool_caps": TOOL_CAPS, "hints": PLANNING_HINTS, "filters": (extra_aug or {}).get("filters", {})},
+                {
+                    "user_query": q,
+                    "memory": mem_get(sid, 6),
+                    "observations": observations[-4:],
+                    "tool_caps": TOOL_CAPS,
+                    "hints": PLANNING_HINTS,
+                    "filters": (extra_aug or {}).get("filters", {}),
+                    "allowed_targets": allowed,
+                },
                 max_tokens=300
             )
             plan = Plan(**plan_raw)
+            # Enforce allow-list
+            if allowed:
+                plan.steps = [s for s in plan.steps if s.target in allowed]
         except Exception:
-            # fallback to router + heuristic if planner fails
+            # fallback to router + heuristic if planner fails (respect allow-list)
             targets = llm_decide_targets(q, sid)
+            if allowed:
+                targets = [t for t in targets if t in allowed]
             if not targets:
-                targets = heuristic_targets_from_filters(extra_aug)
+                targets = heuristic_targets_from_filters(extra_aug, allowed)
             if targets:
                 plan = Plan(steps=[Step(target=t, input=q) for t in targets])
             else:
