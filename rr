@@ -1,103 +1,495 @@
-# pip install -U langchain langchain-aws langchain-community langchain-text-splitters chromadb boto3
+# filtered_new_ui.py
+import json
+import uuid
+import hashlib
+import requests
+import streamlit as st
+from pathlib import Path
+from datetime import date
 
-import os
-import boto3
-from typing import Optional
+# ================== Orchestrator endpoints ==================
+ORCH_BASE = "http://localhost:9000"  # change if deployed
+ROUTE_URL = f"{ORCH_BASE}/route_query"
+AGENT_URL = f"{ORCH_BASE}/agent_query"
+MEM_CLEAR = f"{ORCH_BASE}/memory/clear"
+TIMEOUT   = 30
 
-# --- LangChain imports ---
-from langchain_aws import ChatBedrock, BedrockEmbeddings           # or use legacy BedrockChat if you must
-from langchain_community.document_loaders import TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain.memory import ConversationBufferMemory
-from langchain.prompts import PromptTemplate
-from langchain.chains import ConversationalRetrievalChain, LLMChain
-from langchain.chains.question_answering import load_qa_chain
+# ================== Example users ==================
+USERS = [
+    {"name": "Alice Singh",  "email": "alice@example.com"},
+    {"name": "Bob Kumar",    "email": "bob@example.com"},
+    {"name": "Charlie Rao",  "email": "charlie@example.com"},
+]
 
-# ---------- LLM + Embeddings (Bedrock Claude Haiku + Titan Embeddings) ----------
-bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+# ================== Airports: options + labels ==================
+AIRPORT_LABELS = {
+    "DEL": "Delhi — Indira Gandhi Intl",
+    "BOM": "Mumbai — Chhatrapati Shivaji Maharaj Intl",
+    "BLR": "Bengaluru — Kempegowda Intl",
+    "MAA": "Chennai — Chennai Intl",
+    "HYD": "Hyderabad — Rajiv Gandhi Intl",
+    "CCU": "Kolkata — Netaji Subhas Chandra Bose Intl",
+    "PNQ": "Pune — Lohegaon",
+    "COK": "Kochi — Cochin Intl",
+    "GOI": "Goa — Dabolim",
+    "DXB": "Dubai — Dubai Intl",
+    "SIN": "Singapore — Changi",
+    "LHR": "London — Heathrow",
+    "JFK": "New York — John F. Kennedy Intl",
+    "SFO": "San Francisco — SFO",
+}
+ORIGIN_OPTIONS      = ["DEL","BLR","MAA","HYD","CCU","PNQ","COK","GOI","BOM","DXB","SIN","LHR","JFK","SFO"]
+DESTINATION_OPTIONS = ["BOM","DEL","BLR","CCU","MAA","HYD","COK","PNQ","GOI","DXB","SIN","LHR","JFK","SFO"]
 
-llm = ChatBedrock(
-    client=bedrock,
-    model_id="anthropic.claude-3-haiku-20240307-v1:0",
-    model_kwargs={"temperature": 0.1, "max_tokens": 1024},
+def label_for(code: str) -> str:
+    return f"{code} ({AIRPORT_LABELS.get(code, 'Unknown')})"
+
+# ================== Allowed dates (whitelists) ==================
+ALLOWED_START_DATES = ["2025-09-01", "2025-09-05", "2025-09-08", "2025-09-10", "2025-10-01"]
+ALLOWED_END_DATES   = ["2025-09-01", "2025-09-07", "2025-09-10", "2025-09-15", "2025-10-31", "2025-12-31"]
+
+def _iso_to_dates(xs):
+    return sorted(date.fromisoformat(x) if isinstance(x, str) else x for x in xs)
+
+START_WHITELIST = _iso_to_dates(ALLOWED_START_DATES)
+END_WHITELIST   = _iso_to_dates(ALLOWED_END_DATES)
+
+def _snap_to_allowed(chosen: date, allowed: list[date], *, direction="nearest", min_after: date | None = None) -> date:
+    if not allowed:
+        return chosen
+    xs = allowed
+    if min_after is not None:
+        xs = [d for d in xs if d >= min_after] or [allowed[-1]]
+    if direction == "up":
+        for d in xs:
+            if d >= chosen:
+                return d
+        return xs[-1]
+    if direction == "down":
+        for d in reversed(xs):
+            if d <= chosen:
+                return d
+        return xs[0]
+    return min(xs, key=lambda d: abs(d - chosen))
+
+# ================== Page config (Logo + Favicon) ==================
+LOGO_PATH    = Path("assets/logo.png")       # direct path to your logo
+FAVICON_PATH = Path("assets/favicon.png")    # direct path to your favicon
+
+st.set_page_config(
+    page_title="Orchestrator Chat",
+    page_icon=str(FAVICON_PATH) if FAVICON_PATH.exists() else "💬",
+    layout="centered",
 )
 
-embeddings = BedrockEmbeddings(
-    client=bedrock,
-    model_id="amazon.titan-embed-text-v1",
-)
+# Top-centered logo + title
+if LOGO_PATH.exists():
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        st.image(str(LOGO_PATH), use_container_width=False)
 
-# ---------- Build or load Chroma once ----------
-def _load_or_build_chroma(persist_dir: str = "./data") -> Chroma:
-    if os.path.exists(persist_dir) and os.listdir(persist_dir):
-        return Chroma(persist_directory=persist_dir, embedding_function=embeddings)
-    loader = TextLoader("details.txt", encoding="utf-8")
-    docs = loader.load()
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = splitter.split_documents(docs)
-    vdb = Chroma.from_documents(chunks, embedding=embeddings, persist_directory=persist_dir)
-    vdb.persist()
-    return vdb
+st.markdown("<h1 style='text-align:center'>💬 Orchestrator — Conversational Chat</h1>", unsafe_allow_html=True)
 
-_vectordb = _load_or_build_chroma("./data")
+# ================== Helpers ==================
+def post(url: str, payload: dict):
+    r = requests.post(url, json=payload, timeout=TIMEOUT)
+    if r.headers.get("content-type","").startswith("application/json"):
+        return r.status_code, r.json()
+    return r.status_code, r.text
 
-# ---------- Prompts ----------
-CONDENSE_TPL = """Given the following conversation and a follow up question, rephrase the follow up
-question to be a standalone question without changing its meaning.
+def answer_sig(text: str, payload: dict) -> str:
+    blob = json.dumps({"t": text, "p": payload}, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
-Chat History:
-{chat_history}
-Follow Up Input: {question}
-Standalone question:"""
-condense_question_prompt = PromptTemplate.from_template(CONDENSE_TPL)
+def ensure_state():
+    ss = st.session_state
+    if "messages" not in ss: ss.messages = []  # [{"role":"user"|"assistant","content":str}]
+    if "session_id" not in ss: ss.session_id = "user123"
+    if "mode" not in ss: ss.mode = "Agentic AI"
+    if "target" not in ss: ss.target = "air"
+    if "user_name" not in ss: ss.user_name = ""
+    if "user_email" not in ss: ss.user_email = ""
+    if "prev_picked" not in ss: ss.prev_picked = None           # track last preset user selection
+    if "prev_user_name" not in ss: ss.prev_user_name = ""
+    if "prev_user_email" not in ss: ss.prev_user_email = ""
+    if "autonomy" not in ss: ss.autonomy = True
+    if "max_iters" not in ss: ss.max_iters = 3
+    if "filters" not in ss:
+        ss.filters = {
+            "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
+            "start_date": START_WHITELIST[0].isoformat(),
+            "end_date": END_WHITELIST[-1].isoformat(),
+            "policy_status": "In policy",  # "In policy" | "Out of policy"
+        }
+    # first-Apply flags per mode/target
+    if "boot_agentic" not in ss: ss.boot_agentic = False
+    if "boot_air" not in ss: ss.boot_air = False
+    if "boot_hotel" not in ss: ss.boot_hotel = False
+    # duplicate guard
+    if "last_answer_hash" not in ss: ss.last_answer_hash = None
 
-ANSWER_TPL = """You are a helpful QA system. Answer ONLY using the information in the context below.
-If the answer isn't in the context, say you don't know.
+ensure_state()
 
-{context}
+# ============== Query builders (for first-time Apply only) ==============
+def build_query_combined(fil: dict) -> str:
+    return (
+        "Provide me the best flights for the given route from AIR bot and also provide "
+        "best/preferred hotels from HOTEL bot, and check traveller's past history from TDNA bot. "
+        f"[Filters] Origin: {fil['ond']['origin']}, Destination: {fil['ond']['destination']}, "
+        f"Start: {fil['start_date']}, End: {fil['end_date']}, Policy: {fil['policy_status']}"
+    )
 
-Question: {question}
-Helpful Answer:"""
-qa_prompt = PromptTemplate(template=ANSWER_TPL, input_variables=["context", "question"])
+def build_query_hotels_only(fil: dict) -> str:
+    return (
+        "Provide me the best/preferred hotels from HOTEL bot. "
+        f"[Filters] Origin: {fil['ond']['origin']}, Destination: {fil['ond']['destination']}, "
+        f"Start: {fil['start_date']}, End: {fil['end_date']}, Policy: {fil['policy_status']}"
+    )
 
-# ---------- User-scoped memory (single active user; clears on change) ----------
-_current_user: Optional[str] = None
-_memory: Optional[ConversationBufferMemory] = None
-_qa_chain: Optional[ConversationalRetrievalChain] = None
+def build_query_flights_only(fil: dict) -> str:
+    return (
+        "Provide me the best flights for the given route from AIR bot. "
+        f"[Filters] Origin: {fil['ond']['origin']}, Destination: {fil['ond']['destination']}, "
+        f"Start: {fil['start_date']}, End: {fil['end_date']}, Policy: {fil['policy_status']}"
+    )
 
-def _ensure_chain_for(user_name: str) -> ConversationalRetrievalChain:
-    """
-    Keep memory if same user; reset memory & rebuild chain when user changes.
-    """
-    global _current_user, _memory, _qa_chain
+# ================== Sidebar ==================
+with st.sidebar:
+    st.subheader("User")
+    user_labels = [f"{u['name']} <{u['email']}>" for u in USERS] + ["Other…"]
+    picked = st.selectbox("Choose a user", user_labels, index=(0 if st.session_state.prev_picked is None else user_labels.index(st.session_state.prev_picked) if st.session_state.prev_picked in user_labels else 0))
 
-    if _qa_chain is None or _current_user != user_name:
-        _current_user = user_name
-        _memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    # Defaults from preset or blanks for Other…
+    if picked != "Other…":
+        idx = user_labels.index(picked)
+        chosen = USERS[idx]
+        name_default = chosen["name"]
+        email_default = chosen["email"]
+    else:
+        name_default = st.session_state.prev_user_name or ""
+        email_default = st.session_state.prev_user_email or ""
 
-        question_generator = LLMChain(llm=llm, prompt=condense_question_prompt, memory=_memory)
-        doc_chain = load_qa_chain(llm, chain_type="stuff", prompt=qa_prompt)
+    name_val = st.text_input("Name", value=name_default, placeholder="e.g., Priya Sharma", key="user_name_input")
+    email_val = st.text_input("Email", value=email_default, placeholder="e.g., priya@company.com", key="user_email_input")
 
-        _qa_chain = ConversationalRetrievalChain(
-            retriever=_vectordb.as_retriever(search_kwargs={"k": 6}),
-            question_generator=question_generator,
-            combine_docs_chain=doc_chain,
-            memory=_memory,
+    # ---- Identity switching logic ----
+    def _switch_to_identity(name: str, email: str, reason: str):
+        # Use email as stable session id if present; else name; else random
+        new_sid = (email.strip() or name.strip() or f"user-{uuid.uuid4().hex[:8]}")
+        st.session_state.session_id = new_sid
+        st.session_state.messages = []
+        st.session_state.boot_agentic = False
+        st.session_state.boot_air = False
+        st.session_state.boot_hotel = False
+        st.session_state.user_name = name.strip()
+        st.session_state.user_email = email.strip()
+        st.session_state.prev_picked = picked
+        st.session_state.prev_user_name = name.strip()
+        st.session_state.prev_user_email = email.strip()
+        st.success(f"Switched user ({reason}). New session id: {new_sid}")
+
+    # Auto-switch for preset change
+    if st.session_state.prev_picked is None:
+        st.session_state.prev_picked = picked
+        st.session_state.user_name = name_default
+        st.session_state.user_email = email_default
+        if (email_default or name_default):
+            st.session_state.session_id = (email_default or name_default)
+    elif picked != st.session_state.prev_picked and picked != "Other…":
+        _switch_to_identity(name_default, email_default, reason="preset")
+
+    # Manual switch for 'Other…' (avoid resets on every keystroke)
+    if picked == "Other…":
+        if st.button("🔁 Switch User"):
+            _switch_to_identity(name_val, email_val, reason="manual (Other…)")
+
+    st.markdown("---")
+    st.subheader("Session")
+    # You can still override the session id if needed
+    new_session_id = st.text_input("Session ID", value=st.session_state.session_id, key="sid_input")
+    if new_session_id != st.session_state.session_id:
+        st.session_state.session_id = new_session_id
+        st.info("Session id changed. Context will follow this id.")
+
+    col_a, col_b = st.columns(2)
+    if col_a.button("🆕 New Chat"):
+        sid = f"{(st.session_state.user_email or st.session_state.user_name or 'user')}-{uuid.uuid4().hex[:8]}"
+        st.session_state.session_id = sid
+        st.session_state.messages = []
+        st.session_state.boot_agentic = False
+        st.session_state.boot_air = False
+        st.session_state.boot_hotel = False
+        st.success(f"New session id: {sid}")
+
+    if col_b.button("🧹 Clear Server Memory"):
+        try:
+            r = requests.post(MEM_CLEAR, json={"session_id": st.session_state.session_id}, timeout=TIMEOUT)
+            if r.status_code == 200:
+                st.success("Server memory cleared for this session id.")
+            else:
+                st.error(r.text)
+        except Exception as e:
+            st.error(f"Clear error: {e}")
+
+    st.markdown("---")
+    st.subheader("Mode")
+    st.session_state.mode = st.radio(
+        "How should the next message be handled?",
+        ["Agentic AI", "Direct tool"],
+        captions=["Let the orchestrator plan and compose", "Call a specific backend directly"]
+    )
+    if st.session_state.mode == "Direct tool":
+        st.session_state.target = st.segmented_control(
+            "Target", options=["air", "hotel", "tdna"], default="air"
         )
-    return _qa_chain
 
-# ---------- Your handler that receives a payload with user_name ----------
-def qasystem(payload: dict) -> str:
-    """
-    payload = {
-        "user_name": "alice",
-        "query": "your question here"
+    st.markdown("---")
+    st.subheader("Agent Settings")
+    st.session_state.autonomy = st.checkbox("Enable Autonomy (agent loop)", value=st.session_state.autonomy)
+    st.session_state.max_iters = st.slider("Max Iterations", 1, 8, st.session_state.max_iters)
+
+# ============== Filters (hidden only for Direct→TDNA) ==============
+def compose_filters_caption(fil: dict) -> str:
+    return (f"{label_for(fil['ond']['origin'])} → {label_for(fil['ond']['destination'])} | "
+            f"Start: {fil['start_date']} | End: {fil['end_date']} | Policy: {fil['policy_status']}")
+
+show_filters = not (st.session_state.mode == "Direct tool" and st.session_state.target == "tdna")
+
+if show_filters:
+    with st.container():
+        st.markdown("### 🔎 Filters")
+        fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns([1,1,1,1,1])
+
+        with fcol1:
+            origin_code = st.selectbox(
+                "Origin",
+                options=ORIGIN_OPTIONS,
+                index=(ORIGIN_OPTIONS.index(st.session_state.filters["ond"]["origin"])
+                       if st.session_state.filters["ond"]["origin"] in ORIGIN_OPTIONS else 0),
+                format_func=label_for,
+            )
+        with fcol2:
+            dest_code = st.selectbox(
+                "Destination",
+                options=DESTINATION_OPTIONS,
+                index=(DESTINATION_OPTIONS.index(st.session_state.filters["ond"]["destination"])
+                       if st.session_state.filters["ond"]["destination"] in DESTINATION_OPTIONS else 0),
+                format_func=label_for,
+            )
+        with fcol3:
+            start_default = date.fromisoformat(st.session_state.filters["start_date"])
+            start_default = _snap_to_allowed(start_default, START_WHITELIST, direction="nearest")
+            start_input = st.date_input(
+                "Start date",
+                value=start_default,
+                min_value=START_WHITELIST[0],
+                max_value=START_WHITELIST[-1],
+                format="YYYY-MM-DD",
+                key="start_date_picker",
+            )
+        with fcol4:
+            end_default = date.fromisoformat(st.session_state.filters["end_date"])
+            end_default = _snap_to_allowed(end_default, END_WHITELIST, direction="up", min_after=start_input)
+            end_input = st.date_input(
+                "End date",
+                value=end_default,
+                min_value=END_WHITELIST[0],
+                max_value=END_WHITELIST[-1],
+                format="YYYY-MM-DD",
+                key="end_date_picker",
+            )
+        with fcol5:
+            policy_input = st.selectbox(
+                "Policy status",
+                options=["In policy", "Out of policy"],
+                index=["In policy", "Out of policy"].index(st.session_state.filters["policy_status"])
+            )
+            apply = st.button("Apply", use_container_width=True)
+            clear = st.button("Clear", use_container_width=True)
+
+        if apply:
+            if origin_code == dest_code:
+                st.warning("Origin and Destination cannot be the same.")
+
+            chosen_start = start_input if isinstance(start_input, date) else START_WHITELIST[0]
+            snapped_start = _snap_to_allowed(chosen_start, START_WHITELIST, direction="nearest")
+
+            chosen_end = end_input if isinstance(end_input, date) else END_WHITELIST[-1]
+            snapped_end = _snap_to_allowed(chosen_end, END_WHITELIST, direction="up", min_after=snapped_start)
+
+            st.session_state.filters = {
+                "ond": {"origin": origin_code, "destination": dest_code},
+                "start_date": snapped_start.isoformat(),
+                "end_date": snapped_end.isoformat(),
+                "policy_status": policy_input,
+            }
+
+            # ---------- First-time-only Apply behavior ----------
+            def _call_orchestrator(url: str, payload: dict, response_key: str):
+                with st.chat_message("assistant"):
+                    ph = st.empty()
+                    ph.markdown("**Great! Agent is planning your trip…**")
+                    with st.spinner("Processing…"):
+                        status, data = post(url, payload)
+                    raw_answer = data.get(response_key, "") if isinstance(data, dict) else str(data)
+                    ph.markdown(str(raw_answer))
+                sig = answer_sig(str(raw_answer), payload)
+                if st.session_state.last_answer_hash != sig:
+                    st.session_state.messages.append({"role": "assistant", "content": str(raw_answer)})
+                    st.session_state.last_answer_hash = sig
+
+            if st.session_state.mode == "Agentic AI":
+                if not st.session_state.boot_agentic:
+                    qtext = (
+                        "Provide me the best flights for the given route from AIR bot and also provide "
+                        "best/preferred hotels from HOTEL bot, and check traveller's past history from TDNA bot. "
+                        f"[Filters] Origin: {origin_code}, Destination: {dest_code}, "
+                        f"Start: {snapped_start.isoformat()}, End: {snapped_end.isoformat()}, Policy: {policy_input}"
+                    )
+                    payload = {
+                        "query": qtext,
+                        "session_id": st.session_state.session_id,
+                        "targets": ["air", "hotel", "tdna"],
+                        "extra": {
+                            "user_name": st.session_state.user_name.strip(),
+                            "user_email": st.session_state.user_email.strip(),
+                            "filters": st.session_state.filters,
+                            "ui_version": "new-ui-v1",
+                            "source": "filters_apply",
+                            "llm_hints": "Use conversation history; avoid repetition.",
+                        },
+                    }
+                    _call_orchestrator(ROUTE_URL, payload, response_key="answer")
+                    st.session_state.boot_agentic = True
+                else:
+                    st.info("Filters updated. They’ll be used for your next message.", icon="✅")
+
+            else:
+                if st.session_state.target == "hotel":
+                    if not st.session_state.boot_hotel:
+                        qtext = build_query_hotels_only(st.session_state.filters)
+                        payload = {
+                            "query": qtext,
+                            "session_id": st.session_state.session_id,
+                            "target": "hotel",
+                            "extra": {
+                                "user_name": st.session_state.user_name.strip(),
+                                "user_email": st.session_state.user_email.strip(),
+                                "filters": st.session_state.filters,
+                                "ui_version": "new-ui-v1",
+                                "source": "filters_apply",
+                            },
+                        }
+                        _call_orchestrator(ROUTE_URL, payload, response_key="answer")
+                        st.session_state.boot_hotel = True
+                    else:
+                        st.info("Filters updated. They’ll be used for your next message.", icon="✅")
+
+                elif st.session_state.target == "air":
+                    if not st.session_state.boot_air:
+                        qtext = build_query_flights_only(st.session_state.filters)
+                        payload = {
+                            "query": qtext,
+                            "session_id": st.session_state.session_id,
+                            "target": "air",
+                            "extra": {
+                                "user_name": st.session_state.user_name.strip(),
+                                "user_email": st.session_state.user_email.strip(),
+                                "filters": st.session_state.filters,
+                                "ui_version": "new-ui-v1",
+                                "source": "filters_apply",
+                            },
+                        }
+                        _call_orchestrator(ROUTE_URL, payload, response_key="answer")
+                        st.session_state.boot_air = True
+                    else:
+                        st.info("Filters updated. They’ll be used for your next message.", icon="✅")
+
+                else:
+                    st.info("TDNA does not use filters. Please type directly in chat.", icon="ℹ️")
+
+        if clear:
+            st.session_state.filters = {
+                "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
+                "start_date": START_WHITELIST[0].isoformat(),
+                "end_date": END_WHITELIST[-1].isoformat(),
+                "policy_status": "In policy",
+            }
+            st.info("Filters cleared.")
+
+        st.caption("Active filters → " + compose_filters_caption(st.session_state.filters))
+else:
+    st.info("Filters are not available when using TDNA directly. Switch to Agentic AI or a different tool to apply filters.")
+
+# ================== Chat transcript (oldest → newest) ==================
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+# ================== Chat input ==================
+prompt = st.chat_input("Type a message and press Enter…")
+if prompt:
+    # show user message now
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # build extra (include filters always; TDNA may ignore)
+    extra = {
+        "user_name": st.session_state.user_name.strip(),
+        "user_email": st.session_state.user_email.strip(),
+        "filters": {
+            "ond": {
+                "origin": st.session_state.filters["ond"]["origin"],
+                "destination": st.session_state.filters["ond"]["destination"],
+            },
+            "start_date": st.session_state.filters["start_date"],
+            "end_date": st.session_state.filters["end_date"],
+            "policy_status": st.session_state.filters["policy_status"],
+        },
+        "ui_version": "new-ui-v1"
     }
-    """
-    user_name = (payload.get("user_name") or "anonymous").strip()
-    query = (payload.get("query") or payload.get("question") or "").strip()
 
-    qa_chain = _ensure_chain_for(user_name)
-    result = qa_chain({"question": query})
-    return result["answer"]
+    try:
+        if st.session_state.mode == "Agentic AI":
+            payload = {
+                "query": prompt.strip(),
+                "session_id": st.session_state.session_id,  # keep stable across turns!
+                "autonomy": st.session_state.autonomy,
+                "max_iters": st.session_state.max_iters,
+                "extra": extra,
+            }
+            with st.chat_message("assistant"):
+                with st.spinner("Processing…"):
+                    status, data = post(AGENT_URL, payload)
+                final_answer = data.get("final_answer", "") if isinstance(data, dict) else str(data)
+                st.markdown(final_answer)
+
+        else:
+            target = st.session_state.target
+            payload = {
+                "query": prompt.strip(),
+                "target": target,
+                "session_id": st.session_state.session_id,  # no tool suffix → preserves context
+                "extra": extra,
+            }
+            with st.chat_message("assistant"):
+                with st.spinner("Processing…"):
+                    status, data = post(ROUTE_URL, payload)
+                final_answer = data.get("answer", "") if isinstance(data, dict) else str(data)
+                st.markdown(final_answer)
+
+        sig = answer_sig(final_answer, payload)
+        if st.session_state.last_answer_hash != sig:
+            st.session_state.messages.append({"role": "assistant", "content": final_answer})
+            st.session_state.last_answer_hash = sig
+
+    except Exception as e:
+        err = f"Request error: {e}"
+        with st.chat_message("assistant"):
+            st.error(err)
+        st.session_state.messages.append({"role": "assistant", "content": err})
+
+# footer
+st.markdown("---")
+st.caption("Conversational Orchestrator UI — history persists per user until you switch users or start a new chat.")
