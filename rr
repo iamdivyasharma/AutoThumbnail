@@ -1,0 +1,391 @@
+# RAG — 11 Clients, One Doc Each (In‑Memory, No Vector DB)
+
+A minimal setup where you have **11 clients / 1 PDF per client**. Each client is indexed **separately**, and the chatbot answers **only from the selected client’s document**. No external vector DB — just in‑memory embeddings (or optional BM25) and Bedrock Claude 3.5 Sonnet for generation.
+
+---
+
+## Project layout
+
+```
+rag-11-clients/
+├─ app.py                  # Streamlit chat UI (client picker)
+├─ rag_core.py             # PDF -> chunks -> embeddings (per client); retrieval; Bedrock calls
+├─ prompts.py              # System + instruction prompt templates
+├─ clients.json            # Map client -> absolute/relative path to that single PDF
+├─ requirements.txt
+├─ .env.example
+└─ README.md
+```
+
+---
+
+## `clients.json` (sample)
+
+```json
+{
+  "ClientA": "./docs/ClientA.pdf",
+  "ClientB": "./docs/ClientB.pdf",
+  "ClientC": "./docs/ClientC.pdf",
+  "ClientD": "./docs/ClientD.pdf",
+  "ClientE": "./docs/ClientE.pdf",
+  "ClientF": "./docs/ClientF.pdf",
+  "ClientG": "./docs/ClientG.pdf",
+  "ClientH": "./docs/ClientH.pdf",
+  "ClientI": "./docs/ClientI.pdf",
+  "ClientJ": "./docs/ClientJ.pdf",
+  "ClientK": "./docs/ClientK.pdf"
+}
+```
+
+---
+
+## `.env.example`
+
+```bash
+AWS_REGION="us-east-1"
+BEDROCK_SONNET_MODEL_ID="anthropic.claude-3-5-sonnet"
+BEDROCK_TITAN_EMBED_MODEL_ID="amazon.titan-embed-text-v2"
+CHUNK_SIZE_CHARS=1200
+CHUNK_OVERLAP_CHARS=200
+TOP_K=6
+APP_TITLE="Chat with Contracts"
+APP_LOGO_PATH="./logo.png"   # optional
+```
+
+---
+
+## `requirements.txt`
+
+```
+boto3==1.34.162
+python-dotenv==1.0.1
+pypdf==5.0.0
+pymupdf==1.24.8
+streamlit==1.36.0
+numpy==1.26.4
+```
+
+---
+
+## `prompts.py`
+
+```python
+# prompts.py
+
+SYSTEM_PROMPT = (
+    "You are a contract analysis assistant. Use only the provided sources. "
+    "Cite sources inline like [Source N]. If uncertain, say you couldn't find it. "
+    "Be concise and precise."
+)
+
+INSTRUCTION_PROMPT = (
+    "Follow these rules strictly:\n"
+    "- Only use the sources from the selected client's document.\n"
+    "- Prefer quoting exact clauses with page references when answering.\n"
+    "- If the answer is partially present, state what's missing.\n"
+    "- If the question asks outside scope, say it isn't in the client's document."
+)
+```
+
+---
+
+## `rag_core.py`
+
+```python
+# rag_core.py
+import os, re, json
+from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple
+
+import numpy as np
+import boto3
+from botocore.config import Config
+from dotenv import load_dotenv
+
+try:
+    import fitz  # PyMuPDF (preferred)
+except Exception:
+    fitz = None
+from pypdf import PdfReader
+
+load_dotenv()
+REGION = os.getenv("AWS_REGION", "us-east-1")
+BEDROCK_SONNET = os.getenv("BEDROCK_SONNET_MODEL_ID", "anthropic.claude-3-5-sonnet")
+BEDROCK_EMBED = os.getenv("BEDROCK_TITAN_EMBED_MODEL_ID", "amazon.titan-embed-text-v2")
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE_CHARS", "1200"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP_CHARS", "200"))
+TOP_K = int(os.getenv("TOP_K", "6"))
+
+bedrock_rt = boto3.client("bedrock-runtime", region_name=REGION, config=Config(retries={"max_attempts": 3}))
+
+@dataclass
+class Chunk:
+    client_id: str
+    doc_id: str
+    page: int
+    text: str
+    source: str
+
+# In-memory index: { client_id: [ (embedding(np.ndarray), Chunk), ... ] }
+INDEX: Dict[str, List[Tuple[np.ndarray, Chunk]]] = {}
+
+# ---------- Embeddings ----------
+
+def _normalize_rows(mat: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return mat / norms
+
+
+def embed_texts(texts: List[str]) -> np.ndarray:
+    payload = {"inputText": texts}
+    resp = bedrock_rt.invoke_model(
+        modelId=BEDROCK_EMBED,
+        body=json.dumps(payload),
+        accept="application/json",
+        contentType="application/json",
+    )
+    body = json.loads(resp["body"].read())
+    if "embeddings" in body:
+        vecs = np.array([e["embedding"] for e in body["embeddings"]], dtype=np.float32)
+    elif "embedding" in body:
+        vecs = np.array([body["embedding"]], dtype=np.float32)
+    else:
+        raise RuntimeError(f"Unexpected Titan embedding response: keys={list(body.keys())}")
+    return _normalize_rows(vecs)
+
+# ---------- PDF parsing ----------
+
+def _extract_all_pages(path: str) -> List[Tuple[int, str]]:
+    pages: List[Tuple[int, str]] = []
+    if fitz is not None:
+        with fitz.open(path) as doc:
+            for i, page in enumerate(doc, start=1):
+                pages.append((i, page.get_text("text")))
+        if any(t.strip() for _, t in pages):
+            return pages
+    # fallback to PyPDF
+    reader = PdfReader(path)
+    for i, p in enumerate(reader.pages, start=1):
+        try:
+            pages.append((i, p.extract_text() or ""))
+        except Exception:
+            pages.append((i, ""))
+    return pages
+
+# ---------- Chunking ----------
+
+def _clean(t: str) -> str:
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def make_chunks(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    text = _clean(text)
+    out: List[str] = []
+    step = max(1, size - overlap)
+    i = 0
+    while i < len(text):
+        out.append(text[i : i + size])
+        i += step
+    return [c for c in out if c.strip()]
+
+# ---------- Ingestion (per client) ----------
+
+def ingest_client_pdf(client_id: str, pdf_path: str) -> int:
+    """Read a single PDF for one client, chunk it, embed, and store in-memory."""
+    pages = _extract_all_pages(pdf_path)
+    texts: List[str] = []
+    metas: List[Tuple[int, str]] = []
+    for pno, tx in pages:
+        for ch in make_chunks(tx):
+            texts.append(ch)
+            metas.append((pno, ch))
+    if not texts:
+        INDEX[client_id] = []
+        return 0
+    vecs = embed_texts(texts)  # normalized
+    items: List[Tuple[np.ndarray, Chunk]] = []
+    doc_id = os.path.splitext(os.path.basename(pdf_path))[0]
+    for (pno, ch), v in zip(metas, vecs):
+        items.append((v, Chunk(client_id, doc_id, pno, ch, os.path.basename(pdf_path))))
+    INDEX[client_id] = items
+    return len(items)
+
+
+def ingest_all_from_mapping(mapping_path: str) -> Dict[str, int]:
+    with open(mapping_path, "r", encoding="utf-8") as f:
+        mp = json.load(f)
+    counts: Dict[str, int] = {}
+    for client_id, pdf_path in mp.items():
+        n = ingest_client_pdf(client_id, pdf_path)
+        counts[client_id] = n
+    return counts
+
+# ---------- Retrieval (restricted to selected client) ----------
+
+def retrieve_for_client(client_id: str, query: str, top_k: int = TOP_K) -> List[Dict[str, Any]]:
+    items = INDEX.get(client_id, [])
+    if not items:
+        return []
+    q = embed_texts([query])[0]
+    scored = [(float(np.dot(q, emb)), ch) for emb, ch in items]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out = []
+    for s, ch in scored[:top_k]:
+        out.append({
+            "text": ch.text,
+            "score": s,
+            "source": ch.source,
+            "page": ch.page,
+            "doc_id": ch.doc_id,
+        })
+    return out
+
+# ---------- Prompt + Bedrock streaming ----------
+
+def build_messages(question: str, ctxs: List[Dict[str, Any]], system_prompt: str, instruction_prompt: str):
+    ctx_block = "\n\n".join(
+        [f"[Source {i+1}] (doc: {c['doc_id']}, page {c['page']}):\n{c['text']}" for i, c in enumerate(ctxs)]
+    )
+    user = (
+        f"{instruction_prompt}\n\n"
+        f"Question: {question}\n\nSources:\n{ctx_block}"
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user},
+    ]
+
+
+def stream_sonnet(messages):
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 1024,
+        "messages": messages,
+        # optional: "temperature": 0.2
+    })
+    resp = bedrock_rt.invoke_model_with_response_stream(
+        modelId=BEDROCK_SONNET,
+        body=body,
+        accept="application/json",
+        contentType="application/json",
+    )
+    for event in resp["body"]:
+        if "chunk" in event:
+            data = json.loads(event["chunk"]["bytes"].decode("utf-8"))
+            delta = data.get("delta", {}).get("text", "") or data.get("output_text", "")
+            if delta:
+                yield delta
+
+
+def answer_question(client_id: str, question: str, system_prompt: str, instruction_prompt: str, top_k: int = TOP_K):
+    ctxs = retrieve_for_client(client_id, question, top_k=top_k)
+    msgs = build_messages(question, ctxs, system_prompt, instruction_prompt)
+    return ctxs, stream_sonnet(msgs)
+```
+
+---
+
+## `app.py`
+
+```python
+# app.py
+import os, io, json
+import streamlit as st
+from dotenv import load_dotenv
+
+from rag_core import ingest_all_from_mapping, answer_question, INDEX
+from prompts import SYSTEM_PROMPT, INSTRUCTION_PROMPT
+
+load_dotenv()
+
+APP_TITLE = os.getenv("APP_TITLE", "Chat with Contracts")
+APP_LOGO_PATH = os.getenv("APP_LOGO_PATH", "")
+
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+
+# Sidebar branding
+st.sidebar.title(APP_TITLE)
+if APP_LOGO_PATH and os.path.exists(APP_LOGO_PATH):
+    st.sidebar.image(APP_LOGO_PATH, use_column_width=True)
+
+# One-time bulk ingestion (11 clients -> 11 PDFs) from clients.json
+with st.sidebar.expander("Load client PDFs (once)"):
+    mapping_path = st.text_input("clients.json path", value="./clients.json")
+    if st.button("Index all clients", type="primary", use_container_width=True):
+        with st.spinner("Indexing all client PDFs …"):
+            counts = ingest_all_from_mapping(mapping_path)
+        msg = " | ".join([f"{k}:{v}" for k, v in counts.items()])
+        st.success(f"Done. Chunks per client — {msg}")
+
+# Client picker: only clients that are indexed will appear
+indexed_clients = sorted([k for k, v in INDEX.items() if v])
+client = st.sidebar.selectbox("Choose client", indexed_clients) if indexed_clients else None
+
+# Prompt editor
+sys_prompt = st.sidebar.text_area("System prompt", value=SYSTEM_PROMPT, height=120)
+inst_prompt = st.sidebar.text_area("Instruction prompt", value=INSTRUCTION_PROMPT, height=140)
+
+st.markdown(f"## {APP_TITLE}")
+if client:
+    st.caption(f"Tenant: **{client}** — answers come only from this client's single indexed PDF.")
+else:
+    st.caption("No clients indexed. Load clients.json and click ‘Index all clients’.")
+
+# Per-client chat history
+if "history" not in st.session_state:
+    st.session_state.history = {}
+if client and client not in st.session_state.history:
+    st.session_state.history[client] = []
+
+# Replay history
+if client:
+    for role, content in st.session_state.history[client]:
+        with st.chat_message(role):
+            st.markdown(content)
+
+user_q = st.chat_input("Ask about the selected client's document …")
+
+if client and user_q:
+    st.session_state.history[client].append(("user", user_q))
+    with st.chat_message("user"):
+        st.markdown(user_q)
+
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        sources_box = st.empty()
+        ctxs, stream = answer_question(client, user_q, sys_prompt, inst_prompt)
+        buf = io.StringIO()
+        for token in stream:
+            buf.write(token)
+            placeholder.markdown(buf.getvalue())
+        if ctxs:
+            src_lines = [
+                f"- [Source {i+1}] **{c.get('doc_id')}** page {c.get('page')} — _{c.get('source')}_ (score {c.get('score'):.3f})"
+                for i, c in enumerate(ctxs)
+            ]
+            sources_box.markdown("**Sources**\n\n" + "\n".join(src_lines))
+        st.session_state.history[client].append(("assistant", buf.getvalue()))
+```
+
+---
+
+## README (quick start)
+
+```markdown
+1) Create and fill `clients.json` with the 11 clients (client name -> path to the single PDF).
+2) `python -m venv .venv && source .venv/bin/activate`
+3) `pip install -r requirements.txt`
+4) Copy `.env.example` -> `.env` and set your Bedrock model IDs and region.
+5) `streamlit run app.py`
+6) In the sidebar: provide `clients.json` path -> **Index all clients**.
+7) Pick a client and ask questions — responses will cite [Source N] with page numbers, only from that client’s PDF.
+```
+
+---
+
+### Notes & options
+
+* **Privacy**: everything is in-memory; the only external calls are to Bedrock (embeddings + generation). No external vector DB.
+* **BM25 option**: if you want zero embedding calls, swap `retrieve_for_client` with a BM25 scorer; keep the rest identical.
+* **Scaling a bit**: for longer documents, reduce `CHUNK_SIZE_CHARS` (e.g., 800–1200) and keep `TOP_K` 4–8.
