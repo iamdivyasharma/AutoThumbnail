@@ -1,0 +1,380 @@
+# configs/clients.yaml
+# Authoritative per-client overrides (no heuristics used).
+# For each client_id, set k / temperature / max_tokens.
+# Example values (edit to your needs):
+
+acme:
+  k: 6
+  temperature: 0.15
+  max_tokens: 1500
+
+globex:
+  k: 4
+  temperature: 0.20
+  max_tokens: 1200
+
+# Add more clients as needed:
+# initech:
+#   k: 5
+#   temperature: 0.18
+#   max_tokens: 1400
+
+
+# index_clients.py
+# Build per-client FAISS indexes from a single ./pdfs/ folder.
+# Filenames must be "<client>__<anything>.pdf"
+
+import re
+from pathlib import Path
+from collections import defaultdict
+from typing import List, Dict
+
+import boto3
+from langchain_aws import BedrockEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+
+# ---------- Hardcoded config ----------
+REGION = "us-east-1"
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+
+# ⚠️ Inline credentials (your request). Prefer env/roles in production.
+AWS_ACCESS_KEY_ID = "YOUR_ACCESS_KEY_ID"
+AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
+
+PDFS_DIR = Path("pdfs")
+INDEX_DIR = Path("faiss_indices")
+INDEX_DIR.mkdir(exist_ok=True)
+
+CLIENT_RE = re.compile(r"^(?P<client>[^_]+)__(?P<rest>.+)\.pdf$", re.IGNORECASE)
+
+# Create a boto3 session with inline creds
+SESSION = boto3.Session(
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=REGION,
+)
+
+def group_pdfs_by_client() -> Dict[str, List[Path]]:
+    buckets = defaultdict(list)
+    for p in PDFS_DIR.glob("*.pdf"):
+        m = CLIENT_RE.match(p.name)
+        if not m:
+            print(f"[skip:badname] {p.name} (expected '<client>__<anything>.pdf')")
+            continue
+        buckets[m.group("client").lower()].append(p)
+    return buckets
+
+def build_one_client_index(client_id: str, pdf_paths: List[Path]):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=180, add_start_index=True)
+    all_chunks = []
+    for pdf in pdf_paths:
+        docs = PyPDFLoader(str(pdf)).load()
+        chunks = splitter.split_documents(docs)
+        for d in chunks:
+            d.metadata.update({
+                "client_id": client_id,
+                "policy_id": pdf.name,
+                "source_file": str(pdf),
+            })
+        all_chunks.extend(chunks)
+
+    emb = BedrockEmbeddings(
+        model_id=EMBED_MODEL,
+        client=SESSION.client("bedrock-runtime"),
+    )
+    vs = FAISS.from_documents(all_chunks, emb)
+    out = INDEX_DIR / client_id
+    out.mkdir(parents=True, exist_ok=True)
+    vs.save_local(str(out))
+    print(f"[ok] {client_id}: {len(all_chunks)} chunks → {out}")
+
+def main():
+    buckets = group_pdfs_by_client()
+    if not buckets:
+        print("No PDFs found in ./pdfs or naming mismatch.")
+        return
+    for client_id, pdfs in buckets.items():
+        build_one_client_index(client_id, pdfs)
+
+if __name__ == "__main__":
+    main()
+
+
+# app.py
+# Backend API: lists clients, reads per-client params from YAML (no heuristics),
+# answers questions with strict client isolation.
+
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+
+import boto3
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import yaml
+
+from langchain_aws import BedrockEmbeddings, ChatBedrockConverse
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# ---------- Hardcoded config ----------
+REGION = "us-east-1"
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+LLM_MODEL = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+
+# ⚠️ Inline credentials (your request). Prefer env/roles in production.
+AWS_ACCESS_KEY_ID = "YOUR_ACCESS_KEY_ID"
+AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
+
+INDEX_ROOT = Path("faiss_indices")
+CONFIGS = Path("configs/clients.yaml")
+
+# Global fallback if a client is not present in YAML
+GLOBAL_DEFAULTS = {
+    "k": 4,
+    "temperature": 0.20,
+    "max_tokens": 1200,
+}
+
+# Create a boto3 session with inline creds
+SESSION = boto3.Session(
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=REGION,
+)
+
+app = FastAPI(title="Client-Scoped RAG API")
+
+# ---------- Models ----------
+
+class AskRequest(BaseModel):
+    client_id: str
+    question: str
+    must_contain: Optional[str] = None  # optional keyword filter
+
+class AskResponse(BaseModel):
+    answer: str
+    params: Dict[str, Any]
+    sources: List[Dict[str, Any]]
+
+# ---------- Helpers ----------
+
+def list_clients() -> List[str]:
+    if not INDEX_ROOT.exists(): return []
+    return sorted([p.name for p in INDEX_ROOT.iterdir() if p.is_dir()])
+
+def _load_index(client_id: str) -> FAISS:
+    emb = BedrockEmbeddings(
+        model_id=EMBED_MODEL,
+        client=SESSION.client("bedrock-runtime"),
+    )
+    vs = FAISS.load_local(str(INDEX_ROOT / client_id), emb, allow_dangerous_deserialization=True)
+    return vs
+
+def _load_overrides() -> Dict[str, Dict[str, Any]]:
+    if CONFIGS.exists():
+        with open(CONFIGS, "r") as f:
+            data = yaml.safe_load(f) or {}
+            if not isinstance(data, dict):
+                return {}
+            # normalize keys
+            norm = {}
+            for k, v in data.items():
+                if isinstance(v, dict):
+                    norm[k.lower()] = {
+                        "k": int(v.get("k", GLOBAL_DEFAULTS["k"])),
+                        "temperature": float(v.get("temperature", GLOBAL_DEFAULTS["temperature"])),
+                        "max_tokens": int(v.get("max_tokens", GLOBAL_DEFAULTS["max_tokens"])),
+                    }
+            return norm
+    return {}
+
+def choose_params(client_id: str) -> Dict[str, Any]:
+    overrides = _load_overrides()
+    return overrides.get(client_id.lower(), GLOBAL_DEFAULTS.copy())
+
+def apply_keyword_filter(docs, must_contain: Optional[str]):
+    if not must_contain:
+        return docs
+    kw = must_contain.lower()
+    return [d for d in docs if (kw in d.page_content.lower()) or (kw in str(d.metadata).lower())]
+
+# ---------- Routes ----------
+
+@app.get("/clients")
+def api_list_clients() -> List[str]:
+    return list_clients()
+
+@app.get("/clients/{client_id}/params")
+def api_params(client_id: str) -> Dict[str, Any]:
+    if client_id not in list_clients():
+        raise HTTPException(404, f"Unknown client_id '{client_id}'")
+    return choose_params(client_id)
+
+@app.post("/ask", response_model=AskResponse)
+def ask(payload: AskRequest):
+    clients = list_clients()
+    if payload.client_id not in clients:
+        raise HTTPException(404, f"Unknown client_id '{payload.client_id}'")
+
+    params = choose_params(payload.client_id)
+    k = params["k"]
+    temperature = params["temperature"]
+    max_tokens = params["max_tokens"]
+
+    vs = _load_index(payload.client_id)
+    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": k})
+
+    docs = retriever.get_relevant_documents(payload.question)
+    filtered = apply_keyword_filter(docs, payload.must_contain)
+    if not filtered:
+        raise HTTPException(404, f"No results for client '{payload.client_id}' with the given filters.")
+
+    def fmt(docs):
+        return "\n\n".join(
+            f"[{i+1}] (policy={d.metadata.get('policy_id')}, page={d.metadata.get('page','?')})\n{d.page_content}"
+            for i, d in enumerate(docs)
+        )
+
+    context = fmt(filtered)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "Answer strictly from the Provided Context. If not present, say you don't know. Cite bracket numbers like [1], [2]."),
+        ("human", "Client: {client_id}\nQ: {question}\n\nProvided Context:\n{context}\n\nAnswer:")
+    ])
+
+    llm = ChatBedrockConverse(
+        model_id=LLM_MODEL,
+        client=SESSION.client("bedrock-runtime"),
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    chain = prompt | llm | StrOutputParser()
+    answer = chain.invoke({
+        "client_id": payload.client_id,
+        "question": payload.question,
+        "context": context
+    })
+
+    sources = [{
+        "policy_id": d.metadata.get("policy_id"),
+        "page": d.metadata.get("page"),
+        "source_file": d.metadata.get("source_file"),
+        "client_id": d.metadata.get("client_id"),
+    } for d in filtered]
+
+    return AskResponse(
+        answer=answer,
+        params={"k": k, "temperature": temperature, "max_tokens": max_tokens},
+        sources=sources[:k]
+    )
+
+
+
+# streamlit_app.py
+# Streamlit UI with logo, client picker, question + optional keyword filter.
+# Shows active per-client params fetched from backend (read-only).
+
+import os
+import time
+import requests
+import streamlit as st
+
+API_URL = os.getenv("RAG_API_URL", "http://localhost:8000")
+
+st.set_page_config(page_title="Client RAG Assistant", page_icon="📄", layout="centered")
+
+# Logo
+logo_path = "assets/logo.png"
+if os.path.exists(logo_path):
+    st.image(logo_path, width=180)
+st.title("Client-Scoped Policy Assistant")
+
+with st.sidebar:
+    st.caption("Backend")
+    api_url = st.text_input("API URL", API_URL)
+
+# Fetch clients
+try:
+    clients = requests.get(f"{api_url}/clients", timeout=10).json()
+except Exception as e:
+    st.error(f"Could not reach backend: {e}")
+    st.stop()
+
+if not clients:
+    st.info("No clients found. Run the indexer and refresh.")
+    st.stop()
+
+client_id = st.selectbox("Choose client", clients, index=0)
+
+# Show active params for this client (from YAML or global defaults)
+params = {}
+try:
+    params = requests.get(f"{api_url}/clients/{client_id}/params", timeout=10).json()
+except Exception as e:
+    st.warning(f"Could not fetch per-client params: {e}")
+
+if params:
+    st.caption("Active parameters for this client")
+    st.json(params)
+
+# Inputs
+question = st.text_input("Your question")
+must_contain = st.text_input("Keyword filter (optional)", placeholder="e.g., deductible, waiting period")
+
+if st.button("Ask") and question.strip():
+    with st.spinner("Thinking..."):
+        payload = {
+            "client_id": client_id,
+            "question": question,
+            "must_contain": must_contain or None,
+        }
+        try:
+            resp = requests.post(f"{api_url}/ask", json=payload, timeout=120)
+            if resp.status_code != 200:
+                st.error(resp.text)
+            else:
+                data = resp.json()
+                # simple type-out effect
+                placeholder = st.empty()
+                out = ""
+                for ch in data["answer"]:
+                    out += ch
+                    placeholder.markdown(out)
+                    time.sleep(0.003)
+
+                with st.expander("Sources"):
+                    for i, s in enumerate(data.get("sources", []), start=1):
+                        st.markdown(
+                            f"**[{i}]** `{s.get('policy_id')}` — page **{s.get('page')}**  \n`{s.get('source_file')}`"
+                        )
+        except Exception as e:
+            st.error(f"Request failed: {e}")
+
+
+fastapi==0.112.2
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+boto3==1.35.14
+langchain==0.2.12
+langchain-community==0.2.11
+langchain-aws==0.1.6
+pypdf==4.3.1
+faiss-cpu==1.8.0.post1
+streamlit==1.38.0
+requests==2.32.3
+PyYAML==6.0.2
+
+
+               pip install -r requirements.txt
+
+# Put PDFs (named client__file.pdf) into ./pdfs
+python index_clients.py
+
+# Start API
+uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+
+# Start UI
+streamlit run streamlit_app.py
