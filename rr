@@ -1,18 +1,19 @@
 # streamlit_app.py
-# Streamlit UI with logo centered, client picker, and query box.
-# No API URL input, no parameter display (params handled by backend).
+# Streamlit UI with logo, client picker, question + optional keyword filter.
+# Backend URL is hardcoded (no sidebar API input).
+# No active params shown in UI.
 
-import os
 import time
 import requests
 import streamlit as st
+import os
 
 # Hardcode backend API URL
 API_URL = "http://localhost:8000"
 
 st.set_page_config(page_title="Client RAG Assistant", page_icon="📄", layout="centered")
 
-# Logo in center
+# Logo
 logo_path = "assets/logo.png"
 if os.path.exists(logo_path):
     st.markdown(
@@ -26,7 +27,7 @@ if os.path.exists(logo_path):
 
 st.title("Client-Scoped Policy Assistant")
 
-# Fetch clients from backend
+# Fetch clients
 try:
     clients = requests.get(f"{API_URL}/clients", timeout=10).json()
 except Exception as e:
@@ -56,7 +57,7 @@ if st.button("Ask") and question.strip():
                 st.error(resp.text)
             else:
                 data = resp.json()
-                # Simple type-out effect
+                # simple type-out effect
                 placeholder = st.empty()
                 out = ""
                 for ch in data["answer"]:
