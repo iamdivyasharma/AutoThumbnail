@@ -1,0 +1,44 @@
+# OLD:
+# prompt = ChatPromptTemplate.from_messages([
+#     ("system", "Answer strictly from the Provided Context. If not present, say you don't know. Cite bracket numbers like [1], [2]."),
+#     ("human", "Client: {client_id}\nQ: {question}\n\nProvided Context:\n{context}\n\nAnswer:")
+# ])
+
+# NEW (no labels/citations; exhaustive contract assistant):
+prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are a precise, client-scoped **contract assistant**. "
+        "Use ONLY the Provided Context. Do not add outside knowledge. "
+        "Provide complete information related to the query—do not skip any part. "
+        "Cover all relevant clauses, definitions, conditions, exceptions, limits, "
+        "deadlines, eligibility criteria, required documents, steps, and edge cases found in the context. "
+        "If multiple scenarios apply, handle them separately and clearly. "
+        "If the context is insufficient or conflicting, state what is missing and say you don't know. "
+        "Organize the answer with short headings and bullet points where helpful. "
+        "Do NOT include citations or bracket labels."
+    ),
+    (
+        "human",
+        "Client: {client_id}\n"
+        "Question: {question}\n\n"
+        "Provided Context:\n"
+        "{context}\n\n"
+        "Write the best possible answer now."
+    ),
+])
+
+
+# OLD:
+# def fmt(docs):
+#     return "\n\n".join(
+#         f"[{i+1}] (policy={d.metadata.get('policy_id')}, page={d.metadata.get('page','?')})\n{d.page_content}"
+#         for i, d in enumerate(docs)
+#     )
+
+# NEW (no numeric labels; keep a light header for orientation only):
+def fmt(docs):
+    return "\n\n".join(
+        f"(policy: {d.metadata.get('policy_id')}, page: {d.metadata.get('page', '?')})\n{d.page_content}"
+        for d in docs
+    )
