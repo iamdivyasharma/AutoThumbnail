@@ -1,0 +1,269 @@
+# filtered_new_ui.py
+import json
+import uuid
+import hashlib
+import requests
+import streamlit as st
+from pathlib import Path
+from datetime import date
+
+# ================== Orchestrator endpoints ==================
+ORCH_BASE = "http://localhost:9000"  # change if deployed
+AGENT_URL = f"{ORCH_BASE}/agent_query"
+MEM_CLEAR = f"{ORCH_BASE}/memory/clear"
+TIMEOUT   = 30
+
+# ================== Example users ==================
+USERS = [
+    {"name": "Alice Singh",  "email": "alice@example.com"},
+    {"name": "Bob Kumar",    "email": "bob@example.com"},
+    {"name": "Charlie Rao",  "email": "charlie@example.com"},
+]
+
+# ================== Airports: options + labels (for optional form) ==================
+AIRPORT_LABELS = {
+    "DEL": "Delhi — Indira Gandhi Intl",
+    "BOM": "Mumbai — Chhatrapati Shivaji Maharaj Intl",
+    "BLR": "Bengaluru — Kempegowda Intl",
+    "MAA": "Chennai — Chennai Intl",
+    "HYD": "Hyderabad — Rajiv Gandhi Intl",
+    "CCU": "Kolkata — Netaji Subhas Chandra Bose Intl",
+    "PNQ": "Pune — Lohegaon",
+    "COK": "Kochi — Cochin Intl",
+    "GOI": "Goa — Dabolim",
+    "DXB": "Dubai — Dubai Intl",
+    "SIN": "Singapore — Changi",
+    "LHR": "London — Heathrow",
+    "JFK": "New York — John F. Kennedy Intl",
+    "SFO": "San Francisco — SFO",
+}
+ORIGIN_OPTIONS      = ["DEL","BLR","MAA","HYD","CCU","PNQ","COK","GOI","BOM","DXB","SIN","LHR","JFK","SFO"]
+DESTINATION_OPTIONS = ["BOM","DEL","BLR","CCU","MAA","HYD","COK","PNQ","GOI","DXB","SIN","LHR","JFK","SFO"]
+
+def label_for(code: str) -> str:
+    return f"{code} ({AIRPORT_LABELS.get(code, 'Unknown')})"
+
+# ================== Page config (Logo + Favicon) ==================
+LOGO_PATH    = Path("assets/logo.png")
+FAVICON_PATH = Path("assets/favicon.png")
+
+st.set_page_config(
+    page_title="Orchestrator Chat",
+    page_icon=str(FAVICON_PATH) if FAVICON_PATH.exists() else "💬",
+    layout="centered",
+)
+
+# Top-centered logo + title
+if LOGO_PATH.exists():
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        st.image(str(LOGO_PATH), use_container_width=False)
+
+st.markdown("<h1 style='text-align:center'>💬 Orchestrator — Conversational Chat</h1>", unsafe_allow_html=True)
+
+# ================== Helpers ==================
+def post(url: str, payload: dict):
+    r = requests.post(url, json=payload, timeout=TIMEOUT)
+    if r.headers.get("content-type", "").startswith("application/json"):
+        return r.status_code, r.json()
+    return r.status_code, r.text
+
+def answer_sig(text: str, payload: dict) -> str:
+    blob = json.dumps({"t": text, "p": payload}, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+def ensure_state():
+    ss = st.session_state
+    if "messages" not in ss: ss.messages = []
+    if "session_id" not in ss: ss.session_id = "user123"
+    if "user_name" not in ss: ss.user_name = ""
+    if "user_email" not in ss: ss.user_email = ""
+    if "autonomy" not in ss: ss.autonomy = True
+    if "max_iters" not in ss: ss.max_iters = 3
+    if "last_answer_hash" not in ss: ss.last_answer_hash = None
+    # quick form state
+    if "use_quick_form" not in ss: ss.use_quick_form = False
+    if "form_origin" not in ss: ss.form_origin = ORIGIN_OPTIONS[0]
+    if "form_dest" not in ss: ss.form_dest = DESTINATION_OPTIONS[0]
+    if "form_start" not in ss: ss.form_start = None
+    if "form_end" not in ss: ss.form_end = None
+
+ensure_state()
+
+# ================== Sidebar ==================
+with st.sidebar:
+    st.subheader("User")
+    user_labels = [f"{u['name']} <{u['email']}>" for u in USERS] + ["Other…"]
+    picked = st.selectbox("Choose a user", user_labels, index=0)
+    if picked != "Other…":
+        idx = user_labels.index(picked)
+        chosen = USERS[idx]
+        user_name_default = chosen["name"]
+        user_email_default = chosen["email"]
+    else:
+        user_name_default = ""
+        user_email_default = ""
+
+    st.session_state.user_name = st.text_input("Name", value=user_name_default, placeholder="e.g., Priya Sharma")
+    st.session_state.user_email = st.text_input("Email", value=user_email_default, placeholder="e.g., priya@company.com")
+
+    st.markdown("---")
+    st.subheader("Session")
+    default_session = st.session_state.user_email or st.session_state.session_id
+    new_session_id = st.text_input("Session ID", value=default_session, key="sid_input")
+    if new_session_id != st.session_state.session_id:
+        st.session_state.session_id = new_session_id
+
+    col_a, col_b = st.columns(2)
+    if col_a.button("🆕 New Chat"):
+        sid = f"{(st.session_state.user_email or 'user')}-{uuid.uuid4().hex[:8]}"
+        st.session_state.session_id = sid
+        st.session_state.messages = []
+        st.success(f"New session id: {sid}")
+
+    if col_b.button("🧹 Clear Server Memory"):
+        try:
+            r = requests.post(MEM_CLEAR, json={"session_id": st.session_state.session_id}, timeout=TIMEOUT)
+            if r.status_code == 200:
+                st.success("Server memory cleared.")
+            else:
+                st.error(r.text)
+        except Exception as e:
+            st.error(f"Clear error: {e}")
+
+    st.markdown("---")
+    st.subheader("Mode")
+    st.caption("Agentic mode is enabled for all messages.")
+
+    st.markdown("---")
+    st.subheader("Agent Settings")
+    st.session_state.autonomy = st.checkbox("Enable Autonomy (agent loop)", value=st.session_state.autonomy)
+    st.session_state.max_iters = st.slider("Max Iterations", 1, 8, st.session_state.max_iters)
+
+# ================== Optional quick form (appears on demand) ==================
+with st.container(border=True):
+    left, right = st.columns([3,1])
+    with left:
+        st.markdown("### ✨ Plan by typing OR use a quick form")
+        st.caption("Type natural language like: ‘Please plan my trip from DEL to SFO on 2025-09-10 to 2025-09-15’. Or, toggle the form.")
+    with right:
+        st.session_state.use_quick_form = st.toggle("Use form", value=st.session_state.use_quick_form, help="Show origin/destination/date pickers")
+
+if st.session_state.use_quick_form:
+    st.markdown("#### Quick form (optional)")
+    c1, c2, c3, c4 = st.columns([1,1,1,1], gap="large")
+    with c1:
+        st.session_state.form_origin = st.selectbox(
+            "Origin",
+            options=ORIGIN_OPTIONS,
+            index=ORIGIN_OPTIONS.index(st.session_state.form_origin) if st.session_state.form_origin in ORIGIN_OPTIONS else 0,
+            format_func=label_for,
+            key="origin_select",
+        )
+    with c2:
+        st.session_state.form_dest = st.selectbox(
+            "Destination",
+            options=[x for x in DESTINATION_OPTIONS if x != st.session_state.form_origin],
+            index=0 if st.session_state.form_dest == st.session_state.form_origin else (
+                DESTINATION_OPTIONS.index(st.session_state.form_dest) if st.session_state.form_dest in DESTINATION_OPTIONS else 0
+            ),
+            format_func=label_for,
+            key="dest_select",
+        )
+    with c3:
+        st.session_state.form_start = st.date_input("Start date", value=st.session_state.form_start, key="start_date")
+    with c4:
+        st.session_state.form_end = st.date_input("End date", value=st.session_state.form_end, key="end_date")
+
+    go_col, _ = st.columns([1,3])
+    if go_col.button("Apply form", use_container_width=True):
+        o = st.session_state.form_origin
+        d = st.session_state.form_dest
+        s = st.session_state.form_start
+        e = st.session_state.form_end
+        if not (o and d and s and e):
+            st.error("Please select origin, destination, start and end dates.")
+        elif o == d:
+            st.error("Origin and Destination cannot be the same.")
+        else:
+            # Build the same NL query the orchestrator expects
+            nl_query = f"plan me a trip from {o} to {d} on {s} to {e}"
+            st.session_state.messages.append({"role": "user", "content": nl_query})
+            with st.chat_message("user"):
+                st.markdown(nl_query)
+
+            extra = {
+                "user_name": st.session_state.user_name.strip(),
+                "user_email": st.session_state.user_email.strip(),
+                "ui_version": "agentic-quick-form",
+            }
+            payload = {
+                "query": nl_query,
+                "session_id": st.session_state.session_id,
+                "autonomy": st.session_state.autonomy,
+                "max_iters": st.session_state.max_iters,
+                "extra": extra,
+            }
+            try:
+                with st.chat_message("assistant"):
+                    with st.spinner("Processing…"):
+                        status, data = post(AGENT_URL, payload)
+                    final_answer = data.get("final_answer", "") if isinstance(data, dict) else str(data)
+                    st.markdown(final_answer)
+                sig = answer_sig(final_answer, payload)
+                if st.session_state.last_answer_hash != sig:
+                    st.session_state.messages.append({"role": "assistant", "content": final_answer})
+                    st.session_state.last_answer_hash = sig
+            except Exception as e:
+                err = f"Request error: {e}"
+                with st.chat_message("assistant"):
+                    st.error(err)
+                st.session_state.messages.append({"role": "assistant", "content": err})
+
+# ================== Chat transcript ==================
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+# ================== Chat input (Agentic mode) ==================
+prompt = st.chat_input("Type a message like 'Please plan my trip from DEL to SFO on 2025-09-10 to 2025-09-15'…")
+if prompt:
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # No filter UI required by default — orchestrator will parse origin/destination/dates from text.
+    extra = {
+        "user_name": st.session_state.user_name.strip(),
+        "user_email": st.session_state.user_email.strip(),
+        "ui_version": "agentic-no-filters-ui",
+    }
+
+    try:
+        payload = {
+            "query": prompt.strip(),
+            "session_id": st.session_state.session_id,
+            "autonomy": st.session_state.autonomy,
+            "max_iters": st.session_state.max_iters,
+            "extra": extra,
+        }
+        with st.chat_message("assistant"):
+            with st.spinner("Processing…"):
+                status, data = post(AGENT_URL, payload)
+            final_answer = data.get("final_answer", "") if isinstance(data, dict) else str(data)
+            st.markdown(final_answer)
+
+        sig = answer_sig(final_answer, payload)
+        if st.session_state.last_answer_hash != sig:
+            st.session_state.messages.append({"role": "assistant", "content": final_answer})
+            st.session_state.last_answer_hash = sig
+
+    except Exception as e:
+        err = f"Request error: {e}"
+        with st.chat_message("assistant"):
+            st.error(err)
+        st.session_state.messages.append({"role": "assistant", "content": err})
+
+# footer
+st.markdown("---")
+st.caption("Conversational Orchestrator UI — Type freely, or toggle the quick form when needed. AIR + HOTEL + TDNA are triggered automatically.")
