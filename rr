@@ -1,96 +1,72 @@
-# index_clients.py
-# Build per-client FAISS indexes from a single ./pdfs/ folder.
-# Works with names like: ey_policy_of_ey1.pdf  → client_id="ey"
-#                        google_doc_policy-tm1.pdf → client_id="google"
-
-import os
+# streamlit_app.py
+import streamlit as st
+import requests
 from pathlib import Path
-from collections import defaultdict
-from typing import List, Dict
+import yaml
 
-import boto3
-from langchain_aws import BedrockEmbeddings
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
+# -------------------------
+# Config
+# -------------------------
+BACKEND_URL = "http://localhost:8000/ask"   # hardcoded backend API
+CONFIG_PATH = Path("configs/clients.yaml")
+LOGO_PATH = Path("assets/logo.png")
 
-# ---------- Hardcoded config ----------
-REGION = "us-east-1"
-EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+# Load per-client configs
+if CONFIG_PATH.exists():
+    with open(CONFIG_PATH, "r") as f:
+        CLIENT_CONFIGS = yaml.safe_load(f) or {}
+else:
+    CLIENT_CONFIGS = {}
 
-# ⚠️ Inline credentials (your request). Prefer env/roles in production.
-AWS_ACCESS_KEY_ID = "YOUR_ACCESS_KEY_ID"
-AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
+# -------------------------
+# UI Setup
+# -------------------------
+st.set_page_config(page_title="Client RAG Bot", page_icon=":robot_face:", layout="centered")
 
-PDFS_DIR = Path("pdfs")
-INDEX_DIR = Path("faiss_indices")
-INDEX_DIR.mkdir(exist_ok=True)
-
-# Create a boto3 session with inline creds
-SESSION = boto3.Session(
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=REGION,
-)
-
-def get_client_id(filename: str) -> str:
-    """
-    Extract client id from a filename like:
-      ey_policy_of_ey1.pdf        -> ey
-      google_doc_policy-tm1.pdf   -> google
-    Rule: take everything before the first '_' if present, else before first '-', else the stem.
-    """
-    name = filename.lower()
-    if "_" in name:
-        return name.split("_")[0]
-    if "-" in name:
-        return name.split("-")[0]
-    return Path(name).stem
-
-def group_pdfs_by_client() -> Dict[str, List[Path]]:
-    buckets: Dict[str, List[Path]] = defaultdict(list)
-    # Only top-level PDFs in ./pdfs; add **/*.pdf if you want recursion
-    for p in PDFS_DIR.glob("*.pdf"):
-        client = get_client_id(p.name).strip()
-        if not client:
-            print(f"[skip] Could not parse client from {p.name}")
-            continue
-        buckets[client].append(p)
-    return buckets
-
-def build_one_client_index(client_id: str, pdf_paths: List[Path]):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1200, chunk_overlap=180, add_start_index=True
+# Centered logo
+if LOGO_PATH.exists():
+    st.markdown(
+        f"""
+        <div style="text-align:center;">
+            <img src="data:image/png;base64,{Path(LOGO_PATH).read_bytes().hex()}" 
+                 alt="Logo" width="200">
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-    all_chunks = []
-    for pdf in pdf_paths:
-        docs = PyPDFLoader(str(pdf)).load()
-        chunks = splitter.split_documents(docs)
-        for d in chunks:
-            d.metadata.update({
-                "client_id": client_id,
-                "policy_id": pdf.name,
-                "source_file": str(pdf),
-            })
-        all_chunks.extend(chunks)
 
-    emb = BedrockEmbeddings(
-        model_id=EMBED_MODEL,
-        client=SESSION.client("bedrock-runtime"),
-    )
-    vs = FAISS.from_documents(all_chunks, emb)
-    out = INDEX_DIR / client_id
-    out.mkdir(parents=True, exist_ok=True)
-    vs.save_local(str(out))
-    print(f"[ok] {client_id}: {len(all_chunks)} chunks → {out}")
+st.title("📄 Multi-Client Policy Assistant")
 
-def main():
-    buckets = group_pdfs_by_client()
-    if not buckets:
-        print("No PDFs found in ./pdfs (or parsing failed).")
-        return
-    for client_id, pdfs in buckets.items():
-        build_one_client_index(client_id, pdfs)
+# -------------------------
+# Sidebar only for client selection
+# -------------------------
+clients = sorted(CLIENT_CONFIGS.keys())
+if not clients:
+    st.error("No clients found in configs/clients.yaml")
+    st.stop()
 
-if __name__ == "__main__":
-    main()
+client_id = st.sidebar.selectbox("Choose a client", clients)
+
+# -------------------------
+# Chat Interface
+# -------------------------
+query = st.text_input("💬 Ask a question about the selected client’s policies:")
+
+if st.button("Ask"):
+    if not query.strip():
+        st.warning("Please enter a question.")
+    else:
+        with st.spinner("Thinking..."):
+            try:
+                resp = requests.post(
+                    BACKEND_URL,
+                    json={"client_id": client_id, "question": query},
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    st.success("Answer:")
+                    st.write(resp.json().get("answer", "No answer found."))
+                else:
+                    st.error(f"Backend error {resp.status_code}: {resp.text}")
+            except Exception as e:
+                st.error(f"Error contacting backend: {e}")
