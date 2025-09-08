@@ -1,72 +1,75 @@
 # streamlit_app.py
-import streamlit as st
+# Streamlit UI with logo centered, client picker, and query box.
+# No API URL input, no parameter display (params handled by backend).
+
+import os
+import time
 import requests
-from pathlib import Path
-import yaml
+import streamlit as st
 
-# -------------------------
-# Config
-# -------------------------
-BACKEND_URL = "http://localhost:8000/ask"   # hardcoded backend API
-CONFIG_PATH = Path("configs/clients.yaml")
-LOGO_PATH = Path("assets/logo.png")
+# Hardcode backend API URL
+API_URL = "http://localhost:8000"
 
-# Load per-client configs
-if CONFIG_PATH.exists():
-    with open(CONFIG_PATH, "r") as f:
-        CLIENT_CONFIGS = yaml.safe_load(f) or {}
-else:
-    CLIENT_CONFIGS = {}
+st.set_page_config(page_title="Client RAG Assistant", page_icon="📄", layout="centered")
 
-# -------------------------
-# UI Setup
-# -------------------------
-st.set_page_config(page_title="Client RAG Bot", page_icon=":robot_face:", layout="centered")
-
-# Centered logo
-if LOGO_PATH.exists():
+# Logo in center
+logo_path = "assets/logo.png"
+if os.path.exists(logo_path):
     st.markdown(
         f"""
-        <div style="text-align:center;">
-            <img src="data:image/png;base64,{Path(LOGO_PATH).read_bytes().hex()}" 
-                 alt="Logo" width="200">
+        <div style="text-align: center;">
+            <img src="data:image/png;base64,{open(logo_path, "rb").read().hex()}" width="180">
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-st.title("📄 Multi-Client Policy Assistant")
+st.title("Client-Scoped Policy Assistant")
 
-# -------------------------
-# Sidebar only for client selection
-# -------------------------
-clients = sorted(CLIENT_CONFIGS.keys())
-if not clients:
-    st.error("No clients found in configs/clients.yaml")
+# Fetch clients from backend
+try:
+    clients = requests.get(f"{API_URL}/clients", timeout=10).json()
+except Exception as e:
+    st.error(f"Could not reach backend: {e}")
     st.stop()
 
-client_id = st.sidebar.selectbox("Choose a client", clients)
+if not clients:
+    st.info("No clients found. Run the indexer and refresh.")
+    st.stop()
 
-# -------------------------
-# Chat Interface
-# -------------------------
-query = st.text_input("💬 Ask a question about the selected client’s policies:")
+client_id = st.selectbox("Choose client", clients, index=0)
 
-if st.button("Ask"):
-    if not query.strip():
-        st.warning("Please enter a question.")
-    else:
-        with st.spinner("Thinking..."):
-            try:
-                resp = requests.post(
-                    BACKEND_URL,
-                    json={"client_id": client_id, "question": query},
-                    timeout=60,
-                )
-                if resp.status_code == 200:
-                    st.success("Answer:")
-                    st.write(resp.json().get("answer", "No answer found."))
-                else:
-                    st.error(f"Backend error {resp.status_code}: {resp.text}")
-            except Exception as e:
-                st.error(f"Error contacting backend: {e}")
+# Inputs
+question = st.text_input("💬 Your question")
+must_contain = st.text_input("🔎 Keyword filter (optional)", placeholder="e.g., deductible, waiting period")
+
+if st.button("Ask") and question.strip():
+    with st.spinner("Thinking..."):
+        payload = {
+            "client_id": client_id,
+            "question": question,
+            "must_contain": must_contain or None,
+        }
+        try:
+            resp = requests.post(f"{API_URL}/ask", json=payload, timeout=120)
+            if resp.status_code != 200:
+                st.error(resp.text)
+            else:
+                data = resp.json()
+                # Simple type-out effect
+                placeholder = st.empty()
+                out = ""
+                for ch in data["answer"]:
+                    out += ch
+                    placeholder.markdown(out)
+                    time.sleep(0.003)
+
+                # Sources
+                if data.get("sources"):
+                    with st.expander("Sources"):
+                        for i, s in enumerate(data["sources"], start=1):
+                            st.markdown(
+                                f"**[{i}]** `{s.get('policy_id')}` — page **{s.get('page')}**  \n`{s.get('source_file')}`"
+                            )
+        except Exception as e:
+            st.error(f"Request failed: {e}")
