@@ -1,19 +1,17 @@
 # streamlit_app.py
-# Streamlit UI with logo, client picker, question + optional keyword filter.
-# Backend URL is hardcoded (no sidebar API input).
-# No active params shown in UI.
+# Minimal UI: centered logo, client picker, single question box, answer + sources.
+# No API URL input, no keyword filter shown.
 
 import time
 import requests
 import streamlit as st
 import os
 
-# Hardcode backend API URL
-API_URL = "http://localhost:8000"
+API_URL = "http://localhost:8000"  # backend FastAPI base
 
 st.set_page_config(page_title="Client RAG Assistant", page_icon="📄", layout="centered")
 
-# Logo
+# Centered logo
 logo_path = "assets/logo.png"
 if os.path.exists(logo_path):
     st.markdown(
@@ -40,16 +38,15 @@ if not clients:
 
 client_id = st.selectbox("Choose client", clients, index=0)
 
-# Inputs
+# Single input for question
 question = st.text_input("💬 Your question")
-must_contain = st.text_input("🔎 Keyword filter (optional)", placeholder="e.g., deductible, waiting period")
 
 if st.button("Ask") and question.strip():
     with st.spinner("Thinking..."):
         payload = {
             "client_id": client_id,
             "question": question,
-            "must_contain": must_contain or None,
+            # no 'must_contain' sent anymore
         }
         try:
             resp = requests.post(f"{API_URL}/ask", json=payload, timeout=120)
@@ -57,18 +54,20 @@ if st.button("Ask") and question.strip():
                 st.error(resp.text)
             else:
                 data = resp.json()
+
                 # simple type-out effect
                 placeholder = st.empty()
                 out = ""
-                for ch in data["answer"]:
+                for ch in data.get("answer", ""):
                     out += ch
                     placeholder.markdown(out)
                     time.sleep(0.003)
 
-                # Sources
-                if data.get("sources"):
+                # Sources (if provided)
+                sources = data.get("sources", [])
+                if sources:
                     with st.expander("Sources"):
-                        for i, s in enumerate(data["sources"], start=1):
+                        for i, s in enumerate(sources, start=1):
                             st.markdown(
                                 f"**[{i}]** `{s.get('policy_id')}` — page **{s.get('page')}**  \n`{s.get('source_file')}`"
                             )
