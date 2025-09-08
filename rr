@@ -1,5 +1,134 @@
-logo_path = "abc.jpg"  # put your file in the same folder as streamlit_app.py
-if os.path.exists(logo_path):
-    st.markdown("<div style='text-align: center;'>", unsafe_allow_html=True)
-    st.image(logo_path, width=180)
-    st.markdown("</div>", unsafe_allow_html=True)
+# index_clients.py
+# Build per-client FAISS indexes from a single ./pdfs/ folder.
+# Filenames like:
+#   ey_policy_of_ey1.pdf        -> client_id = "ey"
+#   google_doc_policy-tm1.pdf   -> client_id = "google"
+#
+# Per-client chunk settings are read from configs/clients.yaml:
+# ey:
+#   chunk_size: 1000
+#   chunk_overlap: 150
+# (Falls back to defaults if not set.)
+
+import os
+from pathlib import Path
+from collections import defaultdict
+from typing import List, Dict
+
+import yaml
+import boto3
+from langchain_aws import BedrockEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+
+# ---------- Hardcoded config ----------
+REGION = "us-east-1"
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+
+# ⚠️ Inline credentials (for local/dev only; prefer env/roles in prod)
+AWS_ACCESS_KEY_ID = "YOUR_ACCESS_KEY_ID"
+AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
+
+PDFS_DIR = Path("pdfs")
+INDEX_DIR = Path("faiss_indices")
+INDEX_DIR.mkdir(exist_ok=True)
+CONFIG_PATH = Path("configs/clients.yaml")
+
+# Defaults if a client has no chunk settings in YAML
+DEFAULT_CHUNK_SIZE = 1200
+DEFAULT_CHUNK_OVERLAP = 180
+
+# Create a boto3 session with inline creds
+SESSION = boto3.Session(
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=REGION,
+)
+
+def load_client_configs() -> Dict[str, Dict]:
+    """Load per-client settings from YAML (lowercase keys)."""
+    if not CONFIG_PATH.exists():
+        return {}
+    with open(CONFIG_PATH, "r") as f:
+        data = yaml.safe_load(f) or {}
+    # normalize keys to lowercase
+    return {str(k).lower(): (v or {}) for k, v in data.items()}
+
+CLIENT_CONFIGS = load_client_configs()
+
+def get_client_id(filename: str) -> str:
+    """
+    Extract client id from a filename like:
+      ey_policy_of_ey1.pdf        -> ey
+      google_doc_policy-tm1.pdf   -> google
+    Rule: part before first '_' if present, else before first '-', else stem.
+    """
+    name = filename.lower()
+    if "_" in name:
+        return name.split("_")[0]
+    if "-" in name:
+        return name.split("-")[0]
+    return Path(name).stem
+
+def group_pdfs_by_client() -> Dict[str, List[Path]]:
+    buckets: Dict[str, List[Path]] = defaultdict(list)
+    # Change to rglob("*.pdf") if you want recursive indexing
+    for p in PDFS_DIR.glob("*.pdf"):
+        client = get_client_id(p.name).strip()
+        if not client:
+            print(f"[skip] Could not parse client from {p.name}")
+            continue
+        buckets[client].append(p)
+    return buckets
+
+def build_one_client_index(client_id: str, pdf_paths: List[Path]):
+    # Per-client chunk settings from YAML (fallback to defaults)
+    cfg = CLIENT_CONFIGS.get(client_id, {})
+    chunk_size = int(cfg.get("chunk_size", DEFAULT_CHUNK_SIZE))
+    chunk_overlap = int(cfg.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP))
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        add_start_index=True,
+    )
+
+    all_chunks = []
+    for pdf in pdf_paths:
+        docs = PyPDFLoader(str(pdf)).load()
+        chunks = splitter.split_documents(docs)
+        for d in chunks:
+            # Fix page numbering to be human-friendly (start at 1 not 0)
+            d.metadata.update({
+                "client_id": client_id,
+                "policy_id": pdf.name,
+                "source_file": str(pdf),
+                "page": int(d.metadata.get("page", 0)) + 1,
+            })
+        all_chunks.extend(chunks)
+
+    if not all_chunks:
+        print(f"[warn] No chunks generated for client '{client_id}'")
+        return
+
+    emb = BedrockEmbeddings(
+        model_id=EMBED_MODEL,
+        client=SESSION.client("bedrock-runtime"),
+    )
+    vs = FAISS.from_documents(all_chunks, emb)
+    out = INDEX_DIR / client_id
+    out.mkdir(parents=True, exist_ok=True)
+    vs.save_local(str(out))
+    print(f"[ok] {client_id}: {len(all_chunks)} chunks (size={chunk_size}, overlap={chunk_overlap}) → {out}")
+
+def main():
+    buckets = group_pdfs_by_client()
+    if not buckets:
+        print("No PDFs found in ./pdfs (or parsing failed).")
+        return
+    for client_id, pdfs in buckets.items():
+        build_one_client_index(client_id, pdfs)
+
+if __name__ == "__main__":
+    main()
