@@ -1,0 +1,27 @@
+import os
+from pathlib import Path
+import re
+
+PDF_DIR = Path("pdfs")
+
+def get_client_id(filename: str) -> str:
+    """
+    Extract client id from a filename like:
+    ey_policy_of_ey1.pdf -> ey
+    google_doc_policy-tm1.pdf -> google
+    """
+    name = filename.lower()
+    # rule 1: everything before first underscore
+    if "_" in name:
+        return name.split("_")[0]
+    # rule 2: everything before first dash
+    if "-" in name:
+        return name.split("-")[0]
+    # fallback: strip extension
+    return Path(name).stem
+
+# Example run
+for f in os.listdir(PDF_DIR):
+    if f.endswith(".pdf"):
+        client = get_client_id(f)
+        print(f"{f} -> {client}")
