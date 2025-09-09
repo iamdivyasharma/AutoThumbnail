@@ -1,0 +1,450 @@
+# filtered_new_ui.py
+import json
+import uuid
+import hashlib
+import re
+import requests
+import streamlit as st
+from pathlib import Path
+from datetime import date
+
+# ================== Orchestrator endpoints ==================
+ORCH_BASE = "http://localhost:9000"      # change if deployed
+ROUTE_URL = f"{ORCH_BASE}/route_query"   # used for TDNA bootstrap only
+AGENT_URL = f"{ORCH_BASE}/agent_query"   # used for Apply/chat flows
+MEM_CLEAR = f"{ORCH_BASE}/memory/clear"
+TIMEOUT   = 30
+
+# ================== Example users ==================
+USERS = [
+    {"name": "Alice Singh",  "email": "alice@example.com"},
+    {"name": "Bob Kumar",    "email": "bob@example.com"},
+    {"name": "Charlie Rao",  "email": "charlie@example.com"},
+]
+
+# ================== Airports: options + labels ==================
+AIRPORT_LABELS = {
+    "DEL": "Delhi — Indira Gandhi Intl",
+    "BOM": "Mumbai — Chhatrapati Shivaji Maharaj Intl",
+    "BLR": "Bengaluru — Kempegowda Intl",
+    "MAA": "Chennai — Chennai Intl",
+    "HYD": "Hyderabad — Rajiv Gandhi Intl",
+    "CCU": "Kolkata — Netaji Subhas Chandra Bose Intl",
+    "PNQ": "Pune — Lohegaon",
+    "COK": "Kochi — Cochin Intl",
+    "GOI": "Goa — Dabolim",
+    "DXB": "Dubai — Dubai Intl",
+    "SIN": "Singapore — Changi",
+    "LHR": "London — Heathrow",
+    "JFK": "New York — John F. Kennedy Intl",
+    "SFO": "San Francisco — SFO",
+}
+ORIGIN_OPTIONS      = ["DEL","BLR","MAA","HYD","CCU","PNQ","COK","GOI","BOM","DXB","SIN","LHR","JFK","SFO"]
+DESTINATION_OPTIONS = ["BOM","DEL","BLR","CCU","MAA","HYD","COK","PNQ","GOI","DXB","SIN","LHR","JFK","SFO"]
+
+def label_for(code: str) -> str:
+    return f"{code} ({AIRPORT_LABELS.get(code, 'Unknown')})"
+
+# ================== Allowed dates (whitelists) ==================
+ALLOWED_START_DATES = ["2025-09-01", "2025-09-05", "2025-09-08", "2025-09-10", "2025-10-01"]
+ALLOWED_END_DATES   = ["2025-09-01", "2025-09-07", "2025-09-10", "2025-09-15", "2025-10-31", "2025-12-31"]
+
+def _iso_to_dates(xs):
+    return sorted(date.fromisoformat(x) if isinstance(x, str) else x for x in xs)
+
+START_WHITELIST = _iso_to_dates(ALLOWED_START_DATES)
+END_WHITELIST   = _iso_to_dates(ALLOWED_END_DATES)
+
+def _snap_to_allowed(chosen: date, allowed: list[date], *, direction="nearest", min_after: date | None = None) -> date:
+    if not allowed:
+        return chosen
+    xs = allowed
+    if min_after is not None:
+        xs = [d for d in xs if d >= min_after] or [allowed[-1]]
+    if direction == "up":
+        for d in xs:
+            if d >= chosen:
+                return d
+        return xs[-1]
+    if direction == "down":
+        for d in reversed(xs):
+            if d <= chosen:
+                return d
+        return xs[0]
+    return min(xs, key=lambda d: abs(d - chosen))
+
+# ================== Page config (Logo + Favicon) ==================
+LOGO_PATH    = Path("assets/logo.png")
+FAVICON_PATH = Path("assets/favicon.png")
+
+st.set_page_config(
+    page_title="Trip Planner — Orchestrator",
+    page_icon=str(FAVICON_PATH) if FAVICON_PATH.exists() else "🧭",
+    layout="centered",
+)
+
+# Top-centered logo + title
+if LOGO_PATH.exists():
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        st.image(str(LOGO_PATH), use_container_width=False)
+
+st.markdown("<h1 style='text-align:center'>💬 Trip Planner — Conversational Orchestrator</h1>", unsafe_allow_html=True)
+
+# ================== Helpers ==================
+def post(url: str, payload: dict):
+    r = requests.post(url, json=payload, timeout=TIMEOUT)
+    if r.headers.get("content-type","").startswith("application/json"):
+        return r.status_code, r.json()
+    return r.status_code, r.text
+
+def answer_sig(text: str, payload: dict) -> str:
+    blob = json.dumps({"t": text, "p": payload}, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+def ensure_state():
+    ss = st.session_state
+    if "messages" not in ss: ss.messages = []
+    if "session_id" not in ss: ss.session_id = "user123"
+    if "user_name" not in ss: ss.user_name = ""
+    if "user_email" not in ss: ss.user_email = ""
+    if "autonomy" not in ss: ss.autonomy = True
+    if "max_iters" not in ss: ss.max_iters = 3
+    if "filters" not in ss:
+        ss.filters = {
+            "ond": {"origin": ORIGIN_OPTIONS[0], "destination": DESTINATION_OPTIONS[0]},
+            "start_date": START_WHITELIST[0].isoformat(),
+            "end_date": END_WHITELIST[-1].isoformat(),
+        }
+    if "last_answer_hash" not in ss: ss.last_answer_hash = None
+
+    # TDNA bootstrap state
+    if "boot_tdna_home" not in ss: ss.boot_tdna_home = False
+    if "tdna_home_code" not in ss: ss.tdna_home_code = None
+    if "tdna_home_label" not in ss: ss.tdna_home_label = None
+    if "home_choice" not in ss: ss.home_choice = None
+    if "last_boot_user_key" not in ss: ss.last_boot_user_key = ""
+
+ensure_state()
+
+# === TDNA bootstrap helper ===
+DEFAULT_TDNA_QUESTION = "What is the home airport?"
+
+def _extract_home_airport(answer_text: str) -> tuple[str|None, str|None]:
+    """Pick CODEx from TDNA reply by IATA or fuzzy label match."""
+    if not isinstance(answer_text, str) or not answer_text.strip():
+        return None, None
+    # IATA direct matches
+    for code in ORIGIN_OPTIONS:
+        if re.search(rf"\b{re.escape(code)}\b", answer_text, re.IGNORECASE):
+            return code, label_for(code)
+    # fuzzy label match
+    lower = answer_text.lower()
+    for code, full in AIRPORT_LABELS.items():
+        # split on separators to find tokens
+        name_parts = re.split(r"[—\-(),]", full)
+        if any(p.strip().lower() and p.strip().lower() in lower for p in name_parts):
+            if code in ORIGIN_OPTIONS:
+                return code, label_for(code)
+    return None, None
+
+def _bootstrap_tdna_home(user_name: str, user_email: str, session_id: str):
+    """Call TDNA once to fetch home airport; map to allowed origins; set state."""
+    payload = {
+        "query": DEFAULT_TDNA_QUESTION,
+        "session_id": session_id,
+        "target": "tdna",
+        "extra": {"user_name": user_name.strip(), "user_email": user_email.strip(), "source": "tdna_boot"},
+    }
+    with st.status("Asking TDNA for home airport…", expanded=False) as s:
+        try:
+            status, data = post(ROUTE_URL, payload)
+            raw = ""
+            if isinstance(data, dict):
+                raw = data.get("answer", "") or data.get("final_answer", "") or ""
+            else:
+                raw = str(data)
+            s.update(label="TDNA responded", state="complete")
+        except Exception as e:
+            st.error(f"TDNA error: {e}")
+            st.session_state.boot_tdna_home = True
+            return
+    code, label = _extract_home_airport(raw)
+    st.session_state.tdna_home_code = code
+    st.session_state.tdna_home_label = label
+    st.session_state.boot_tdna_home = True
+
+# ================== Sidebar ==================
+with st.sidebar:
+    st.subheader("User")
+    user_labels = [f"{u['name']} <{u['email']}>" for u in USERS] + ["Other…"]
+    picked = st.selectbox("Choose a user", user_labels, index=0)
+    if picked != "Other…":
+        idx = user_labels.index(picked)
+        chosen = USERS[idx]
+        user_name_default = chosen["name"]
+        user_email_default = chosen["email"]
+    else:
+        user_name_default = ""
+        user_email_default = ""
+
+    st.session_state.user_name = st.text_input("Name", value=user_name_default, placeholder="e.g., Priya Sharma")
+    st.session_state.user_email = st.text_input("Email", value=user_email_default, placeholder="e.g., priya@company.com")
+
+    # detect user change -> reset bootstrap + choices
+    current_user_key = f"{st.session_state.user_name}|{st.session_state.user_email}"
+    if current_user_key != st.session_state.last_boot_user_key:
+        st.session_state.boot_tdna_home = False
+        st.session_state.home_choice = None
+        st.session_state.tdna_home_code = None
+        st.session_state.tdna_home_label = None
+        st.session_state.last_boot_user_key = current_user_key
+
+    st.markdown("---")
+    st.subheader("Session")
+    default_session = st.session_state.user_email or st.session_state.session_id
+    new_session_id = st.text_input("Session ID", value=default_session, key="sid_input")
+    if new_session_id != st.session_state.session_id:
+        st.session_state.session_id = new_session_id
+        st.session_state.boot_tdna_home = False
+        st.session_state.home_choice = None
+        st.session_state.tdna_home_code = None
+        st.session_state.tdna_home_label = None
+
+    col_a, col_b = st.columns(2)
+    if col_a.button("🆕 New Chat"):
+        sid = f"{(st.session_state.user_email or 'user')}-{uuid.uuid4().hex[:8]}"
+        st.session_state.session_id = sid
+        st.session_state.messages = []
+        st.session_state.boot_tdna_home = False
+        st.session_state.home_choice = None
+        st.session_state.tdna_home_code = None
+        st.session_state.tdna_home_label = None
+        st.success(f"New session id: {sid}")
+
+    if col_b.button("🧹 Clear Server Memory"):
+        try:
+            r = requests.post(MEM_CLEAR, json={"session_id": st.session_state.session_id}, timeout=TIMEOUT)
+            if r.status_code == 200:
+                st.success("Server memory cleared.")
+            else:
+                st.error(r.text)
+        except Exception as e:
+            st.error(f"Clear error: {e}")
+
+    st.markdown("---")
+    st.subheader("Mode")
+    st.caption("Agentic mode is enabled for all actions.")  # 🔒 only Agentic mode
+
+    st.markdown("---")
+    st.subheader("Agent Settings")
+    st.session_state.autonomy = st.checkbox("Enable Autonomy (agent loop)", value=st.session_state.autonomy)
+    st.session_state.max_iters = st.slider("Max Iterations", 1, 8, st.session_state.max_iters)
+
+# ============= Home-airport bootstrap =============
+if (st.session_state.user_name or st.session_state.user_email) and not st.session_state.boot_tdna_home:
+    _bootstrap_tdna_home(
+        user_name=st.session_state.user_name,
+        user_email=st.session_state.user_email,
+        session_id=st.session_state.session_id,
+    )
+
+# ========= Welcome + Branching =========
+def _home_welcome_block():
+    st.markdown(
+        f"### 👋 Welcome to Trip Planner!\n"
+        f"Do you want to plan your Trip from your Home location **“{st.session_state.tdna_home_label}”** "
+        f"or choose other origin options?"
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("✅ Yes — use my Home location", use_container_width=True):
+            st.session_state.home_choice = "home"
+            st.rerun()
+    with c2:
+        if st.button("🧭 Choose other origin options", use_container_width=True):
+            st.session_state.home_choice = "other"
+            st.rerun()
+
+def _call_agent_once(payload: dict, response_key: str = "final_answer"):
+    with st.status("Agent is planning your trip…", expanded=False) as s:
+        status, data = post(AGENT_URL, payload)
+        raw_answer = data.get(response_key, "") if isinstance(data, dict) else str(data)
+        s.update(label="Done", state="complete")
+    sig = answer_sig(str(raw_answer), payload)
+    if st.session_state.last_answer_hash != sig:
+        st.session_state.messages.append({"role": "assistant", "content": str(raw_answer)})
+        st.session_state.last_answer_hash = sig
+        st.rerun()
+
+# ========= Filters for "Home" branch (Destination + Dates only) =========
+def _filters_home_branch():
+    st.markdown("### 🔎 Filters\nChoose destination and dates you want to travel.")
+    # destination list excludes home origin
+    dest_code = st.selectbox(
+        "Destination",
+        options=[x for x in DESTINATION_OPTIONS if x != st.session_state.tdna_home_code],
+        index=0,
+        format_func=label_for,
+        key="dest_home_branch",
+    )
+    # whitelisted date pickers
+    start_default = _snap_to_allowed(START_WHITELIST[0], START_WHITELIST, direction="nearest")
+    end_default = _snap_to_allowed(END_WHITELIST[-1], END_WHITELIST, direction="up", min_after=start_default)
+    start_input = st.date_input("Start date", value=start_default, min_value=START_WHITELIST[0], max_value=START_WHITELIST[-1], format="YYYY-MM-DD", key="start_home_branch")
+    end_input   = st.date_input("End date",   value=end_default,   min_value=END_WHITELIST[0],   max_value=END_WHITELIST[-1],   format="YYYY-MM-DD", key="end_home_branch")
+
+    c1, _ = st.columns(2)
+    go = c1.button("Apply", use_container_width=True, key="apply_home_branch")
+    if go:
+        chosen_start = start_input if isinstance(start_input, date) else START_WHITELIST[0]
+        snapped_start = _snap_to_allowed(chosen_start, START_WHITELIST, direction="nearest")
+        chosen_end = end_input if isinstance(end_input, date) else END_WHITELIST[-1]
+        snapped_end = _snap_to_allowed(chosen_end, END_WHITELIST, direction="up", min_after=snapped_start)
+
+        origin = st.session_state.tdna_home_code
+        destination = dest_code
+        qtext = f"plan me a trip from {origin} to {destination} on {snapped_start.isoformat()} to {snapped_end.isoformat()}"
+
+        extra = {
+            "user_name": st.session_state.user_name.strip(),
+            "user_email": st.session_state.user_email.strip(),
+            "filters": {
+                "ond": {"origin": origin, "destination": destination},
+                "start_date": snapped_start.isoformat(),
+                "end_date": snapped_end.isoformat(),
+            },
+            "ui_version": "trip-planner-v3",
+            "source": "home_branch_apply",
+        }
+        payload = {
+            "query": qtext,
+            "session_id": st.session_state.session_id,
+            "autonomy": st.session_state.autonomy,
+            "max_iters": st.session_state.max_iters,
+            "extra": extra,
+        }
+        _call_agent_once(payload)
+
+# ========= Filters for "Other" branch (Origin + Destination + Dates) =========
+def _filters_other_branch():
+    st.markdown("### 🔎 Filters\nChoose origin, destination, and dates you want to travel.")
+    origin_code = st.selectbox(
+        "Origin",
+        options=ORIGIN_OPTIONS,
+        index=ORIGIN_OPTIONS.index(st.session_state.tdna_home_code) if st.session_state.tdna_home_code in ORIGIN_OPTIONS else 0,
+        format_func=label_for,
+        key="origin_other_branch",
+    )
+    dest_code = st.selectbox(
+        "Destination",
+        options=[x for x in DESTINATION_OPTIONS if x != origin_code],
+        index=0,
+        format_func=label_for,
+        key="dest_other_branch",
+    )
+    start_default = _snap_to_allowed(START_WHITELIST[0], START_WHITELIST, direction="nearest")
+    end_default = _snap_to_allowed(END_WHITELIST[-1], END_WHITELIST, direction="up", min_after=start_default)
+    start_input = st.date_input("Start date", value=start_default, min_value=START_WHITELIST[0], max_value=START_WHITELIST[-1], format="YYYY-MM-DD", key="start_other_branch")
+    end_input   = st.date_input("End date",   value=end_default,   min_value=END_WHITELIST[0],   max_value=END_WHITELIST[-1],   format="YYYY-MM-DD", key="end_other_branch")
+
+    c1, _ = st.columns(2)
+    go = c1.button("Apply", use_container_width=True, key="apply_other_branch")
+    if go:
+        if origin_code == dest_code:
+            st.error("Origin and Destination cannot be the same. Please change one and click Apply again.")
+            return
+
+        chosen_start = start_input if isinstance(start_input, date) else START_WHITELIST[0]
+        snapped_start = _snap_to_allowed(chosen_start, START_WHITELIST, direction="nearest")
+        chosen_end = end_input if isinstance(end_input, date) else END_WHITELIST[-1]
+        snapped_end = _snap_to_allowed(chosen_end, END_WHITELIST, direction="up", min_after=snapped_start)
+
+        qtext = f"plan me a trip from {origin_code} to {dest_code} on {snapped_start.isoformat()} to {snapped_end.isoformat()}"
+
+        extra = {
+            "user_name": st.session_state.user_name.strip(),
+            "user_email": st.session_state.user_email.strip(),
+            "filters": {
+                "ond": {"origin": origin_code, "destination": dest_code},
+                "start_date": snapped_start.isoformat(),
+                "end_date": snapped_end.isoformat(),
+            },
+            "ui_version": "trip-planner-v3",
+            "source": "other_branch_apply",
+        }
+        payload = {
+            "query": qtext,
+            "session_id": st.session_state.session_id,
+            "autonomy": st.session_state.autonomy,
+            "max_iters": st.session_state.max_iters,
+            "extra": extra,
+        }
+        _call_agent_once(payload)
+
+# ================== Flow rendering ==================
+if (st.session_state.user_name or st.session_state.user_email) and st.session_state.boot_tdna_home:
+    home_code = st.session_state.tdna_home_code
+    home_label = st.session_state.tdna_home_label
+    if home_code and home_label:
+        if st.session_state.home_choice is None:
+            _home_welcome_block()
+        elif st.session_state.home_choice == "home":
+            st.success(f"Using Home location: **{home_label}**")
+            _filters_home_branch()
+        else:
+            st.info("Choose your origin, destination, and dates below.")
+            _filters_other_branch()
+    else:
+        st.warning("Could not map a Home airport to your allowed origins. Please choose another origin.")
+        st.session_state.home_choice = "other"
+        _filters_other_branch()
+
+# ================== Chat transcript ==================
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+# ================== Chat input (optional free text) ==================
+prompt = st.chat_input("Type a message and press Enter… (or use the filters above)")
+if prompt:
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    extra = {
+        "user_name": st.session_state.user_name.strip(),
+        "user_email": st.session_state.user_email.strip(),
+        "filters": st.session_state.filters,  # may be stale; orchestrator also parses free text
+        "ui_version": "trip-planner-v3"
+    }
+
+    try:
+        payload = {
+            "query": prompt.strip(),
+            "session_id": st.session_state.session_id,
+            "autonomy": st.session_state.autonomy,
+            "max_iters": st.session_state.max_iters,
+            "extra": extra,
+        }
+        with st.chat_message("assistant"):
+            with st.status("Agent is planning your trip…", expanded=False) as s:
+                status, data = post(AGENT_URL, payload)
+                final_answer = data.get("final_answer", "") if isinstance(data, dict) else str(data)
+                s.update(label="Done", state="complete")
+            st.markdown(final_answer)
+
+        sig = answer_sig(final_answer, payload)
+        if st.session_state.last_answer_hash != sig:
+            st.session_state.messages.append({"role": "assistant", "content": final_answer})
+            st.session_state.last_answer_hash = sig
+
+    except Exception as e:
+        err = f"Request error: {e}"
+        with st.chat_message("assistant"):
+            st.error(err)
+        st.session_state.messages.append({"role": "assistant", "content": err})
+
+# footer
+st.markdown("---")
+st.caption("Trip Planner UI — TDNA bootstrap → Home/Other branch → (Destination/Origin) + Dates → Agent plan.")
