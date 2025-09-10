@@ -1,0 +1,247 @@
+# index_clients.py
+# Per-client FAISS indexer that SKIPS rebuilds unless something relevant changed.
+# Triggers rebuild if: chunk_size/chunk_overlap changed, embedding model/region changed,
+# or client PDFs changed (added/removed/modified). Stores a manifest per client.
+
+import os
+import json
+import time
+import argparse
+import hashlib
+from pathlib import Path
+from collections import defaultdict
+from typing import List, Dict, Any
+
+import yaml
+import boto3
+from langchain_aws import BedrockEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+
+# ---------- Hardcoded config ----------
+REGION = "us-east-1"
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+
+# ⚠️ Inline credentials (for local/dev only; prefer env/roles in prod)
+AWS_ACCESS_KEY_ID = "YOUR_ACCESS_KEY_ID"
+AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
+
+PDFS_DIR = Path("pdfs")
+INDEX_DIR = Path("faiss_indices")
+INDEX_DIR.mkdir(exist_ok=True)
+CONFIG_PATH = Path("configs/clients.yaml")
+
+# Defaults if a client has no chunk settings in YAML
+DEFAULT_CHUNK_SIZE = 1200
+DEFAULT_CHUNK_OVERLAP = 180
+
+# Manifest file name inside each client's index dir
+MANIFEST_NAME = "manifest.json"
+TOOL_VERSION = "index_clients_v2"
+
+# Create a boto3 session with inline creds
+SESSION = boto3.Session(
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=REGION,
+)
+
+# --------------------- config helpers ---------------------
+
+def load_client_configs() -> Dict[str, Dict[str, Any]]:
+    """Load per-client settings from YAML (lowercase keys)."""
+    if not CONFIG_PATH.exists():
+        return {}
+    with open(CONFIG_PATH, "r") as f:
+        data = yaml.safe_load(f) or {}
+    return {str(k).lower(): (v or {}) for k, v in data.items()}
+
+CLIENT_CONFIGS = load_client_configs()
+
+def get_client_id(filename: str) -> str:
+    """Extract client id from filename: before first '_' (else '-') (else stem)."""
+    name = filename.lower()
+    if "_" in name:
+        return name.split("_")[0]
+    if "-" in name:
+        return name.split("-")[0]
+    return Path(name).stem
+
+def group_pdfs_by_client(recursive: bool = False) -> Dict[str, List[Path]]:
+    buckets: Dict[str, List[Path]] = defaultdict(list)
+    pattern = "**/*.pdf" if recursive else "*.pdf"
+    for p in PDFS_DIR.glob(pattern):
+        if p.name.startswith("~$"):  # ignore temp files
+            continue
+        client = get_client_id(p.name).strip().lower()
+        if not client:
+            print(f"[skip] Could not parse client from {p.name}")
+            continue
+        buckets[client].append(p)
+    return buckets
+
+def client_index_dir(client_id: str) -> Path:
+    return INDEX_DIR / client_id.lower()
+
+def client_index_exists(client_id: str) -> bool:
+    out = client_index_dir(client_id)
+    return (out / "index.faiss").exists() and (out / "index.pkl").exists()
+
+# --------------------- change detection ---------------------
+
+def _file_fingerprint(p: Path, use_hash: bool = False) -> Dict[str, Any]:
+    """Lightweight fingerprint: size + mtime; optionally sha256 for stronger detection."""
+    info = {
+        "path": str(p).replace("\\", "/"),
+        "size": p.stat().st_size if p.exists() else None,
+        "mtime": int(p.stat().st_mtime) if p.exists() else None,
+    }
+    if use_hash and p.exists():
+        h = hashlib.sha256()
+        with p.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        info["sha256"] = h.hexdigest()
+    return info
+
+def _current_manifest(client_id: str, pdf_paths: List[Path], cfg: Dict[str, Any], use_hash: bool) -> Dict[str, Any]:
+    """Build the manifest describing the current intended index state."""
+    chunk_size = int(cfg.get("chunk_size", DEFAULT_CHUNK_SIZE))
+    chunk_overlap = int(cfg.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP))
+    return {
+        "tool_version": TOOL_VERSION,
+        "client_id": client_id,
+        "embed_model": EMBED_MODEL,
+        "region": REGION,
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "pdfs": [_file_fingerprint(p, use_hash=use_hash) for p in sorted(pdf_paths, key=lambda x: x.name)],
+    }
+
+def _load_existing_manifest(client_id: str) -> Dict[str, Any] | None:
+    mpath = client_index_dir(client_id) / MANIFEST_NAME
+    if not mpath.exists():
+        return None
+    try:
+        return json.loads(mpath.read_text())
+    except Exception:
+        return None
+
+def _manifests_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """Compare two manifests (ignore non-impact fields like created_at)."""
+    keys = ["tool_version", "client_id", "embed_model", "region", "chunk_size", "chunk_overlap", "pdfs"]
+    try:
+        return all(a.get(k) == b.get(k) for k in keys)
+    except Exception:
+        return False
+
+def needs_rebuild(client_id: str, pdf_paths: List[Path], cfg: Dict[str, Any], use_hash: bool) -> bool:
+    """Return True if index must be rebuilt for this client."""
+    if not client_index_exists(client_id):
+        return True
+    existing = _load_existing_manifest(client_id)
+    if existing is None:
+        return True
+    current = _current_manifest(client_id, pdf_paths, cfg, use_hash)
+    return not _manifests_equal(existing, current)
+
+def _write_manifest(client_id: str, manifest: Dict[str, Any]) -> None:
+    out = client_index_dir(client_id)
+    out.mkdir(parents=True, exist_ok=True)
+    manifest = dict(manifest)  # copy
+    manifest["created_at"] = int(time.time())
+    (out / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2))
+
+# --------------------- build ---------------------
+
+def build_one_client_index(client_id: str, pdf_paths: List[Path], *, force: bool, use_hash: bool):
+    cfg = CLIENT_CONFIGS.get(client_id, {})
+    chunk_size = int(cfg.get("chunk_size", DEFAULT_CHUNK_SIZE))
+    chunk_overlap = int(cfg.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP))
+
+    # Check if rebuild is needed
+    if not force and not needs_rebuild(client_id, pdf_paths, cfg, use_hash):
+        print(f"[skip] Up-to-date index for '{client_id}'")
+        return
+
+    # Build splitter
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        add_start_index=True,
+    )
+
+    # Load & split
+    all_chunks = []
+    for pdf in pdf_paths:
+        docs = PyPDFLoader(str(pdf)).load()
+        chunks = splitter.split_documents(docs)
+        for d in chunks:
+            # Human-friendly page numbers (start at 1)
+            d.metadata.update({
+                "client_id": client_id.lower(),
+                "policy_id": pdf.name,
+                "source_file": str(pdf),
+                "page": int(d.metadata.get("page", 0)) + 1,
+            })
+        all_chunks.extend(chunks)
+
+    if not all_chunks:
+        print(f"[warn] No chunks generated for client '{client_id}'")
+        return
+
+    # Embeddings
+    emb = BedrockEmbeddings(
+        model_id=EMBED_MODEL,
+        client=SESSION.client("bedrock-runtime"),
+    )
+
+    # Ensure output dir and clear old artifacts if rebuilding
+    out = client_index_dir(client_id)
+    out.mkdir(parents=True, exist_ok=True)
+    for f in out.glob("*"):
+        # Keep nothing; we'll re-write index.faiss/index.pkl/manifest.json
+        try:
+            f.unlink()
+        except Exception:
+            pass
+
+    # Build & save FAISS
+    vs = FAISS.from_documents(all_chunks, emb)
+    vs.save_local(str(out))
+
+    # Write new manifest
+    manifest = _current_manifest(client_id, pdf_paths, cfg, use_hash)
+    _write_manifest(client_id, manifest)
+
+    print(f"[ok] {client_id}: {len(all_chunks)} chunks (size={chunk_size}, overlap={chunk_overlap}) → {out}")
+
+# --------------------- CLI ---------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Build per-client FAISS indexes with change detection")
+    parser.add_argument("--force", action="store_true", help="Rebuild even if index appears up-to-date")
+    parser.add_argument("--recursive", action="store_true", help="Scan pdfs/ recursively")
+    parser.add_argument("--client", type=str, help="Build only this client_id (lowercase)")
+    parser.add_argument("--hash-pdfs", action="store_true", help="Use SHA256 to detect PDF content changes (slower but exact)")
+    args = parser.parse_args()
+
+    buckets = group_pdfs_by_client(recursive=args.recursive)
+    if not buckets:
+        print("No PDFs found in ./pdfs (or parsing failed).")
+        return
+
+    if args.client:
+        cid = args.client.strip().lower()
+        if cid not in buckets:
+            print(f"[error] No PDFs found for client '{cid}'")
+            return
+        build_one_client_index(cid, buckets[cid], force=args.force, use_hash=args.hash_pdfs)
+        return
+
+    for client_id, pdfs in buckets.items():
+        build_one_client_index(client_id, pdfs, force=args.force, use_hash=args.hash_pdfs)
+
+if __name__ == "__main__":
+    main()
