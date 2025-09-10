@@ -1,161 +1,38 @@
-# streamlit_app.py
-# Free-text query (auto-detect clients), answer on the left, scrollable PDF viewer on the right.
-# No client picker, no params/URL knobs; PDFs are shown when a source is clicked.
-
-import os
-import time
-import base64
+# app.py — add near other helpers
 from pathlib import Path
+from pypdf import PdfReader
 
-import requests
-import streamlit as st
+PDF_ROOT = (ROOT / "pdfs").resolve()
 
-API_URL = "http://localhost:8000"  # FastAPI backend base URL
-PDF_ROOT = Path("pdfs")            # where your PDFs live (paths from backend are relative to this)
+def _get_client_id_from_filename(filename: str) -> str:
+    name = filename.lower()
+    if "_" in name:
+        return name.split("_")[0]
+    if "-" in name:
+        return name.split("-")[0]
+    return Path(name).stem
 
-st.set_page_config(page_title="Contract Assistant", page_icon="📄", layout="wide")
+def _list_client_pdfs(client_id: str):
+    client = client_id.strip().lower()
+    pdfs = []
+    for p in PDF_ROOT.glob("*.pdf"):  # use rglob("*.pdf") if recursive
+        if _get_client_id_from_filename(p.name) == client:
+            try:
+                pages = len(PdfReader(str(p)).pages)
+            except Exception:
+                pages = None
+            pdfs.append({
+                "policy_id": p.name,
+                "source_file": str(p),
+                "pages": pages,
+                "client_id": client,
+            })
+    return sorted(pdfs, key=lambda x: x["policy_id"])
 
-# --- Logo (optional) ---
-logo_path = "abc.jpg"   # put your logo next to this file
-if os.path.exists(logo_path):
-    st.markdown("<div style='text-align:center;'>", unsafe_allow_html=True)
-    st.image(logo_path, width=160)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-st.title("Contract Assistant — Multi-Client with Document Viewer")
-
-# ---- Helpers ----
-@st.cache_data(show_spinner=False)
-def _pdf_to_data_uri(pdf_path: str) -> str:
-    """
-    Convert a local PDF file to a base64 data URI.
-    This lets us embed it in an <iframe> that scrolls.
-    """
-    p = Path(pdf_path)
-    if not p.exists():
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
-    data = p.read_bytes()
-    b64 = base64.b64encode(data).decode("utf-8")
-    return f"data:application/pdf;base64,{b64}"
-
-def _render_pdf(pdf_path: str, height: int = 820):
-    """
-    Renders a scrollable PDF viewer.
-    Note: data URIs are convenient but can be heavy for very large PDFs.
-    """
-    try:
-        data_uri = _pdf_to_data_uri(pdf_path)
-    except Exception as e:
-        st.error(f"Could not open PDF: {e}")
-        return
-    # Use an <iframe> so it's scrollable within the column
-    st.components.v1.html(
-        f"""<iframe src="{data_uri}" width="100%" height="{height}" style="border:none;"></iframe>""",
-        height=height + 8,
-        scrolling=True,
-    )
-
-def _resolve_source_path(source_file: str) -> str:
-    """
-    Backend returns something like 'pdfs/ey_policy.pdf'.
-    Resolve safely relative to project root; restrict to the 'pdfs' folder.
-    """
-    p = Path(source_file)
-    if not p.is_absolute():
-        p = Path.cwd() / p
-    # sanity: ensure it lives under PDF_ROOT
-    try:
-        p.relative_to(PDF_ROOT.resolve())
-    except Exception:
-        # If not under ./pdfs, still try to open; you can hard-enforce if you want
-        pass
-    return str(p)
-
-# ---- Layout: two columns (left: chat & sources, right: PDF viewer) ----
-left, right = st.columns([0.55, 0.45], gap="large")
-
-# Keep some state between clicks
-if "last_answer" not in st.session_state:
-    st.session_state.last_answer = ""
-if "last_sources" not in st.session_state:
-    st.session_state.last_sources = []
-if "used_clients" not in st.session_state:
-    st.session_state.used_clients = []
-if "selected_source_idx" not in st.session_state:
-    st.session_state.selected_source_idx = None
-
-with left:
-    question = st.text_input(
-        "Ask a question (mention client names in your text, e.g., 'EY', 'Bain', 'Google', 'KPMG'):"
-    )
-
-    if st.button("Ask"):
-        if not question.strip():
-            st.warning("Please enter a question.")
-        else:
-            with st.spinner("Thinking..."):
-                try:
-                    resp = requests.post(f"{API_URL}/ask", json={"question": question}, timeout=120)
-                    if resp.status_code != 200:
-                        st.error(resp.text)
-                    else:
-                        data = resp.json()
-                        st.session_state.used_clients = data.get("used_clients", [])
-                        st.session_state.last_sources = data.get("sources", [])
-                        st.session_state.selected_source_idx = None  # reset selection
-
-                        # "type out" the answer
-                        answer = data.get("answer", "")
-                        st.session_state.last_answer = ""  # reset
-                        placeholder = st.empty()
-                        buf = ""
-                        for ch in answer:
-                            buf += ch
-                            placeholder.markdown(buf)
-                            time.sleep(0.0015)
-                        st.session_state.last_answer = answer
-                except Exception as e:
-                    st.error(f"Request failed: {e}")
-
-    # Show last answer if present
-    if st.session_state.last_answer:
-        st.markdown("### Answer")
-        st.markdown(st.session_state.last_answer)
-
-    # Show detected clients
-    if st.session_state.used_clients:
-        st.caption(f"Detected client(s): {', '.join(st.session_state.used_clients)}")
-
-    # Clickable sources list
-    if st.session_state.last_sources:
-        st.markdown("### Sources (click to open)")
-        # Group sources by client for clarity
-        grouped = {}
-        for i, s in enumerate(st.session_state.last_sources):
-            client = (s.get("client_id") or "").lower()
-            grouped.setdefault(client, []).append((i, s))
-
-        for client, items in grouped.items():
-            with st.expander(f"Client: {client}", expanded=True):
-                for i, s in items:
-                    label = f"📄 {s.get('policy_id')} — page {s.get('page')}"
-                    # Each item has a button that sets selected index
-                    if st.button(label, key=f"srcbtn_{i}"):
-                        st.session_state.selected_source_idx = i
-
-with right:
-    st.markdown("### Document Viewer")
-    idx = st.session_state.selected_source_idx
-    if idx is None:
-        st.info("Select a source on the left to preview its PDF here.")
-    else:
-        sel = st.session_state.last_sources[idx]
-        pdf_path = _resolve_source_path(sel.get("source_file", ""))
-        st.caption(f"Showing: {sel.get('policy_id')} (page {sel.get('page')})")
-        _render_pdf(pdf_path, height=820)
-        # Optional: let user download the file as well
-        try:
-            p = Path(pdf_path)
-            st.download_button("Download PDF", data=p.read_bytes(), file_name=p.name)
-        except Exception:
-            pass
+@app.get("/clients/{client_id}/documents")
+def api_client_documents(client_id: str):
+    available = list_clients()
+    cid = client_id.strip().lower()
+    if cid not in available:
+        raise HTTPException(404, f"Unknown client_id '{client_id}'")
+    return _list_client_pdfs(cid)
