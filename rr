@@ -1,0 +1,207 @@
+# streamlit_app.py
+# Free-text Contract Assistant UI with a side-by-side PDF viewer.
+# - User types a question that mentions client names (e.g., "EY", "Bain").
+# - Backend (FastAPI) detects clients, retrieves only those indexes, and returns sources.
+# - UI shows the answer (left) and lets you click any source or any client PDF to preview (right).
+
+import os
+import time
+import base64
+from pathlib import Path
+import requests
+import streamlit as st
+
+# -------------------------
+# Config (no UI controls)
+# -------------------------
+API_URL = os.getenv("RAG_API_URL", "http://localhost:8000")  # backend base URL
+PDF_ROOT = Path("pdfs")  # local folder where PDFs live
+LOGO_PATH = "abc.jpg"    # your logo file, same folder as this script
+
+st.set_page_config(page_title="Contract Assistant", page_icon="📄", layout="wide")
+
+# -------------------------
+# Header with centered logo
+# -------------------------
+if os.path.exists(LOGO_PATH):
+    st.markdown("<div style='text-align:center;'>", unsafe_allow_html=True)
+    st.image(LOGO_PATH, width=160)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+st.title("Contract Assistant — Multi-Client with Document Viewer")
+
+# -------------------------
+# Small helpers
+# -------------------------
+def _resolve_source_path(source_file: str) -> str:
+    """
+    Backend returns paths like 'pdfs/bain_policy_2024.pdf'.
+    Resolve safely relative to current working directory.
+    """
+    p = Path(source_file)
+    if not p.is_absolute():
+        p = Path.cwd() / p
+    return str(p)
+
+@st.cache_data(show_spinner=False)
+def _pdf_to_data_uri(pdf_path: str) -> str:
+    """
+    Convert a local PDF to a base64 data URI for embedding in an iframe.
+    """
+    p = Path(pdf_path)
+    if not p.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    if p.suffix.lower() != ".pdf":
+        raise ValueError("Selected file is not a PDF.")
+    data = p.read_bytes()
+    b64 = base64.b64encode(data).decode("utf-8")
+    return f"data:application/pdf;base64,{b64}"
+
+def _render_pdf(pdf_path: str, height: int = 820):
+    """
+    Render a scrollable PDF viewer on the page via an iframe.
+    """
+    try:
+        data_uri = _pdf_to_data_uri(pdf_path)
+    except Exception as e:
+        st.error(f"Could not open PDF: {e}")
+        return
+    st.components.v1.html(
+        f"""<iframe src="{data_uri}" width="100%" height="{height}" style="border:none;"></iframe>""",
+        height=height + 8,
+        scrolling=True,
+    )
+
+def _fetch_all_docs_for_client(client_id: str):
+    """
+    Ask backend for all PDFs belonging to a client (not just retrieved sources).
+    Requires the `/clients/{client_id}/documents` endpoint in app.py.
+    """
+    try:
+        resp = requests.get(f"{API_URL}/clients/{client_id}/documents", timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.warning(f"Could not fetch docs for {client_id}: {e}")
+        return []
+
+# -------------------------
+# App state
+# -------------------------
+if "last_answer" not in st.session_state:
+    st.session_state.last_answer = ""
+if "last_sources" not in st.session_state:
+    st.session_state.last_sources = []
+if "used_clients" not in st.session_state:
+    st.session_state.used_clients = []
+if "client_docs" not in st.session_state:
+    st.session_state.client_docs = {}  # {client: [docs]}
+if "selected_pdf_path" not in st.session_state:
+    st.session_state.selected_pdf_path = None
+if "selected_label" not in st.session_state:
+    st.session_state.selected_label = None
+
+# -------------------------
+# Layout
+# -------------------------
+left, right = st.columns([0.55, 0.45], gap="large")
+
+with left:
+    question = st.text_input(
+        "Ask a question (mention client name(s) in your text, e.g., 'EY', 'Bain', 'KPMG', 'Google'):"
+    )
+
+    if st.button("Ask"):
+        if not question.strip():
+            st.warning("Please enter a question.")
+        else:
+            with st.spinner("Thinking..."):
+                try:
+                    resp = requests.post(f"{API_URL}/ask", json={"question": question}, timeout=120)
+                    if resp.status_code != 200:
+                        st.error(resp.text)
+                    else:
+                        data = resp.json()
+                        # Update session state from response
+                        st.session_state.used_clients = [c.lower() for c in data.get("used_clients", [])]
+                        st.session_state.last_sources = data.get("sources", [])
+                        st.session_state.selected_pdf_path = None
+                        st.session_state.selected_label = None
+
+                        # Type-out effect for the answer
+                        answer = data.get("answer", "")
+                        st.session_state.last_answer = ""
+                        placeholder = st.empty()
+                        buf = ""
+                        for ch in answer:
+                            buf += ch
+                            placeholder.markdown(buf)
+                            time.sleep(0.0015)
+                        st.session_state.last_answer = answer
+
+                        # Fetch "all documents" per client (browse list)
+                        st.session_state.client_docs = {}
+                        for c in st.session_state.used_clients:
+                            st.session_state.client_docs[c] = _fetch_all_docs_for_client(c)
+
+                except Exception as e:
+                    st.error(f"Request failed: {e}")
+
+    # Show last answer (if any)
+    if st.session_state.last_answer:
+        st.markdown("### Answer")
+        st.markdown(st.session_state.last_answer)
+
+    # Show detected clients
+    if st.session_state.used_clients:
+        st.caption(f"Detected client(s): {', '.join(st.session_state.used_clients)}")
+
+    # 1) Sources actually used for this answer (click to preview)
+    if st.session_state.last_sources:
+        st.markdown("### Sources (retrieved)")
+        grouped = {}
+        for i, s in enumerate(st.session_state.last_sources):
+            client = (s.get("client_id") or "").lower()
+            grouped.setdefault(client, []).append((i, s))
+
+        for client, items in grouped.items():
+            with st.expander(f"Client: {client}", expanded=True):
+                for i, s in items:
+                    # Skip anything that isn't a PDF (safety)
+                    src_path = _resolve_source_path(s.get("source_file", ""))
+                    if not str(src_path).lower().endswith(".pdf"):
+                        continue
+                    label = f"📄 {s.get('policy_id')} — page {s.get('page')}"
+                    if st.button(label, key=f"srcbtn_{client}_{i}"):
+                        st.session_state.selected_pdf_path = src_path
+                        st.session_state.selected_label = label
+
+    # 2) All documents for each detected client (browse everything)
+    if st.session_state.client_docs:
+        st.markdown("### All documents (browse)")
+        for client, docs in st.session_state.client_docs.items():
+            with st.expander(f"Client: {client}", expanded=False):
+                if not docs:
+                    st.caption("No PDFs found.")
+                for j, d in enumerate(docs):
+                    src_path = _resolve_source_path(d.get("source_file", ""))
+                    if not str(src_path).lower().endswith(".pdf"):
+                        continue
+                    pages = d.get("pages") or "?"
+                    label = f"📄 {d.get('policy_id')} ({pages} pages)"
+                    if st.button(label, key=f"alldoc_{client}_{j}"):
+                        st.session_state.selected_pdf_path = src_path
+                        st.session_state.selected_label = label
+
+with right:
+    st.markdown("### Document Viewer")
+    if st.session_state.selected_pdf_path and str(st.session_state.selected_pdf_path).lower().endswith(".pdf"):
+        st.caption(f"Showing: {st.session_state.selected_label or Path(st.session_state.selected_pdf_path).name}")
+        _render_pdf(st.session_state.selected_pdf_path, height=820)
+        try:
+            p = Path(st.session_state.selected_pdf_path)
+            st.download_button("Download PDF", data=p.read_bytes(), file_name=p.name)
+        except Exception:
+            pass
+    else:
+        st.info("Select a source or any document on the left to preview it here.")
