@@ -1,0 +1,108 @@
+# identity_ui.py
+# Minimal Streamlit page to choose a user and internally set:
+#   st.session_state.user_name
+#   st.session_state.user_email
+#   st.session_state.user_key  -> "Name (email)"
+# Optionally seeds st.session_state.session_id (if empty) with the email.
+#
+# Use this page alongside your other app pages; they can read the session state.
+
+import re
+from pathlib import Path
+import streamlit as st
+
+# ================== Example users (edit as needed) ==================
+USERS = [
+    {"name": "Alice Singh",  "email": "alice@example.com"},
+    {"name": "Bob Kumar",    "email": "bob@example.com"},
+    {"name": "Charlie Rao",  "email": "charlie@example.com"},
+]
+
+# ================== Page config (Logo + Favicon optional) ==================
+LOGO_PATH    = Path("assets/logo.png")
+FAVICON_PATH = Path("assets/favicon.png")
+
+st.set_page_config(
+    page_title="Identity Picker",
+    page_icon=str(FAVICON_PATH) if FAVICON_PATH.exists() else "👤",
+    layout="centered",
+)
+
+if LOGO_PATH.exists():
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        st.image(str(LOGO_PATH), use_container_width=False)
+
+st.markdown("<h1 style='text-align:center'>👤 Identity Picker</h1>", unsafe_allow_html=True)
+st.caption("Pick a user or enter custom details. This page sets session state for other pages to use.")
+
+# ================== Helpers ==================
+EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+def valid_email(e: str) -> bool:
+    return bool(EMAIL_RE.match(e.strip()))
+
+def build_user_key(name: str, email: str) -> str:
+    return f"{name.strip()} ({email.strip()})"
+
+# ================== Defaults in session (safe no-ops if already present) ==================
+ss = st.session_state
+ss.setdefault("user_name", "")
+ss.setdefault("user_email", "")
+ss.setdefault("user_key", "")
+ss.setdefault("session_id", "")
+
+# ================== UI ==================
+st.subheader("User")
+
+# Show options like "Name <email>"
+user_labels = ["— Select user —"] + [f"{u['name']} <{u['email']}>" for u in USERS] + ["Other…"]
+picked = st.selectbox("Choose a username", user_labels, index=0)
+
+# Determine default field values from selection
+if picked == "— Select user —":
+    default_name = ""
+    default_email = ""
+elif picked == "Other…":
+    default_name = ss.user_name or ""
+    default_email = ss.user_email or ""
+else:
+    idx = user_labels.index(picked) - 1
+    chosen = USERS[idx]
+    default_name = chosen["name"]
+    default_email = chosen["email"]
+
+# Inputs (enabled for Other… or when nothing selected)
+is_other = picked in ("— Select user —", "Other…")
+c1, c2 = st.columns(2)
+with c1:
+    name = st.text_input("Name", value=default_name, placeholder="e.g., Priya Sharma", disabled=not is_other)
+with c2:
+    email = st.text_input("Email", value=default_email, placeholder="e.g., priya@company.com", disabled=not is_other)
+
+# If a saved choice exists and user hit back, ensure fields reflect it
+if not is_other and (name != default_name or email != default_email):
+    name, email = default_name, default_email
+
+# ================== Apply ==================
+apply = st.button("Use this identity", type="primary", use_container_width=True)
+
+if apply:
+    if not name.strip():
+        st.error("Please enter a name.")
+    elif not valid_email(email):
+        st.error("Please enter a valid email address.")
+    else:
+        ss.user_name = name.strip()
+        ss.user_email = email.strip()
+        ss.user_key = build_user_key(ss.user_name, ss.user_email)  # ← "Name (email)"
+        # Seed session_id once if empty, so other pages can use it
+        if not ss.session_id:
+            ss.session_id = ss.user_email
+
+        st.success("Identity set for this session ✅")
+        st.caption(f"Stored: user_name, user_email, user_key, session_id")
+
+# ================== Tiny footer ==================
+st.markdown("---")
+st.caption("This page only sets session state. Your other pages can read it to build payloads as “Name (email)”.")
