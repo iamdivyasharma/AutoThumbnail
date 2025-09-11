@@ -1,24 +1,35 @@
-#add to app.py  app.py – include modified time in /clients/{client}/documents
-from datetime import datetime
+# at top:
+from pathlib import Path
 
-def _list_client_pdfs(client_id: str) -> List[Dict[str, Any]]:
-    """Return all PDF docs for a client with last-modified info (epoch + ISO)."""
-    client = client_id.strip().lower()
-    pdfs: List[Dict[str, Any]] = []
-    for p in PDF_ROOT.glob("*.pdf"):  # use rglob("*.pdf") if you have subfolders
-        if not p.is_file() or p.suffix.lower() != ".pdf" or p.name.startswith((".", "~$")):
-            continue
-        if _get_client_id_from_filename(p.name) == client:
-            stat = p.stat()
-            pages = get_pdf_page_count(str(p))
-            mtime_epoch = int(stat.st_mtime)
-            mtime_iso   = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
-            pdfs.append({
-                "policy_id": p.name,
-                "source_file": str(p.resolve()),  # absolute path (or keep your source_url too)
-                "pages": pages,
-                "client_id": client,
-                "modified_time": mtime_epoch,      # <-- new
-                "modified_iso": mtime_iso,         # <-- new (server local time)
-            })
-    return sorted(pdfs, key=lambda x: x["policy_id"])
+def get_pdf_page_count_local(path: str):
+    """Return page count for a local PDF path. Tries pypdf -> PyPDF2 -> PyMuPDF."""
+    try:
+        p = Path(path)
+        if not p.exists() or p.suffix.lower() != ".pdf":
+            return None
+
+        # Try pypdf
+        try:
+            from pypdf import PdfReader
+            return len(PdfReader(str(p)).pages)
+        except Exception:
+            pass
+
+        # Fallback: PyPDF2
+        try:
+            from PyPDF2 import PdfReader as P2Reader
+            return len(P2Reader(str(p)).pages)
+        except Exception:
+            pass
+
+        # Fallback: PyMuPDF
+        try:
+            import fitz
+            with fitz.open(str(p)) as doc:
+                return doc.page_count
+        except Exception:
+            pass
+
+        return None
+    except Exception:
+        return None
