@@ -1,8 +1,7 @@
-# streamlit_app.py
+# streamlit_app.py  11/09/25 (with links removed page wise)
 # Free-text Contract Assistant UI + side-by-side PDF viewer (streamlit-pdf-viewer).
-# - User types a question mentioning client(s). Backend detects clients (/ask).
-# - Answer renders once (no duplicates).
-# - Click any source or any client PDF to preview it inline on the right (pdf.js).
+# - Sources: plain list (policy + page), not clickable.
+# - "All documents (browse)": clickable; opens full PDF on the right.
 
 import os
 from pathlib import Path
@@ -10,10 +9,14 @@ from typing import Optional
 
 import requests
 import streamlit as st
-from streamlit_pdf_viewer import pdf_viewer  # <— pdf.js-based component
+from streamlit_pdf_viewer import pdf_viewer  # pdf.js-based component4
+from datetime import datetime
+from zoneinfo import ZoneInfo   # stdlib on Python 3.9+
+IST = ZoneInfo("Asia/Kolkata")  # display in IST
+
 
 API_URL   = os.getenv("RAG_API_URL", "http://localhost:8000")
-LOGO_PATH = "abc.jpg"  # optional logo next to this file
+LOGO_PATH = "abc.jpg"  # optional logo file next to this script
 
 st.set_page_config(page_title="Contract Assistant", page_icon="📄", layout="wide")
 
@@ -41,6 +44,10 @@ if "selected_label" not in st.session_state:
 if "selected_scroll_page" not in st.session_state:
     st.session_state.selected_scroll_page = None  # int | None
 
+     
+if "selected_modified" not in st.session_state:
+    st.session_state.selected_modified = None
+
 # ---------- Helpers ----------
 def _resolve_local(path_or_none: str) -> Optional[str]:
     if not path_or_none:
@@ -62,13 +69,12 @@ def _get_pdf_bytes(src: str, timeout: int = 25) -> bytes:
         return p.read_bytes()
 
 def _render_pdf(src: Optional[str], scroll_to_page: Optional[int] = None):
-    """Render selected PDF with streamlit-pdf-viewer (bytes to avoid CORS)."""
+    """Render selected PDF with streamlit-pdf-viewer (bytes to avoid CORS/popups)."""
     if not src:
-        st.info("Select a source or any document on the left to preview here.")
+        st.info("Select a document on the left to preview here.")
         return
     try:
         pdf_bytes = _get_pdf_bytes(src)
-        # Important: set width explicitly (component requirement inside columns/expanders)
         pdf_viewer(
             pdf_bytes,
             width="100%",
@@ -77,13 +83,23 @@ def _render_pdf(src: Optional[str], scroll_to_page: Optional[int] = None):
             viewer_align="center",
             show_page_separator=True,
             render_text=True,
-            scroll_to_page=scroll_to_page,  # 1-based page index
+            scroll_to_page=scroll_to_page,  # 1-based
             key=f"pdf_{hash((src, scroll_to_page))}"
         )
     except Exception as e:
         st.error(f"Could not display PDF: {e}")
-        if isinstance(src, str) and src.startswith(("http://", "https://")):
+        if src.startswith(("http://", "https://")):
             st.markdown(f"[Open in new tab]({src})")
+
+def _fmt_ist(ts: int | None) -> str | None:
+    """Format epoch seconds in IST."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts), IST).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+
 
 def _fetch_all_docs_for_client(client_id: str):
     try:
@@ -113,7 +129,7 @@ with left:
                         st.error(resp.text)
                     else:
                         data = resp.json()
-                        # Update state only; DO NOT render answer here (prevents duplicates)
+                        # Update state only; avoid rendering here to prevent duplicates
                         st.session_state.used_clients = [c.lower() for c in data.get("used_clients", [])]
                         st.session_state.sources = data.get("sources", [])
                         st.session_state.client_docs = {}
@@ -122,7 +138,7 @@ with left:
                         st.session_state.selected_scroll_page = None
                         st.session_state.answer = data.get("answer", "")
 
-                        # Preload full doc lists per detected client (browse)
+                        # Load "All documents" for each detected client
                         for c in st.session_state.used_clients:
                             st.session_state.client_docs[c] = _fetch_all_docs_for_client(c)
 
@@ -130,38 +146,24 @@ with left:
                 except Exception as e:
                     st.error(f"Request failed: {e}")
 
-    # Render the current answer ONCE (persists across button clicks)
+    # Render the current answer ONCE
     if st.session_state.answer:
         st.markdown("### Answer")
         st.markdown(st.session_state.answer)
+   
 
     if st.session_state.used_clients:
         st.caption(f"Detected client(s): {', '.join(st.session_state.used_clients)}")
 
-    # 1) Sources used for this answer
+    # ---- Sources: show-only (policy + page), NOT clickable ----
     if st.session_state.sources:
-        st.markdown("### Sources (retrieved)")
-        grouped = {}
-        for i, s in enumerate(st.session_state.sources):
-            client = (s.get("client_id") or "").lower()
-            grouped.setdefault(client, []).append((i, s))
+        with st.expander("Sources (retrieved)", expanded=True):
+            for i, s in enumerate(st.session_state.sources, start=1):
+                policy = s.get("policy_id")
+                page   = s.get("page")
+                st.markdown(f"**[{i}]** `{policy}` — page **{page}**")
 
-        for client, items in grouped.items():
-            with st.expander(f"Client: {client}", expanded=True):
-                for i, s in items:
-                    # prefer URL if available; else local path
-                    src = s.get("source_url") or _resolve_local(s.get("source_file", ""))
-                    if not src:
-                        continue
-                    page = s.get("page")  # already 1-based from your indexer
-                    label = f"📄 {s.get('policy_id')} — page {page}"
-                    if st.button(label, key=f"srcbtn_{client}_{i}"):
-                        st.session_state.selected_label = label
-                        st.session_state.selected_pdf_src = src
-                        st.session_state.selected_scroll_page = int(page) if isinstance(page, int) else None
-                        st.rerun()
-
-    # 2) All documents per detected client (browse)
+    # ---- All documents (browse): clickable; open full PDF in viewer ----
     if st.session_state.client_docs:
         st.markdown("### All documents (browse)")
         for client, docs in st.session_state.client_docs.items():
@@ -173,12 +175,38 @@ with left:
                     if not src:
                         continue
                     pages = d.get("pages") or "?"
-                    label = f"📄 {d.get('policy_id')} ({pages} pages)"
+                    mod_ist = _fmt_ist(d.get("modified_time"))
+                    # Label includes last modified in IST
+                    if mod_ist:
+                        label = f"📄 {d.get('policy_id')} ({pages} pages, modified {mod_ist} IST)"
+                    else:
+                        label = f"📄 {d.get('policy_id')} ({pages} pages)"
                     if st.button(label, key=f"alldoc_{client}_{j}"):
                         st.session_state.selected_label = label
                         st.session_state.selected_pdf_src = src
-                        st.session_state.selected_scroll_page = None
+                        st.session_state.selected_scroll_page = None  # full doc
+                        st.session_state.selected_modified = d.get("modified_time")
                         st.rerun()
+
+
+    # # ---- All documents (browse): clickable; open full PDF in viewer ----
+    # if st.session_state.client_docs:
+    #     st.markdown("### All documents (browse)")
+    #     for client, docs in st.session_state.client_docs.items():
+    #         with st.expander(f"Client: {client}", expanded=False):
+    #             if not docs:
+    #                 st.caption("No PDFs found.")
+    #             for j, d in enumerate(docs):
+    #                 src = d.get("source_url") or _resolve_local(d.get("source_file", ""))
+    #                 if not src:
+    #                     continue
+    #                 pages = d.get("pages") or "?"
+    #                 label = f"📄 {d.get('policy_id')} ({pages} pages)"
+    #                 if st.button(label, key=f"alldoc_{client}_{j}"):
+    #                     st.session_state.selected_label = label
+    #                     st.session_state.selected_pdf_src = src
+    #                     st.session_state.selected_scroll_page = None  # show full doc
+    #                     st.rerun()
 
 with right:
     st.markdown("### Document Viewer")
