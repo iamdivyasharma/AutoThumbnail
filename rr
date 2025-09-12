@@ -1,0 +1,33 @@
+# ragbot_api.py
+# Run: uvicorn ragbot_api:app --host 0.0.0.0 --port 8000
+# Expects Ragbot.py with: def tdna_answer(payload: dict) -> str
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+import Ragbot  # direct import, same folder
+
+app = FastAPI(title="Ragbot API", version="1.0.0", docs_url="/docs")
+
+class QueryPayload(BaseModel):
+    query: str = Field(..., min_length=1)
+    user_name: str = Field(..., min_length=1)
+    user_email: str = Field(..., min_length=3)
+    class Config:
+        extra = "forbid"  # reject unexpected keys
+
+class AnswerResponse(BaseModel):
+    answer: str
+
+@app.post("/ask", response_model=AnswerResponse)
+def ask(payload: QueryPayload):
+    clean = {
+        "query": payload.query.strip(),
+        "user_name": payload.user_name.strip(),
+        "user_email": payload.user_email.strip(),
+    }
+    try:
+        result = Ragbot.tdna_answer(clean)  # <-- your function
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ragbot error: {e}") from e
+
+    return {"answer": str(result)}
