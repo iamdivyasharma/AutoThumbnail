@@ -2,11 +2,10 @@
 # Streamlit Chatbot UI (single scrollable chat area + Path-based logo)
 # Run: streamlit run app.py
 
-import os
 import json
 from pathlib import Path
 from typing import List, Dict, Any
-
+import requests
 import streamlit as st
 
 # ----------------------------
@@ -18,6 +17,11 @@ USERS = [
     {"name": "Charlie Rao",  "email": "charlie@example.com"},
 ]
 NAME_TO_EMAIL = {u["name"]: u["email"] for u in USERS}
+
+# ----------------------------
+# Config: fixed API endpoint (no env vars)
+# ----------------------------
+API_URL = "http://localhost:8000/ask"  # FastAPI endpoint
 
 # ----------------------------
 # Per-user memory (JSON files)
@@ -49,42 +53,21 @@ def clear_memory(email: str) -> None:
         mp.unlink(missing_ok=True)
 
 # ----------------------------
-# Backend adapter
+# Backend call (HTTP only)
 # ----------------------------
 def query_backend(payload: Dict[str, Any]) -> str:
-    """
-    Tries local Ragbot.py first (get_answer/answer/query),
-    else POSTs to RAGBOT_URL if set, else returns a stub.
-    """
-    # Local module
     try:
-        import Ragbot  # Ragbot.py in same dir
-        for fn_name in ("get_answer", "answer", "query"):
-            fn = getattr(Ragbot, fn_name, None)
-            if callable(fn):
-                return str(fn(payload))
-    except Exception:
-        pass
-
-    # HTTP fallback
-    url = os.getenv("RAGBOT_URL", "").strip()
-    if url:
-        try:
-            import requests
-            r = requests.post(url, json=payload, timeout=60)
-            r.raise_for_status()
-            data = r.json()
-            return str(data.get("answer", data))
-        except Exception as e:
-            return f"⚠️ Backend error: {e}"
-
-    return "🔌 Backend not connected. Provide Ragbot.py or set RAGBOT_URL."
+        r = requests.post(API_URL, json=payload, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        return str(data.get("answer", data))
+    except Exception as e:
+        return f"⚠️ Backend error: {e}"
 
 # ----------------------------
 # Page config + CSS
 # ----------------------------
 st.set_page_config(page_title="User-Scoped Chatbot", page_icon="💬", layout="centered")
-
 st.markdown(
     """
     <style>
@@ -107,7 +90,7 @@ if "user_name" not in st.session_state:
 if "user_email" not in st.session_state:
     st.session_state.user_email = NAME_TO_EMAIL[st.session_state.user_name]
 if "messages_by_user" not in st.session_state:
-    st.session_state.messages_by_user = {}  # {email: [{"role": "...", "content": "..."}]}
+    st.session_state.messages_by_user = {}
 
 def ensure_loaded(email: str):
     if email not in st.session_state.messages_by_user:
@@ -135,10 +118,9 @@ with st.sidebar:
     st.caption("Per-user conversation history is saved in ./memory")
 
 # ----------------------------
-# Centered logo via Path("logo.jpg")
+# Centered logo via fixed Path("logo.jpg")
 # ----------------------------
-from pathlib import Path as _Path
-logopath = _Path("logo.jpg")  # <-- put logo.jpg in the same folder as app.py
+logopath = Path("logo.jpg")  # <--- exact requirement
 st.markdown('<div class="logo-wrap">', unsafe_allow_html=True)
 if logopath.exists():
     st.image(str(logopath), width=120)
@@ -163,7 +145,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
 # ----------------------------
-# Chat input (no extra chat output below!)
+# Chat input (no extra chat output below)
 # ----------------------------
 placeholder = f"Ask {st.session_state.user_name} a question…"
 query_text = st.chat_input(placeholder=placeholder)
@@ -189,14 +171,12 @@ if query_text:
     st.session_state.messages_by_user[st.session_state.user_email] = history
     save_memory(st.session_state.user_email, history)
 
-    # Rerun to render updated history in the single scrollable box
     st.rerun()
 
 # Footer note
 st.markdown(
     "<div class='chat-wrap'><hr/><small>"
-    "Payload sent to backend is exactly: <code>{'query', 'user_name', 'user_email'}</code>. "
-    "Provide <code>Ragbot.py</code> with <code>get_answer/answer/query</code> or set <code>RAGBOT_URL</code> for HTTP."
+    "Payload sent to backend is exactly: <code>{'query', 'user_name', 'user_email'}</code>."
     "</small></div>",
     unsafe_allow_html=True,
 )
