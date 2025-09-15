@@ -1,0 +1,110 @@
+def ragbot(payload):
+    """
+    payload (required): username, email, query
+    returns: {"answer": str, "sources": [str], "username": str, "email": str, "history_len": int}
+    """
+    # --- keep everything self-contained ---
+    import boto3
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+    from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+    from langchain.chains.combine_documents import create_stuff_documents_chain
+    from langchain_aws.chat_models import BedrockChat
+    from langchain_aws.embeddings import BedrockEmbeddings
+    from langchain_chroma import Chroma
+
+    # --- read required fields ---
+    username = (payload.get("username") or payload.get("user_name") or "").strip()
+    email = (payload.get("email") or "").strip()
+    query = (payload.get("query") or "").strip()
+    if not (username and email and query):
+        return {"error": "username, email, and query are required"}
+
+    # --- one-time setup (hardcoded creds + config) ---
+    if not hasattr(ragbot, "_boot"):
+        ragbot._boot = True
+
+        # 1) AWS Bedrock client (HARD-CODED KEYS HERE)
+        ragbot._bedrock = boto3.client(
+            service_name="bedrock-runtime",
+            region_name="us-east-1",                 # <-- your region
+            aws_access_key_id="AKIA...YOUR_KEY...",  # <-- put your key
+            aws_secret_access_key="YOUR_SECRET...",  # <-- put your secret
+            # aws_session_token="...",               # <-- only if using temporary creds
+        )
+
+        # 2) Models: Claude 3 Haiku + Titan embeddings (Bedrock)
+        ragbot._LLM = BedrockChat(
+            client=ragbot._bedrock,
+            model_id="anthropic.claude-3-haiku-20240307-v1:0",
+            temperature=0.1,
+        )
+        ragbot._EMB = BedrockEmbeddings(
+            client=ragbot._bedrock,
+            model_id="amazon.titan-embed-text-v2:0",
+        )
+
+        # 3) Vector store / retriever (assumes Chroma already has your docs)
+        ragbot._VSTORE = Chroma(
+            collection_name="ragbot",
+            embedding_function=ragbot._EMB,
+            persist_directory=".chroma",   # folder where your index lives
+        )
+        ragbot._RETR = ragbot._VSTORE.as_retriever(search_kwargs={"k": 4})
+
+        # 4) Prompts
+        ragbot._CONDENSE = ChatPromptTemplate.from_messages([
+            ("system", "Rewrite the latest user question into a standalone query using chat history. "
+                       "Do NOT answer; return only the rewritten query."),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ])
+        ragbot._QA = ChatPromptTemplate.from_messages([
+            ("system", "Use ONLY the provided context to answer. If not in context, say you don't know.\n\n"
+                       "CONTEXT:\n{context}"),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ])
+
+        # 5) Chains
+        ragbot._HARETR = create_history_aware_retriever(ragbot._LLM, ragbot._RETR, ragbot._CONDENSE)
+        ragbot._QACHN = create_stuff_documents_chain(llm=ragbot._LLM, prompt=ragbot._QA)
+        ragbot._RAG = create_retrieval_chain(ragbot._HARETR, ragbot._QACHN)
+
+        # 6) Per-(username,email) chat history (in-memory)
+        ragbot._HIST = {}      # key -> [HumanMessage, AIMessage, ...]
+        ragbot._MAX = 20       # keep last N turns
+
+    # --- per-identity history key ---
+    key = f"{username.lower()}|{email.lower()}"
+    chat_history = list(ragbot._HIST.get(key, []))
+
+    # --- run RAG with history-awareness ---
+    try:
+        result = ragbot._RAG.invoke({"input": query, "chat_history": chat_history})
+        answer = result.get("answer", "")
+        docs = result.get("context", []) or []
+
+        # save turn back into this identity's history
+        msgs = ragbot._HIST.setdefault(key, [])
+        msgs.extend([HumanMessage(content=query), AIMessage(content=answer)])
+        if len(msgs) > ragbot._MAX * 2:
+            ragbot._HIST[key] = msgs[-ragbot._MAX * 2:]
+
+        # simple sources list
+        sources, seen = [], set()
+        for d in docs:
+            meta = getattr(d, "metadata", {}) or {}
+            src = meta.get("source") or meta.get("url") or meta.get("path")
+            if src and src not in seen:
+                sources.append(src); seen.add(src)
+
+        return {
+            "username": username,
+            "email": email,
+            "answer": answer,
+            "sources": sources,
+            "history_len": len(ragbot._HIST.get(key, [])),
+        }
+    except Exception as e:
+        return {"username": username, "email": email, "error": f"{e}"}
