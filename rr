@@ -1,101 +1,182 @@
+# rag_simple.py
+# -------------------------------------------
+# Complete example: Ingest (Chroma or FAISS) + single-function ragbot(payload)
+# Uses AWS Bedrock: Claude 3 Haiku for LLM, Titan for embeddings
+# Per-(username,email) chat history (in-memory)
+# -------------------------------------------
+
+# ==== HARD-CODE YOUR AWS / MODEL CONFIG HERE ====
+AWS_ACCESS_KEY_ID     = "AKIA...YOUR_KEY..."
+AWS_SECRET_ACCESS_KEY = "YOUR_SECRET..."
+AWS_SESSION_TOKEN     = None  # if using temporary creds, put token here; else leave None
+AWS_REGION            = "us-east-1"
+
+CLAUDE_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
+TITAN_EMBED_ID  = "amazon.titan-embed-text-v2:0"
+
+# ==== CHOOSE YOUR VECTOR BACKEND ====
+# Set to "chroma" or "faiss"
+INDEX_BACKEND   = "chroma"
+
+# Paths / names for persistence
+CHROMA_DIR        = ".chroma"
+CHROMA_COLLECTION = "ragbot"
+FAISS_DIR         = "faiss_index"
+
+# -------------------------------------------
+# Imports shared by both ingest and ragbot
+import boto3
+
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+
+from langchain_aws.chat_models import BedrockChat
+from langchain_aws.embeddings import BedrockEmbeddings
+
+from langchain_chroma import Chroma
+from langchain_community.vectorstores import FAISS
+
+
+# -------------------------------------------
+# Bedrock clients / models (singletons)
+def _make_bedrock_client():
+    kwargs = {
+        "service_name": "bedrock-runtime",
+        "region_name": AWS_REGION,
+        "aws_access_key_id": AWS_ACCESS_KEY_ID,
+        "aws_secret_access_key": AWS_SECRET_ACCESS_KEY,
+    }
+    if AWS_SESSION_TOKEN:
+        kwargs["aws_session_token"] = AWS_SESSION_TOKEN
+    return boto3.client(**kwargs)
+
+_BEDROCK = _make_bedrock_client()
+_LLM     = BedrockChat(client=_BEDROCK, model_id=CLAUDE_MODEL_ID, temperature=0.1)
+_EMB     = BedrockEmbeddings(client=_BEDROCK, model_id=TITAN_EMBED_ID)
+
+
+# -------------------------------------------
+# ============== INGEST ONCE =================
+# Use the splitter during ingestion to chunk docs, then build the index.
+# Run one of the build_* functions below (only once), not at query time.
+
+def build_chroma_from_texts(texts):
+    """
+    Ingest 'texts' (list[str]) into a Chroma collection using Titan embeddings.
+    Persists to CHROMA_DIR.
+    """
+    docs = [Document(page_content=t, metadata={"source": f"doc_{i+1}"}) for i, t in enumerate(texts)]
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_documents(docs)
+
+    vs = Chroma.from_documents(
+        documents=chunks,
+        embedding=_EMB,
+        collection_name=CHROMA_COLLECTION,
+        persist_directory=CHROMA_DIR
+    )
+    vs.persist()
+    print(f"[INGEST] Chroma index built at {CHROMA_DIR} in collection '{CHROMA_COLLECTION}'.")
+
+
+def build_faiss_from_texts(texts):
+    """
+    Ingest 'texts' (list[str]) into a FAISS index using Titan embeddings.
+    Persists to FAISS_DIR.
+    """
+    docs = [Document(page_content=t, metadata={"source": f"doc_{i+1}"}) for i, t in enumerate(texts)]
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_documents(docs)
+
+    faiss = FAISS.from_documents(chunks, _EMB)
+    faiss.save_local(FAISS_DIR)
+    print(f"[INGEST] FAISS index saved to ./{FAISS_DIR}")
+
+
+# -------------------------------------------
+# ============== RAGBOT FUNCTION =============
+# payload requires only: username, email, query
+# History is tracked per (username, email).
+
 def ragbot(payload):
     """
-    payload (required): username, email, query
-    returns: {"answer": str, "sources": [str], "username": str, "email": str, "history_len": int}
+    payload (required): { "username": str, "email": str, "query": str }
+    returns: { "username", "email", "answer", "sources": [str], "history_len": int }
     """
-    # --- keep everything self-contained ---
-    import boto3
-    from langchain_core.messages import AIMessage, HumanMessage
-    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-    from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-    from langchain.chains.combine_documents import create_stuff_documents_chain
-    from langchain_aws.chat_models import BedrockChat
-    from langchain_aws.embeddings import BedrockEmbeddings
-    from langchain_chroma import Chroma
-
-    # --- read required fields ---
+    # ---- read payload
     username = (payload.get("username") or payload.get("user_name") or "").strip()
-    email = (payload.get("email") or "").strip()
-    query = (payload.get("query") or "").strip()
+    email    = (payload.get("email") or "").strip()
+    query    = (payload.get("query") or "").strip()
+
     if not (username and email and query):
         return {"error": "username, email, and query are required"}
 
-    # --- one-time setup (hardcoded creds + config) ---
+    # ---- one-time ragbot init (simple)
     if not hasattr(ragbot, "_boot"):
         ragbot._boot = True
+        ragbot._hist = {}   # per-identity messages
+        ragbot._cap  = 20   # keep last N turns
 
-        # 1) AWS Bedrock client (HARD-CODED KEYS HERE)
-        ragbot._bedrock = boto3.client(
-            service_name="bedrock-runtime",
-            region_name="us-east-1",                 # <-- your region
-            aws_access_key_id="AKIA...YOUR_KEY...",  # <-- put your key
-            aws_secret_access_key="YOUR_SECRET...",  # <-- put your secret
-            # aws_session_token="...",               # <-- only if using temporary creds
-        )
+        # Load the vector store chosen above
+        if INDEX_BACKEND.lower() == "chroma":
+            vstore = Chroma(
+                collection_name=CHROMA_COLLECTION,
+                embedding_function=_EMB,
+                persist_directory=CHROMA_DIR
+            )
+        elif INDEX_BACKEND.lower() == "faiss":
+            vstore = FAISS.load_local(
+                FAISS_DIR, _EMB, allow_dangerous_deserialization=True
+            )
+        else:
+            raise ValueError("INDEX_BACKEND must be 'chroma' or 'faiss'")
 
-        # 2) Models: Claude 3 Haiku + Titan embeddings (Bedrock)
-        ragbot._LLM = BedrockChat(
-            client=ragbot._bedrock,
-            model_id="anthropic.claude-3-haiku-20240307-v1:0",
-            temperature=0.1,
-        )
-        ragbot._EMB = BedrockEmbeddings(
-            client=ragbot._bedrock,
-            model_id="amazon.titan-embed-text-v2:0",
-        )
+        retriever = vstore.as_retriever(search_kwargs={"k": 4})
 
-        # 3) Vector store / retriever (assumes Chroma already has your docs)
-        ragbot._VSTORE = Chroma(
-            collection_name="ragbot",
-            embedding_function=ragbot._EMB,
-            persist_directory=".chroma",   # folder where your index lives
-        )
-        ragbot._RETR = ragbot._VSTORE.as_retriever(search_kwargs={"k": 4})
-
-        # 4) Prompts
-        ragbot._CONDENSE = ChatPromptTemplate.from_messages([
+        # Prompts
+        condense_prompt = ChatPromptTemplate.from_messages([
             ("system", "Rewrite the latest user question into a standalone query using chat history. "
                        "Do NOT answer; return only the rewritten query."),
             MessagesPlaceholder("chat_history"),
             ("human", "{input}"),
         ])
-        ragbot._QA = ChatPromptTemplate.from_messages([
+
+        qa_prompt = ChatPromptTemplate.from_messages([
             ("system", "Use ONLY the provided context to answer. If not in context, say you don't know.\n\n"
                        "CONTEXT:\n{context}"),
             MessagesPlaceholder("chat_history"),
             ("human", "{input}"),
         ])
 
-        # 5) Chains
-        ragbot._HARETR = create_history_aware_retriever(ragbot._LLM, ragbot._RETR, ragbot._CONDENSE)
-        ragbot._QACHN = create_stuff_documents_chain(llm=ragbot._LLM, prompt=ragbot._QA)
-        ragbot._RAG = create_retrieval_chain(ragbot._HARETR, ragbot._QACHN)
+        # Chains
+        ragbot._hist_aware_retriever = create_history_aware_retriever(_LLM, retriever, condense_prompt)
+        ragbot._qa_chain = create_stuff_documents_chain(llm=_LLM, prompt=qa_prompt)
+        ragbot._rag_chain = create_retrieval_chain(ragbot._hist_aware_retriever, ragbot._qa_chain)
 
-        # 6) Per-(username,email) chat history (in-memory)
-        ragbot._HIST = {}      # key -> [HumanMessage, AIMessage, ...]
-        ragbot._MAX = 20       # keep last N turns
-
-    # --- per-identity history key ---
+    # ---- identity history
     key = f"{username.lower()}|{email.lower()}"
-    chat_history = list(ragbot._HIST.get(key, []))
+    chat_history = list(ragbot._hist.get(key, []))
 
-    # --- run RAG with history-awareness ---
     try:
-        result = ragbot._RAG.invoke({"input": query, "chat_history": chat_history})
+        result = ragbot._rag_chain.invoke({"input": query, "chat_history": chat_history})
         answer = result.get("answer", "")
-        docs = result.get("context", []) or []
+        docs   = result.get("context", []) or []
 
-        # save turn back into this identity's history
-        msgs = ragbot._HIST.setdefault(key, [])
+        # save this turn
+        msgs = ragbot._hist.setdefault(key, [])
         msgs.extend([HumanMessage(content=query), AIMessage(content=answer)])
-        if len(msgs) > ragbot._MAX * 2:
-            ragbot._HIST[key] = msgs[-ragbot._MAX * 2:]
+        if len(msgs) > ragbot._cap * 2:
+            ragbot._hist[key] = msgs[-ragbot._cap * 2:]
 
-        # simple sources list
+        # collect simple sources
         sources, seen = [], set()
         for d in docs:
             meta = getattr(d, "metadata", {}) or {}
-            src = meta.get("source") or meta.get("url") or meta.get("path")
+            src  = meta.get("source") or meta.get("url") or meta.get("path")
             if src and src not in seen:
                 sources.append(src); seen.add(src)
 
@@ -104,7 +185,29 @@ def ragbot(payload):
             "email": email,
             "answer": answer,
             "sources": sources,
-            "history_len": len(ragbot._HIST.get(key, [])),
+            "history_len": len(ragbot._hist.get(key, [])),
         }
     except Exception as e:
         return {"username": username, "email": email, "error": f"{e}"}
+
+
+# -------------------------------------------
+# ============== DEMO (optional) =============
+# Run this file directly to build an index and try ragbot quickly.
+if __name__ == "__main__":
+    # --- 1) Ingest some sample texts ONCE (pick the backend you set above)
+    sample_texts = [
+        "Task decomposition is the process of breaking a complex task into smaller parts...",
+        "Common ways to do task decomposition include goal trees, hierarchical planning, and chain-of-thought..."
+    ]
+
+    if INDEX_BACKEND == "chroma":
+        build_chroma_from_texts(sample_texts)
+    else:
+        build_faiss_from_texts(sample_texts)
+
+    # --- 2) Query via ragbot (history-aware follow-up)
+    resp1 = ragbot({"username": "alice", "email": "alice@example.com", "query": "What is task decomposition?"})
+    print("Q1:", resp1["answer"])
+    resp2 = ragbot({"username": "alice", "email": "alice@example.com", "query": "What are common ways of doing it?"})
+    print("Q2:", resp2["answer"])
