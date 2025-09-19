@@ -1,78 +1,38 @@
-# ---- Robust client detection (drop-in) ----
 import re
+from pathlib import Path
 
-def _normalize_text(s: str) -> str:
-    # keep letters/digits/spaces; collapse whitespace
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", s.lower())).strip()
+def _norm_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 &]+", " ", s.lower())).strip()
 
-def _canon_compact(s: str) -> str:
-    # lower -> replace & with 'and' -> keep only letters/digits; drop spaces entirely
+def _compact(s: str) -> str:
     s = s.lower().replace("&", " and ")
-    s = re.sub(r"[^a-z0-9]+", "", s)
-    return s
+    return re.sub(r"[^a-z0-9]+", "", s)
 
-def _build_alias_map(available: list[str]) -> dict[str, dict]:
+def build_canon_map(overrides: dict) -> dict:
     """
-    Returns {client_id: {"aliases_norm": set([...]), "aliases_compact": set([...])}}
-    where:
-      - aliases_norm: normalized-with-spaces
-      - aliases_compact: same aliases but with spaces removed (to catch 'bmwus')
+    Map many alias spellings -> canonical YAML key.
+    Includes: key itself, aliases, '&' <-> 'and' variants, compact (no-space) forms.
     """
-    out = {}
-    for cid in available:
-        c = cid.strip().lower()
-        base_aliases = [c]
-        # bring in YAML aliases if present
-        for a in CLIENT_OVERRIDES.get(c, {}).get("aliases", []):
-            base_aliases.append(str(a).strip().lower())
-        # also add common '&' <-> 'and' swap automatically
-        more = []
-        for a in list(base_aliases):
+    m = {}
+    for key, cfg in (overrides or {}).items():
+        canon = str(key).strip().lower()
+        names = [canon] + [str(a).strip().lower() for a in cfg.get("aliases", [])]
+        extra = []
+        for a in list(names):
             if " & " in a:
-                more.append(a.replace(" & ", " and "))
+                extra.append(a.replace(" & ", " and "))
             if " and " in a:
-                more.append(a.replace(" and ", " & "))
-        base_aliases += more
+                extra.append(a.replace(" and ", " & "))
+        names += extra
+        for n in names:
+            m[_norm_spaces(n)] = canon
+            m[_compact(n)]     = canon
+    return m
 
-        aliases_norm = {_normalize_text(a) for a in base_aliases}
-        # compact (remove spaces/punct) to catch 'bmwus'
-        aliases_compact = {_canon_compact(a) for a in base_aliases}
+CANON_MAP = build_canon_map(OVERRIDES)
 
-        out[c] = {"aliases_norm": aliases_norm, "aliases_compact": aliases_compact}
-    return out
-
-def detect_clients_from_text(text: str, available: list[str]) -> list[str]:
-    norm_text = f" {_normalize_text(text)} "
-    compact_text = _canon_compact(text)
-    alias_map = _build_alias_map(available)
-
-    detected = []
-    # 1) exact-ish containment (spaces kept)
-    for cid, packs in alias_map.items():
-        if any(f" {a} " in norm_text for a in packs["aliases_norm"] if a):
-            detected.append(cid)
-
-    # 2) compact containment (no spaces) e.g., 'bmwus'
-    for cid, packs in alias_map.items():
-        if cid in detected:
-            continue
-        if any(a and a in compact_text for a in packs["aliases_compact"]):
-            detected.append(cid)
-
-    # 3) OPTIONAL: fuzzy typo tolerance (e.g., 'bwm us', 'erst & young')
-    #   pip install rapidfuzz
-    try:
-        from rapidfuzz import fuzz
-        for cid, packs in alias_map.items():
-            if cid in detected:
-                continue
-            score = max(
-                (fuzz.partial_ratio(a, compact_text) for a in packs["aliases_compact"] if a),
-                default=0
-            )
-            if score >= 90:  # tune 85–92
-                detected.append(cid)
-    except Exception:
-        pass
-
-    return detected
+def canonicalize_client_id(s: str) -> str:
+    """Return canonical YAML key if known; else a normalized fallback."""
+    n = _norm_spaces(s)
+    c = _compact(s)
+    return CANON_MAP.get(n) or CANON_MAP.get(c) or n
