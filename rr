@@ -1,38 +1,17 @@
-import re
-from pathlib import Path
+def client_from_filename(name: str) -> str:
+    # keep everything before first "__" or "_" or "-" (DON'T split on spaces)
+    stem = Path(name).stem
+    if "__" in stem:
+        head = stem.split("__", 1)[0]
+    else:
+        import re
+        head = re.split(r"[_-]", stem, maxsplit=1)[0]
+    return head.strip()
 
-def _norm_spaces(s: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 &]+", " ", s.lower())).strip()
-
-def _compact(s: str) -> str:
-    s = s.lower().replace("&", " and ")
-    return re.sub(r"[^a-z0-9]+", "", s)
-
-def build_canon_map(overrides: dict) -> dict:
-    """
-    Map many alias spellings -> canonical YAML key.
-    Includes: key itself, aliases, '&' <-> 'and' variants, compact (no-space) forms.
-    """
-    m = {}
-    for key, cfg in (overrides or {}).items():
-        canon = str(key).strip().lower()
-        names = [canon] + [str(a).strip().lower() for a in cfg.get("aliases", [])]
-        extra = []
-        for a in list(names):
-            if " & " in a:
-                extra.append(a.replace(" & ", " and "))
-            if " and " in a:
-                extra.append(a.replace(" and ", " & "))
-        names += extra
-        for n in names:
-            m[_norm_spaces(n)] = canon
-            m[_compact(n)]     = canon
-    return m
-
-CANON_MAP = build_canon_map(OVERRIDES)
-
-def canonicalize_client_id(s: str) -> str:
-    """Return canonical YAML key if known; else a normalized fallback."""
-    n = _norm_spaces(s)
-    c = _compact(s)
-    return CANON_MAP.get(n) or CANON_MAP.get(c) or n
+def group_by_client(paths: list[Path]) -> dict[str, list[Path]]:
+    buckets = {}
+    for p in paths:
+        raw = client_from_filename(p.name)       # e.g., "estee lau"
+        cid = canonicalize_client_id(raw)        # -> "estee" (from YAML) if configured
+        buckets.setdefault(cid, []).append(p)
+    return buckets
