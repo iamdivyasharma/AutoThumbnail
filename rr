@@ -1,17 +1,15 @@
-def client_from_filename(name: str) -> str:
-    # keep everything before first "__" or "_" or "-" (DON'T split on spaces)
-    stem = Path(name).stem
-    if "__" in stem:
-        head = stem.split("__", 1)[0]
-    else:
-        import re
-        head = re.split(r"[_-]", stem, maxsplit=1)[0]
-    return head.strip()
+# ---- Load per-client overrides from YAML (for aliases & optional chunking) ----
+from pathlib import Path
+import yaml
 
-def group_by_client(paths: list[Path]) -> dict[str, list[Path]]:
-    buckets = {}
-    for p in paths:
-        raw = client_from_filename(p.name)       # e.g., "estee lau"
-        cid = canonicalize_client_id(raw)        # -> "estee" (from YAML) if configured
-        buckets.setdefault(cid, []).append(p)
-    return buckets
+# Point this to your real file
+CONFIGS_PATH = Path("/ABS/PATH/TO/configs/clients.yaml").resolve()
+
+def load_yaml_overrides() -> dict:
+    if not CONFIGS_PATH.exists():
+        return {}
+    data = yaml.safe_load(CONFIGS_PATH.read_text()) or {}
+    # normalize keys to lowercase
+    return {str(k).strip().lower(): (v or {}) for k, v in data.items()}
+
+OVERRIDES = load_yaml_overrides()
