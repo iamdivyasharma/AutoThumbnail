@@ -1,62 +1,60 @@
 # index_clients.py
-# Build per-client FAISS indexes from PDFs stored in S3.
-# - Text PDFs -> PyPDFLoader
-# - Scanned PDFs -> Textract (async) on the S3 object, cached locally
-# - Saves FAISS locally under faiss_indices/<client>/
-# - Writes manifest.json per client for app.py to show "All documents"
+# Build per-client FAISS indexes from LOCAL ./pdfs folder.
+# - Text PDFs  -> PyPDFLoader
+# - Scanned    -> local OCR with pytesseract per page
+# Saves FAISS locally under faiss_indices/<client>/ and writes manifest.json
 
 import os
-import io
+import re
 import json
 import time
-import hashlib
+import shutil
 import argparse
-import re
 from pathlib import Path
 from collections import defaultdict
 from typing import List, Dict, Any
 
-import boto3
 import fitz  # PyMuPDF
+import pytesseract
+from PIL import Image
+
 from langchain_aws import BedrockEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain.schema import Document
 
-# ========= EDIT THESE =========
-REGION      = "us-east-1"
-S3_BUCKET   = "YOUR_BUCKET"        # <---- set your bucket
-S3_PREFIX   = "contracts/"         # <---- your "folder" in that bucket
+# ========= EDIT THESE ABSOLUTE PATHS =========
+PDF_ROOT  = Path("/ABS/PATH/TO/pdfs").resolve()           # <---- your local PDFs folder
+INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve()  # <---- where FAISS per-client folders go
+CONFIGS_PATH = Path("/ABS/PATH/TO/configs/clients.yaml").resolve()
+INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
-# Bedrock models
+# ========= AWS / Bedrock (for embeddings) =========
+REGION      = "us-east-1"
 EMBED_MODEL = "amazon.titan-embed-text-v2:0"
 
 # ⚠️ Dev creds (prefer IAM roles in prod)
 AWS_ACCESS_KEY_ID     = "YOUR_ACCESS_KEY_ID"
 AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
 
-# Local outputs
-INDEX_DIR  = Path("faiss_indices").resolve(); INDEX_DIR.mkdir(exist_ok=True)
-CACHE_DIR  = Path("ocr_cache").resolve();     CACHE_DIR.mkdir(exist_ok=True)
-TMP_DIR    = Path("tmp_dl").resolve();        TMP_DIR.mkdir(exist_ok=True)
-
-# Default chunking (can be overridden per client in configs/clients.yaml)
-DEFAULT_CHUNK_SIZE    = 1200
-DEFAULT_CHUNK_OVERLAP = 180
-
-CONFIGS_PATH = Path("configs/clients.yaml").resolve()
-# =============================
-
-SESSION  = boto3.Session(
+from boto3 import Session
+SESSION = Session(
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
     region_name=REGION,
 )
-S3       = SESSION.client("s3")
-TEXTRACT = SESSION.client("textract")
-EMB      = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
+EMB = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
 
+# ========= Chunking defaults (can be overridden per client in YAML) =========
+DEFAULT_CHUNK_SIZE    = 1200
+DEFAULT_CHUNK_OVERLAP = 180
+
+# ========= OCR config =========
+OCR_LANG = "eng"     # e.g., "eng+hin"
+OCR_DPI  = 300       # render dpi for OCR
+
+# ========= Utilities =========
 def load_yaml_overrides() -> Dict[str, Any]:
     if not CONFIGS_PATH.exists():
         return {}
@@ -79,40 +77,18 @@ def client_from_filename(name: str) -> str:
     first = re.split(r"[ _\-\.]+", base, maxsplit=1)[0]
     return first.strip()
 
-def list_s3_pdfs() -> List[Dict[str, Any]]:
-    """Return [{'key':..., 'size':..., 'last_modified': epoch, 'client_id':..., 'basename':...}]"""
-    out = []
-    token = None
-    while True:
-        kwargs = {"Bucket": S3_BUCKET, "Prefix": S3_PREFIX}
-        if token: kwargs["ContinuationToken"] = token
-        resp = S3.list_objects_v2(**kwargs)
-        for obj in resp.get("Contents", []):
-            key = obj["Key"]
-            if not key.lower().endswith(".pdf"): 
-                continue
-            base = Path(key).name
-            cid  = client_from_filename(base)
-            out.append({
-                "key": key,
-                "basename": base,
-                "client_id": cid,
-                "size": obj.get("Size"),
-                "last_modified": int(obj.get("LastModified").timestamp()) if obj.get("LastModified") else None,
-            })
-        if resp.get("IsTruncated"):
-            token = resp.get("NextContinuationToken")
-        else:
-            break
-    return out
+def list_local_pdfs() -> List[Path]:
+    return sorted([p for p in PDF_ROOT.rglob("*.pdf") if p.is_file()])
 
-def download_to_tmp(key: str) -> Path:
-    local = TMP_DIR / Path(key).name
-    with open(local, "wb") as f:
-        S3.download_fileobj(S3_BUCKET, key, f)
-    return local
+def group_by_client(paths: List[Path]) -> Dict[str, List[Path]]:
+    buckets: Dict[str, List[Path]] = defaultdict(list)
+    for p in paths:
+        cid = client_from_filename(p.name)
+        buckets[cid].append(p)
+    return buckets
 
 def has_text_first_pages(local_pdf: Path, sample_pages: int = 3) -> bool:
+    """Heuristic: if any of the first few pages has selectable text -> treat as text-PDF."""
     try:
         doc = fitz.open(str(local_pdf))
         n = min(sample_pages, doc.page_count)
@@ -123,90 +99,90 @@ def has_text_first_pages(local_pdf: Path, sample_pages: int = 3) -> bool:
     except Exception:
         return False
 
-def textract_cache_key(key: str) -> Path:
-    h = hashlib.sha1(key.encode()).hexdigest()[:10]
-    base = Path(key).name
-    return CACHE_DIR / f"{base}-{h}.textract.json"
+def ocr_page_with_tesseract(pdf_path: Path, page_index: int, dpi: int = OCR_DPI, lang: str = OCR_LANG):
+    """
+    Render a PDF page to an image, OCR with Tesseract, return:
+      - full page text (joined words by line)
+      - word boxes in PDF coordinate space (points), as [{text,x,y,width,height}, ...]
+    """
+    doc = fitz.open(str(pdf_path))
+    page = doc.load_page(page_index)
 
-def run_textract_on_s3(key: str) -> Dict[int, Dict[str, Any]]:
-    """StartDocumentTextDetection on S3 object, poll GetDocumentTextDetection, return {page:{text,lines[bbox]}}."""
-    start = TEXTRACT.start_document_text_detection(
-        DocumentLocation={"S3Object": {"Bucket": S3_BUCKET, "Name": key}}
-    )
-    job_id = start["JobId"]
-    pages: Dict[int, Dict[str, Any]] = {}
-    next_token = None
-    while True:
-        args = {"JobId": job_id}
-        if next_token: args["NextToken"] = next_token
-        resp = TEXTRACT.get_document_text_detection(**args)
-        status = resp["JobStatus"]
-        for b in resp.get("Blocks", []):
-            if b["BlockType"] == "LINE":
-                p = b.get("Page", 1)
-                pages.setdefault(p, {"text": [], "lines": []})
-                pages[p]["text"].append(b.get("Text", ""))
-                bb = b.get("Geometry", {}).get("BoundingBox", {})
-                pages[p]["lines"].append({
-                    "text": b.get("Text", ""),
-                    "bbox": [bb.get("Left",0.0), bb.get("Top",0.0), bb.get("Width",0.0), bb.get("Height",0.0)]
-                })
-        next_token = resp.get("NextToken")
-        if status in ("SUCCEEDED", "FAILED", "PARTIAL_SUCCESS") and not next_token:
-            break
-        time.sleep(2)
+    # Render to image
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)  # RGB
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
-    return {p: {"text": "\n".join(v["text"]), "lines": v["lines"]} for p, v in pages.items()}
+    # OCR words with bounding boxes (pixels)
+    data = pytesseract.image_to_data(img, lang=lang, output_type=pytesseract.Output.DICT)
 
-def load_or_cache_textract(key: str) -> Dict[int, Dict[str, Any]]:
-    cache = textract_cache_key(key)
-    if cache.exists():
-        return json.loads(cache.read_text(encoding="utf-8"))
-    data = run_textract_on_s3(key)
-    cache.write_text(json.dumps(data), encoding="utf-8")
-    return data
+    words = []
+    lines = {}  # line key -> [text tokens]
+    page_text_lines = []
 
-def per_page_documents_from_textract(local_pdf: Path, s3_key: str, client_id: str, policy_id: str) -> List[Document]:
-    """Build per-page Documents using Textract; include line boxes + page size for highlights."""
-    data = load_or_cache_textract(s3_key)
+    # Convert pixel boxes → PDF points
+    sx = page.rect.width / float(pix.width)
+    sy = page.rect.height / float(pix.height)
+
+    n = len(data.get("text", []))
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        if not txt:
+            continue
+        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+
+        words.append({
+            "text": txt,
+            "x": float(x) * sx,
+            "y": float(y) * sy,
+            "width": float(w) * sx,
+            "height": float(h) * sy,
+        })
+
+        key = (
+            data.get("block_num", [0])[i],
+            data.get("par_num",   [0])[i],
+            data.get("line_num",  [0])[i]
+        )
+        lines.setdefault(key, []).append(txt)
+
+    for _, tokens in sorted(lines.items(), key=lambda kv: kv[0]):
+        page_text_lines.append(" ".join(tokens))
+
+    return "\n".join(page_text_lines), words
+
+def per_page_documents_from_ocr(local_pdf: Path, client_id: str, policy_id: str) -> List[Document]:
+    """OCR each page with pytesseract and build per-page Documents (with OCR word boxes)."""
     docs: List[Document] = []
+    if not shutil.which("tesseract"):
+        print("[warn] Tesseract binary not found on PATH; skipping OCR.")
+        return docs
     try:
         doc = fitz.open(str(local_pdf))
-        for pnum, payload in sorted(data.items()):
-            text = (payload.get("text") or "").strip()
-            if not text: 
+        for pidx in range(doc.page_count):
+            text, words = ocr_page_with_tesseract(local_pdf, pidx, dpi=OCR_DPI, lang=OCR_LANG)
+            if not text.strip():
                 continue
-            page = doc.load_page(pnum - 1)
+            page = doc.load_page(pidx)
             docs.append(Document(
                 page_content=text,
                 metadata={
                     "client_id": client_id,
                     "policy_id": policy_id,
-                    "page": int(pnum),
-                    "source_s3_bucket": S3_BUCKET,
-                    "source_s3_key": s3_key,
-                    "textract_lines": payload.get("lines", []),
+                    "page": int(pidx + 1),  # 1-based
+                    "source_file": str(local_pdf.resolve()),
+                    "ocr_words": words,  # [{text,x,y,width,height}]
                     "page_width": float(page.rect.width),
                     "page_height": float(page.rect.height),
                 }
             ))
-        return docs
-    except Exception:
-        # fallback if we couldn't open PDF for sizes
-        return [Document(
-            page_content=(payload.get("text") or ""),
-            metadata={
-                "client_id": client_id,
-                "policy_id": policy_id,
-                "page": int(pnum),
-                "source_s3_bucket": S3_BUCKET,
-                "source_s3_key": s3_key,
-                "textract_lines": payload.get("lines", []),
-            }
-        ) for pnum, payload in sorted(data.items())]
+    except Exception as e:
+        print(f"[warn] OCR failed for {policy_id}: {e}")
+    return docs
 
-def per_page_documents_from_textpdf(local_pdf: Path, s3_key: str, client_id: str, policy_id: str) -> List[Document]:
-    """Use PyPDFLoader (keeps page numbers). Tag S3 info for viewer."""
+def per_page_documents_from_textpdf(local_pdf: Path, client_id: str, policy_id: str) -> List[Document]:
+    """Use PyPDFLoader (keeps page numbers)."""
     raw_docs = PyPDFLoader(str(local_pdf)).load()
     docs: List[Document] = []
     for d in raw_docs:
@@ -215,13 +191,17 @@ def per_page_documents_from_textpdf(local_pdf: Path, s3_key: str, client_id: str
             "client_id": client_id,
             "policy_id": policy_id,
             "page": int(md.get("page", 0)) + 1,   # 1-based
-            "source_s3_bucket": S3_BUCKET,
-            "source_s3_key": s3_key,
+            "source_file": str(local_pdf.resolve()),
         })
         docs.append(Document(page_content=d.page_content, metadata=md))
     return docs
 
-def build_client(client_id: str, s3_items: List[Dict[str, Any]]):
+def build_client(client_id: str, pdfs: List[Path], force: bool = False):
+    outdir = INDEX_DIR / client_id
+    if outdir.exists() and (outdir / "index.faiss").exists() and (outdir / "index.pkl").exists() and not force:
+        print(f"[skip] {client_id}: index already exists (use --force to rebuild).")
+        return
+
     # chunking (can be per-client in YAML)
     cfg = OVERRIDES.get(client_id, {})
     chunk_size    = int(cfg.get("chunk_size", DEFAULT_CHUNK_SIZE))
@@ -231,16 +211,13 @@ def build_client(client_id: str, s3_items: List[Dict[str, Any]]):
     all_chunks = []
     manifest_docs = []
 
-    for it in s3_items:
-        key       = it["key"]
-        basename  = it["basename"]
-        local_pdf = download_to_tmp(key)
-
+    for pdf in pdfs:
+        basename  = pdf.name
         # choose text vs OCR
-        if has_text_first_pages(local_pdf):
-            page_docs = per_page_documents_from_textpdf(local_pdf, key, client_id, basename)
+        if has_text_first_pages(pdf):
+            page_docs = per_page_documents_from_textpdf(pdf, client_id, basename)
         else:
-            page_docs = per_page_documents_from_textract(local_pdf, key, client_id, basename)
+            page_docs = per_page_documents_from_ocr(pdf, client_id, basename)
 
         # split + propagate metadata
         for d in page_docs:
@@ -250,26 +227,25 @@ def build_client(client_id: str, s3_items: List[Dict[str, Any]]):
                 md.setdefault("client_id", client_id)
                 md.setdefault("policy_id", basename)
                 md.setdefault("page", d.metadata.get("page"))
-                md.setdefault("source_s3_bucket", S3_BUCKET)
-                md.setdefault("source_s3_key", key)
-                if "textract_lines" in d.metadata: md["textract_lines"] = d.metadata["textract_lines"]
-                if "page_width" in d.metadata:     md["page_width"]     = d.metadata["page_width"]
-                if "page_height" in d.metadata:    md["page_height"]    = d.metadata["page_height"]
+                md.setdefault("source_file", str(pdf.resolve()))
+                if "ocr_words" in d.metadata:  md["ocr_words"] = d.metadata["ocr_words"]
+                if "page_width" in d.metadata: md["page_width"] = d.metadata["page_width"]
+                if "page_height" in d.metadata:md["page_height"] = d.metadata["page_height"]
                 c.metadata = md
                 all_chunks.append(c)
 
         # collect manifest info (page count & mtime)
         try:
-            pc = fitz.open(str(local_pdf)).page_count
+            pc = fitz.open(str(pdf)).page_count
         except Exception:
             pc = None
+        stat = pdf.stat()
         manifest_docs.append({
             "policy_id": basename,
-            "s3_bucket": S3_BUCKET,
-            "s3_key": key,
+            "source_file": str(pdf.resolve()),
             "pages": pc,
-            "modified_time": it.get("last_modified"),
-            "size": it.get("size"),
+            "modified_time": int(stat.st_mtime),
+            "size": stat.st_size,
         })
 
     if not all_chunks:
@@ -277,7 +253,6 @@ def build_client(client_id: str, s3_items: List[Dict[str, Any]]):
         return
 
     vs = FAISS.from_documents(all_chunks, EMB)
-    outdir = INDEX_DIR / client_id
     outdir.mkdir(parents=True, exist_ok=True)
     vs.save_local(str(outdir))
     # write manifest
@@ -293,27 +268,27 @@ def build_client(client_id: str, s3_items: List[Dict[str, Any]]):
     print(f"[ok] {client_id}: {len(all_chunks)} chunks → {outdir}")
 
 def main():
-    s3pdfs = list_s3_pdfs()
-    if not s3pdfs:
-        print("No PDFs in S3. Check bucket/prefix.")
+    paths = list_local_pdfs()
+    if not paths:
+        print(f"No PDFs found in {PDF_ROOT}")
         return
-    by_client = defaultdict(list)
-    for it in s3pdfs:
-        by_client[it["client_id"]].append(it)
+    buckets = group_by_client(paths)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--client", help="build only this client id")
+    parser.add_argument("--force", action="store_true", help="force rebuild even if index exists")
     args = parser.parse_args()
 
     if args.client:
         cid = args.client.lower().strip()
-        if cid not in by_client:
-            print(f"No items for client '{cid}'")
+        pdfs = buckets.get(cid, [])
+        if not pdfs:
+            print(f"No PDFs for client '{cid}' in {PDF_ROOT}")
             return
-        build_client(cid, by_client[cid])
+        build_client(cid, pdfs, force=args.force)
     else:
-        for cid, items in by_client.items():
-            build_client(cid, items)
+        for cid, pdfs in buckets.items():
+            build_client(cid, pdfs, force=args.force)
 
 if __name__ == "__main__":
     main()
