@@ -1,38 +1,38 @@
-# index_clients.py
-# Build per-client FAISS indexes from LOCAL ./pdfs folder.
-# - Text PDFs  -> PyPDFLoader
-# - Scanned    -> local OCR with pytesseract per page
-# Saves FAISS locally under faiss_indices/<client>/ and writes manifest.json
+# app.py
+# FastAPI backend:
+# - Free-text client detection (with aliases) + strict per-client retrieval
+# - Loads FAISS per client from local disk
+# - Yellow highlights from PyMuPDF exact search; fallback to OCR word boxes
+# - Lists local PDFs for "All documents" from the per-client manifest.json
+
+from __future__ import annotations
 
 import os
 import re
 import json
-import time
-import shutil
-import argparse
+import math
 from pathlib import Path
-from collections import defaultdict
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional
 
 import fitz  # PyMuPDF
-import pytesseract
-from PIL import Image
+import yaml
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-from langchain_aws import BedrockEmbeddings
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_aws import BedrockEmbeddings, ChatBedrockConverse
 from langchain_community.vectorstores import FAISS
-from langchain.schema import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 # ========= EDIT THESE ABSOLUTE PATHS =========
-PDF_ROOT  = Path("/ABS/PATH/TO/pdfs").resolve()           # <---- your local PDFs folder
-INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve()  # <---- where FAISS per-client folders go
-CONFIGS_PATH = Path("/ABS/PATH/TO/configs/clients.yaml").resolve()
-INDEX_DIR.mkdir(parents=True, exist_ok=True)
+PDF_ROOT        = Path("/ABS/PATH/TO/pdfs").resolve()
+FAISS_INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve()
+CONFIGS_PATH    = Path("/ABS/PATH/TO/configs/clients.yaml").resolve()
 
-# ========= AWS / Bedrock (for embeddings) =========
-REGION      = "us-east-1"
+# ========= AWS / Bedrock =========
+REGION = "us-east-1"
 EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
 
 # ⚠️ Dev creds (prefer IAM roles in prod)
 AWS_ACCESS_KEY_ID     = "YOUR_ACCESS_KEY_ID"
@@ -44,251 +44,343 @@ SESSION = Session(
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
     region_name=REGION,
 )
-EMB = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
 
-# ========= Chunking defaults (can be overridden per client in YAML) =========
-DEFAULT_CHUNK_SIZE    = 1200
-DEFAULT_CHUNK_OVERLAP = 180
+GLOBAL_DEFAULTS = {"k": 4, "temperature": 0.20, "max_tokens": 1200}
+MAX_COMBINED_K  = 12
 
-# ========= OCR config =========
-OCR_LANG = "eng"     # e.g., "eng+hin"
-OCR_DPI  = 300       # render dpi for OCR
+# Cache of FAISS stores
+_VS_CACHE: Dict[str, Any] = {}
+_STEP = 0
+MAX_LOADED = 5  # simple LRU: keep last N clients loaded
 
-# ========= Utilities =========
-def load_yaml_overrides() -> Dict[str, Any]:
+app = FastAPI(title="Contract RAG Backend")
+
+# ========= Models =========
+class AskRequest(BaseModel):
+    question: str
+    client_ids: Optional[List[str]] = None
+
+class AskResponse(BaseModel):
+    answer: str
+    used_clients: List[str]
+    sources: List[Dict[str, Any]]
+
+# ========= YAML / overrides =========
+def _load_overrides() -> Dict[str, Dict[str, Any]]:
     if not CONFIGS_PATH.exists():
         return {}
-    import yaml
     raw = yaml.safe_load(CONFIGS_PATH.read_text()) or {}
-    return {str(k).lower(): (v or {}) for k, v in raw.items()}
+    out: Dict[str, Dict[str, Any]] = {}
+    for k, v in raw.items():
+        if not isinstance(v, dict):
+            continue
+        ck = str(k).strip().lower()
+        out[ck] = {
+            "k": int(v.get("k", GLOBAL_DEFAULTS["k"])),
+            "temperature": float(v.get("temperature", GLOBAL_DEFAULTS["temperature"])),
+            "max_tokens": int(v.get("max_tokens", GLOBAL_DEFAULTS["max_tokens"])),
+            "aliases": [str(a).strip().lower() for a in v.get("aliases", [])],
+        }
+    return out
 
-OVERRIDES = load_yaml_overrides()
+CLIENT_OVERRIDES = _load_overrides()
+
+def list_clients() -> List[str]:
+    if not FAISS_INDEX_DIR.exists():
+        return []
+    clients = []
+    for p in FAISS_INDEX_DIR.iterdir():
+        if not p.is_dir() or p.name.startswith("."):
+            continue
+        if not (p / "index.faiss").exists() or not (p / "index.pkl").exists():
+            continue
+        clients.append(p.name)
+    return sorted(clients)
+
+def _load_index(client_id: str) -> FAISS:
+    """Load FAISS for a client with simple LRU cache."""
+    global _STEP
+    _STEP += 1
+    cid = client_id.strip().lower()
+    if cid in _VS_CACHE:
+        vs, _ = _VS_CACHE[cid]
+        _VS_CACHE[cid] = (vs, _STEP)
+        return vs
+    emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
+    vs = FAISS.load_local(str(FAISS_INDEX_DIR / cid), emb, allow_dangerous_deserialization=True)
+    _VS_CACHE[cid] = (vs, _STEP)
+    if len(_VS_CACHE) > MAX_LOADED:
+        oldest = min(_VS_CACHE.items(), key=lambda kv: kv[1][1])[0]
+        _VS_CACHE.pop(oldest, None)
+    return vs
+
+def choose_params(client_id: str) -> Dict[str, Any]:
+    return CLIENT_OVERRIDES.get(client_id.strip().lower(), GLOBAL_DEFAULTS.copy())
+
+# ========= Client detection from question =========
+def _normalize_text(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+def _build_alias_map(available: List[str]) -> Dict[str, str]:
+    alias_map: Dict[str, str] = {}
+    for cid in available:
+        c = cid.lower().strip()
+        alias_map[_normalize_text(c)] = c
+        for a in CLIENT_OVERRIDES.get(c, {}).get("aliases", []):
+            alias_map[_normalize_text(a)] = c
+    return alias_map
+
+def detect_clients_from_text(text: str, available: List[str]) -> List[str]:
+    norm_text = f" {_normalize_text(text)} "
+    alias_map = _build_alias_map(available)
+    detected: List[str] = []
+    for alias_norm, cid in sorted(alias_map.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if alias_norm and f" {alias_norm} " in norm_text:
+            if cid not in detected:
+                detected.append(cid)
+    return detected
+
+# ========= Prompt =========
+prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a precise, client-scoped contract assistant. Use ONLY the Provided Context. "
+     "Provide complete information related to the query—do not skip any part. "
+     "Cover relevant clauses, definitions, conditions, exceptions, limits, timelines, "
+     "eligibility, required documents, steps, and edge cases found in the context. "
+     "If the context is insufficient, say what is missing and that you don't know. "
+     "No citations or bracket labels."),
+    ("human",
+     "Question: {question}\n\nProvided Context:\n{context}\n\nWrite the best possible answer now.")
+])
+
+def _format_docs(docs) -> str:
+    return "\n\n".join(
+        f"(client: {d.metadata.get('client_id')}, policy: {d.metadata.get('policy_id')}, page: {d.metadata.get('page','?')})\n{d.page_content}"
+        for d in docs
+    )
+
+# ========= PDF helpers =========
+def get_pdf_page_count_local(path: str):
+    """Return page count for a local PDF path. Tries pypdf -> PyPDF2 -> PyMuPDF."""
+    try:
+        p = Path(path)
+        if not p.exists() or p.suffix.lower() != ".pdf":
+            return None
+        try:
+            from pypdf import PdfReader
+            return len(PdfReader(str(p)).pages)
+        except Exception:
+            pass
+        try:
+            from PyPDF2 import PdfReader as P2Reader
+            return len(P2Reader(str(p)).pages)
+        except Exception:
+            pass
+        try:
+            with fitz.open(str(p)) as doc:
+                return doc.page_count
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+
+# ========= Manifest / Documents =========
+@app.get("/clients")
+def api_list_clients() -> List[str]:
+    return list_clients()
+
+@app.get("/clients/{client_id}/documents")
+def api_client_documents(client_id: str):
+    cid = client_id.strip().lower()
+    manifest = (FAISS_INDEX_DIR / cid / "manifest.json")
+    docs = []
+    if manifest.exists():
+        data = json.loads(manifest.read_text())
+        for d in data.get("docs", []):
+            docs.append({
+                "policy_id": d.get("policy_id"),
+                "source_file": d.get("source_file"),
+                "pages": d.get("pages"),
+                "client_id": cid,
+                "modified_time": d.get("modified_time"),
+                "modified_iso": (None if not d.get("modified_time")
+                                 else __import__("datetime").datetime.fromtimestamp(d["modified_time"]).isoformat(timespec="seconds")),
+            })
+    else:
+        # fallback: scan PDF_ROOT
+        for p in PDF_ROOT.rglob("*.pdf"):
+            if client_from_filename(p.name) != cid:
+                continue
+            pages = get_pdf_page_count_local(str(p))
+            stat = p.stat()
+            docs.append({
+                "policy_id": p.name,
+                "source_file": str(p.resolve()),
+                "pages": pages,
+                "client_id": cid,
+                "modified_time": int(stat.st_mtime),
+                "modified_iso": __import__("datetime").datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+            })
+    return sorted(docs, key=lambda x: x["policy_id"])
 
 def client_from_filename(name: str) -> str:
-    """
-    Derive client_id from filename by taking the first token before space/_/-/.
-    'BMW US_policy1.2.pdf'   -> 'bmw'
-    'estee lau_plocuy67.pdf' -> 'estee'
-    'kpmg-benefits.pdf'      -> 'kpmg'
-    'ey_policy.pdf'          -> 'ey'
-    """
     base = Path(name).name.lower()
     base = Path(base).stem
     first = re.split(r"[ _\-\.]+", base, maxsplit=1)[0]
     return first.strip()
 
-def list_local_pdfs() -> List[Path]:
-    return sorted([p for p in PDF_ROOT.rglob("*.pdf") if p.is_file()])
+# ========= Highlights (PyMuPDF exact search + OCR word boxes fallback) =========
+from difflib import SequenceMatcher
 
-def group_by_client(paths: List[Path]) -> Dict[str, List[Path]]:
-    buckets: Dict[str, List[Path]] = defaultdict(list)
-    for p in paths:
-        cid = client_from_filename(p.name)
-        buckets[cid].append(p)
-    return buckets
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
-def has_text_first_pages(local_pdf: Path, sample_pages: int = 3) -> bool:
-    """Heuristic: if any of the first few pages has selectable text -> treat as text-PDF."""
+def _pick_phrases(answer: str, chunk_text: str, max_phrases: int = 3) -> list[str]:
+    ans = _norm(answer).lower()
+    phrases = []
+    sentences = re.split(r"[.\n]+", chunk_text or "")
+    for s in sentences:
+        s2 = _norm(s)
+        if len(s2) >= 30 and s2.lower() in ans:
+            phrases.append(s2[:180])
+            if len(phrases) >= max_phrases: return phrases
+    for s in sentences:
+        s2 = _norm(s)
+        if len(s2) >= 40 and SequenceMatcher(None, s2.lower(), ans).quick_ratio() >= 0.65:
+            phrases.append(s2[:180])
+            if len(phrases) >= max_phrases: return phrases
+    return phrases
+
+def _ann_from_pymupdf_file(local_pdf_path: str, page_num: int, phrases: list[str]) -> list[dict]:
+    ann = []
     try:
-        doc = fitz.open(str(local_pdf))
-        n = min(sample_pages, doc.page_count)
-        for i in range(n):
-            if doc.load_page(i).get_text("text").strip():
-                return True
-        return False
+        with fitz.open(local_pdf_path) as doc:
+            if page_num < 1 or page_num > doc.page_count:
+                return ann
+            page = doc.load_page(page_num - 1)
+            seen = set()
+            for phrase in phrases:
+                if len(_norm(phrase)) < 8:
+                    continue
+                for r in page.search_for(phrase):
+                    key = (round(r.x0,1), round(r.y0,1), round(r.width,1), round(r.height,1))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    ann.append({
+                        "page": page_num,
+                        "x": float(r.x0), "y": float(r.y0),
+                        "width": float(r.width), "height": float(r.height),
+                        "color": "yellow",
+                    })
+                    if len(ann) >= 30:
+                        return ann
     except Exception:
-        return False
+        pass
+    return ann
 
-def ocr_page_with_tesseract(pdf_path: Path, page_index: int, dpi: int = OCR_DPI, lang: str = OCR_LANG):
+def _ann_from_ocr_words(meta: dict, phrases: list[str]) -> list[dict]:
     """
-    Render a PDF page to an image, OCR with Tesseract, return:
-      - full page text (joined words by line)
-      - word boxes in PDF coordinate space (points), as [{text,x,y,width,height}, ...]
+    Highlight OCR words whose text appears in any of the selected phrases.
+    meta['ocr_words'] are in PDF points from the indexer.
     """
-    doc = fitz.open(str(pdf_path))
-    page = doc.load_page(page_index)
-
-    # Render to image
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)  # RGB
-    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-
-    # OCR words with bounding boxes (pixels)
-    data = pytesseract.image_to_data(img, lang=lang, output_type=pytesseract.Output.DICT)
-
-    words = []
-    lines = {}  # line key -> [text tokens]
-    page_text_lines = []
-
-    # Convert pixel boxes → PDF points
-    sx = page.rect.width / float(pix.width)
-    sy = page.rect.height / float(pix.height)
-
-    n = len(data.get("text", []))
-    for i in range(n):
-        txt = (data["text"][i] or "").strip()
-        if not txt:
+    ann = []
+    words = meta.get("ocr_words") or []
+    if not words:
+        return ann
+    want = [re.sub(r"\s+", " ", (p or "").lower()).strip() for p in phrases if p]
+    if not want:
+        return ann
+    for w in words:
+        t = str(w.get("text", "")).lower().strip()
+        if not t:
             continue
-        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        if any(t in ph for ph in want) and all(k in w for k in ("x","y","width","height")):
+            ann.append({
+                "page": int(meta.get("page") or 1),
+                "x": float(w["x"]), "y": float(w["y"]),
+                "width": float(w["width"]), "height": float(w["height"]),
+                "color": "yellow",
+            })
+        if len(ann) >= 60:
+            break
+    return ann
 
-        words.append({
-            "text": txt,
-            "x": float(x) * sx,
-            "y": float(y) * sy,
-            "width": float(w) * sx,
-            "height": float(h) * sy,
-        })
+# ========= Ask =========
+def _format_context(docs):
+    return _format_docs(docs)
 
-        key = (
-            data.get("block_num", [0])[i],
-            data.get("par_num",   [0])[i],
-            data.get("line_num",  [0])[i]
-        )
-        lines.setdefault(key, []).append(txt)
+@app.post("/ask", response_model=AskResponse)
+def ask(payload: AskRequest):
+    available = list_clients()
+    if not available:
+        raise HTTPException(404, "No client indexes available. Build indexes first.")
 
-    for _, tokens in sorted(lines.items(), key=lambda kv: kv[0]):
-        page_text_lines.append(" ".join(tokens))
-
-    return "\n".join(page_text_lines), words
-
-def per_page_documents_from_ocr(local_pdf: Path, client_id: str, policy_id: str) -> List[Document]:
-    """OCR each page with pytesseract and build per-page Documents (with OCR word boxes)."""
-    docs: List[Document] = []
-    if not shutil.which("tesseract"):
-        print("[warn] Tesseract binary not found on PATH; skipping OCR.")
-        return docs
-    try:
-        doc = fitz.open(str(local_pdf))
-        for pidx in range(doc.page_count):
-            text, words = ocr_page_with_tesseract(local_pdf, pidx, dpi=OCR_DPI, lang=OCR_LANG)
-            if not text.strip():
-                continue
-            page = doc.load_page(pidx)
-            docs.append(Document(
-                page_content=text,
-                metadata={
-                    "client_id": client_id,
-                    "policy_id": policy_id,
-                    "page": int(pidx + 1),  # 1-based
-                    "source_file": str(local_pdf.resolve()),
-                    "ocr_words": words,  # [{text,x,y,width,height}]
-                    "page_width": float(page.rect.width),
-                    "page_height": float(page.rect.height),
-                }
-            ))
-    except Exception as e:
-        print(f"[warn] OCR failed for {policy_id}: {e}")
-    return docs
-
-def per_page_documents_from_textpdf(local_pdf: Path, client_id: str, policy_id: str) -> List[Document]:
-    """Use PyPDFLoader (keeps page numbers)."""
-    raw_docs = PyPDFLoader(str(local_pdf)).load()
-    docs: List[Document] = []
-    for d in raw_docs:
-        md = dict(d.metadata)
-        md.update({
-            "client_id": client_id,
-            "policy_id": policy_id,
-            "page": int(md.get("page", 0)) + 1,   # 1-based
-            "source_file": str(local_pdf.resolve()),
-        })
-        docs.append(Document(page_content=d.page_content, metadata=md))
-    return docs
-
-def build_client(client_id: str, pdfs: List[Path], force: bool = False):
-    outdir = INDEX_DIR / client_id
-    if outdir.exists() and (outdir / "index.faiss").exists() and (outdir / "index.pkl").exists() and not force:
-        print(f"[skip] {client_id}: index already exists (use --force to rebuild).")
-        return
-
-    # chunking (can be per-client in YAML)
-    cfg = OVERRIDES.get(client_id, {})
-    chunk_size    = int(cfg.get("chunk_size", DEFAULT_CHUNK_SIZE))
-    chunk_overlap = int(cfg.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP))
-    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap, add_start_index=True)
-
-    all_chunks = []
-    manifest_docs = []
-
-    for pdf in pdfs:
-        basename  = pdf.name
-        # choose text vs OCR
-        if has_text_first_pages(pdf):
-            page_docs = per_page_documents_from_textpdf(pdf, client_id, basename)
-        else:
-            page_docs = per_page_documents_from_ocr(pdf, client_id, basename)
-
-        # split + propagate metadata
-        for d in page_docs:
-            parts = splitter.split_documents([d])
-            for c in parts:
-                md = dict(c.metadata)
-                md.setdefault("client_id", client_id)
-                md.setdefault("policy_id", basename)
-                md.setdefault("page", d.metadata.get("page"))
-                md.setdefault("source_file", str(pdf.resolve()))
-                if "ocr_words" in d.metadata:  md["ocr_words"] = d.metadata["ocr_words"]
-                if "page_width" in d.metadata: md["page_width"] = d.metadata["page_width"]
-                if "page_height" in d.metadata:md["page_height"] = d.metadata["page_height"]
-                c.metadata = md
-                all_chunks.append(c)
-
-        # collect manifest info (page count & mtime)
-        try:
-            pc = fitz.open(str(pdf)).page_count
-        except Exception:
-            pc = None
-        stat = pdf.stat()
-        manifest_docs.append({
-            "policy_id": basename,
-            "source_file": str(pdf.resolve()),
-            "pages": pc,
-            "modified_time": int(stat.st_mtime),
-            "size": stat.st_size,
-        })
-
-    if not all_chunks:
-        print(f"[warn] {client_id}: no chunks")
-        return
-
-    vs = FAISS.from_documents(all_chunks, EMB)
-    outdir.mkdir(parents=True, exist_ok=True)
-    vs.save_local(str(outdir))
-    # write manifest
-    (outdir / "manifest.json").write_text(json.dumps({
-        "client_id": client_id,
-        "region": REGION,
-        "embed_model": EMBED_MODEL,
-        "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
-        "docs": manifest_docs,
-        "updated_at": int(time.time()),
-    }, indent=2))
-    print(f"[ok] {client_id}: {len(all_chunks)} chunks → {outdir}")
-
-def main():
-    paths = list_local_pdfs()
-    if not paths:
-        print(f"No PDFs found in {PDF_ROOT}")
-        return
-    buckets = group_by_client(paths)
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--client", help="build only this client id")
-    parser.add_argument("--force", action="store_true", help="force rebuild even if index exists")
-    args = parser.parse_args()
-
-    if args.client:
-        cid = args.client.lower().strip()
-        pdfs = buckets.get(cid, [])
-        if not pdfs:
-            print(f"No PDFs for client '{cid}' in {PDF_ROOT}")
-            return
-        build_client(cid, pdfs, force=args.force)
+    # Determine clients
+    if payload.client_ids:
+        requested = sorted({c.strip().lower() for c in payload.client_ids})
     else:
-        for cid, pdfs in buckets.items():
-            build_client(cid, pdfs, force=args.force)
+        requested = detect_clients_from_text(payload.question, available)
+    if not requested:
+        raise HTTPException(400, f"No client detected in the question. Mention a client name (e.g., {', '.join(available[:5])} ...)")
 
-if __name__ == "__main__":
-    main()
+    invalid = [c for c in requested if c not in available]
+    if invalid:
+        raise HTTPException(404, f"Unknown client id(s): {invalid}. Available: {available}")
+
+    # Params merge
+    per_client_params = {c: choose_params(c) for c in requested}
+    temperature = min(p["temperature"] for p in per_client_params.values())
+    max_tokens  = max(p["max_tokens"]  for p in per_client_params.values())
+    n_clients   = len(requested)
+    per_cap     = max(1, math.ceil(MAX_COMBINED_K / n_clients))
+
+    # Retrieve
+    combined_docs = []
+    for cid in requested:
+        vs = _load_index(cid)
+        k_yaml      = per_client_params[cid]["k"]
+        k_effective = min(k_yaml, per_cap)
+        retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": k_effective})
+        docs = retriever.get_relevant_documents(payload.question)
+        # hard guard: keep only this client's docs
+        docs = [d for d in docs if str(d.metadata.get("client_id", "")).strip().lower() == cid]
+        combined_docs.extend(docs)
+
+    if not combined_docs:
+        raise HTTPException(404, f"No matching content for clients {requested}.")
+
+    if len(combined_docs) > MAX_COMBINED_K:
+        combined_docs = combined_docs[:MAX_COMBINED_K]
+
+    context = _format_context(combined_docs)
+    llm = ChatBedrockConverse(model_id=LLM_MODEL, client=SESSION.client("bedrock-runtime"),
+                              temperature=temperature, max_tokens=max_tokens)
+    chain = prompt | llm | StrOutputParser()
+    answer = chain.invoke({"question": payload.question, "context": context})
+
+    # Build sources + annotations (local files)
+    sources = []
+    for d in combined_docs:
+        meta = d.metadata
+        page_num = int(meta.get("page") or 1)
+        local_path = meta.get("source_file")
+
+        phrases = _pick_phrases(answer, d.page_content, max_phrases=3)
+
+        anns = []
+        if local_path:
+            anns = _ann_from_pymupdf_file(local_path, page_num, phrases)
+        if not anns and meta.get("ocr_words"):
+            anns = _ann_from_ocr_words(meta, phrases)
+
+        sources.append({
+            "policy_id": meta.get("policy_id"),
+            "page": page_num,
+            "client_id": meta.get("client_id"),
+            "source_file": local_path,
+            "annotations": anns,
+        })
+
+    return AskResponse(answer=answer, used_clients=requested, sources=sources)
