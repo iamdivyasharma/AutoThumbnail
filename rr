@@ -1,165 +1,20 @@
-# streamlit_app.py
-# Free-text Contract Assistant UI + side-by-side PDF viewer (streamlit-pdf-viewer).
-# - Sources: clickable "Open in viewer" (jumps to page + yellow highlights)
-# - All documents: clickable; opens full PDF
-# - No sidebar controls; centered logo; answer renders once
-
-import os
+import re
 from pathlib import Path
-from typing import Optional
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
-import requests
-import streamlit as st
-from streamlit_pdf_viewer import pdf_viewer  # pip install streamlit-pdf-viewer
-
-API_URL   = "http://localhost:8000"
-LOGO_PATH = "abc.jpg"   # optional logo file
-IST = ZoneInfo("Asia/Kolkata")
-
-st.set_page_config(page_title="Contract Assistant", page_icon="📄", layout="wide")
-
-# ---------- Header ----------
-if os.path.exists(LOGO_PATH):
-    st.markdown("<div style='text-align:center;'>", unsafe_allow_html=True)
-    st.image(LOGO_PATH, width=160)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-st.title("Contract Assistant — Multi-Client with Document Viewer")
-
-# ---------- State ----------
-if "answer" not in st.session_state: st.session_state.answer = ""
-if "used_clients" not in st.session_state: st.session_state.used_clients = []
-if "sources" not in st.session_state: st.session_state.sources = []
-if "client_docs" not in st.session_state: st.session_state.client_docs = {}   # {client: [docs]}
-if "selected_pdf_src" not in st.session_state: st.session_state.selected_pdf_src = None
-if "selected_label" not in st.session_state: st.session_state.selected_label = None
-if "selected_scroll_page" not in st.session_state: st.session_state.selected_scroll_page = None
-if "selected_annotations" not in st.session_state: st.session_state.selected_annotations = None
-
-# ---------- Helpers ----------
-def _resolve_local(path_or_none: str) -> Optional[str]:
-    if not path_or_none: return None
-    p = Path(path_or_none)
-    return str(p if p.is_absolute() else (Path.cwd() / p))
-
-@st.cache_data(show_spinner=False)
-def _get_pdf_bytes(src: str, timeout: int = 25) -> bytes:
-    # local-only path reading
-    p = Path(src)
-    if not p.exists():
-        raise FileNotFoundError(f"PDF not found: {src}")
-    return p.read_bytes()
-
-def _fmt_ist(ts: int | None) -> str | None:
-    if not ts: return None
-    try: return datetime.fromtimestamp(int(ts), IST).strftime("%Y-%m-%d %H:%M")
-    except Exception: return None
-
-def _fetch_all_docs_for_client(client_id: str):
-    try:
-        resp = requests.get(f"{API_URL}/clients/{client_id}/documents", timeout=20)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        st.warning(f"Could not fetch docs for {client_id}: {e}")
-        return []
-
-# ---------- Layout ----------
-left, right = st.columns([0.55, 0.45], gap="large")
-
-with left:
-    question = st.text_input("Ask a question (mention client name(s), e.g., 'EY', 'Bain', 'KPMG', 'BMW', 'Estee'):")
-
-    if st.button("Ask"):
-        if not question.strip():
-            st.warning("Please enter a question.")
-        else:
-            with st.spinner("Thinking..."):
-                try:
-                    resp = requests.post(f"{API_URL}/ask", json={"question": question}, timeout=120)
-                    if resp.status_code != 200:
-                        st.error(resp.text)
-                    else:
-                        data = resp.json()
-                        st.session_state.used_clients = [c.lower() for c in data.get("used_clients", [])]
-                        st.session_state.sources = data.get("sources", [])
-                        st.session_state.client_docs = {}
-                        st.session_state.selected_pdf_src = None
-                        st.session_state.selected_label = None
-                        st.session_state.selected_scroll_page = None
-                        st.session_state.selected_annotations = None
-                        st.session_state.answer = data.get("answer", "")
-
-                        for c in st.session_state.used_clients:
-                            st.session_state.client_docs[c] = _fetch_all_docs_for_client(c)
-
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"Request failed: {e}")
-
-    # Render answer ONCE
-    if st.session_state.answer:
-        st.markdown("### Answer")
-        st.markdown(st.session_state.answer)
-
-    if st.session_state.used_clients:
-        st.caption(f"Detected client(s): {', '.join(st.session_state.used_clients)}")
-
-    # ---- Sources (retrieved): clickable to open page + highlights ----
-    if st.session_state.sources:
-        st.markdown("### Sources (retrieved)")
-        for i, s in enumerate(st.session_state.sources, start=1):
-            policy = s.get("policy_id"); page = s.get("page")
-            src    = _resolve_local(s.get("source_file", ""))
-            anns   = s.get("annotations") or []
-            cols = st.columns([0.7, 0.3])
-            with cols[0]:
-                st.markdown(f"**[{i}]** `{policy}` — page **{page}**")
-            with cols[1]:
-                if st.button("Open in viewer", key=f"open_src_{i}"):
-                    st.session_state.selected_label = f"{policy} — page {page}"
-                    st.session_state.selected_pdf_src = src
-                    st.session_state.selected_scroll_page = int(page) if isinstance(page, int) else None
-                    st.session_state.selected_annotations = anns
-                    st.rerun()
-
-    # ---- All documents (browse): clickable; open full PDF ----
-    if st.session_state.client_docs:
-        st.markdown("### All documents (browse)")
-        for client, docs in st.session_state.client_docs.items():
-            with st.expander(f"Client: {client}", expanded=False):
-                if not docs:
-                    st.caption("No PDFs found.")
-                for j, d in enumerate(docs):
-                    src = _resolve_local(d.get("source_file", ""))
-                    if not src:
-                        continue
-                    pages = d.get("pages") or "?"
-                    mod_ist = _fmt_ist(d.get("modified_time"))
-                    label = f"📄 {d.get('policy_id')} ({pages} pages" + (f", modified {mod_ist} IST" if mod_ist else "") + ")"
-                    if st.button(label, key=f"alldoc_{client}_{j}"):
-                        st.session_state.selected_label = label
-                        st.session_state.selected_pdf_src = src
-                        st.session_state.selected_scroll_page = None
-                        st.session_state.selected_annotations = None
-                        st.rerun()
-
-with right:
-    st.markdown("### Document Viewer")
-    if st.session_state.selected_pdf_src:
-        st.caption(f"Showing: {st.session_state.selected_label or Path(str(st.session_state.selected_pdf_src)).name}")
-        try:
-            pdf_bytes = _get_pdf_bytes(st.session_state.selected_pdf_src)
-            pdf_viewer(
-                pdf_bytes,
-                width="100%", height=820, zoom_level="auto", viewer_align="center",
-                show_page_separator=True, render_text=True,
-                scroll_to_page=st.session_state.selected_scroll_page,
-                annotations=st.session_state.get("selected_annotations") or []
-            )
-        except Exception as e:
-            st.error(f"Could not display PDF: {e}")
+def client_from_filename(name: str) -> str:
+    """
+    Use everything before the first delimiter as client id.
+    Delimiters: '__' (preferred), '_' or '-'. Spaces are preserved.
+    Examples:
+      'BMW US_policy1.pdf'        -> 'bmw us'
+      'Ernst & Young--doc.pdf'    -> 'ernst & young'
+      'kpmg__benefits_2024.pdf'   -> 'kpmg'
+    """
+    stem = Path(name).stem  # drop .pdf
+    # prefer double-underscore if present
+    if "__" in stem:
+        head = stem.split("__", 1)[0]
     else:
-        st.info("Select a source or any document on the left to preview it here.")
+        # fall back to first _ or -; DO NOT split on spaces
+        head = re.split(r"[_-]", stem, maxsplit=1)[0]
+    return head.strip().lower()
