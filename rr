@@ -1,0 +1,78 @@
+# ---- Robust client detection (drop-in) ----
+import re
+
+def _normalize_text(s: str) -> str:
+    # keep letters/digits/spaces; collapse whitespace
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", s.lower())).strip()
+
+def _canon_compact(s: str) -> str:
+    # lower -> replace & with 'and' -> keep only letters/digits; drop spaces entirely
+    s = s.lower().replace("&", " and ")
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+def _build_alias_map(available: list[str]) -> dict[str, dict]:
+    """
+    Returns {client_id: {"aliases_norm": set([...]), "aliases_compact": set([...])}}
+    where:
+      - aliases_norm: normalized-with-spaces
+      - aliases_compact: same aliases but with spaces removed (to catch 'bmwus')
+    """
+    out = {}
+    for cid in available:
+        c = cid.strip().lower()
+        base_aliases = [c]
+        # bring in YAML aliases if present
+        for a in CLIENT_OVERRIDES.get(c, {}).get("aliases", []):
+            base_aliases.append(str(a).strip().lower())
+        # also add common '&' <-> 'and' swap automatically
+        more = []
+        for a in list(base_aliases):
+            if " & " in a:
+                more.append(a.replace(" & ", " and "))
+            if " and " in a:
+                more.append(a.replace(" and ", " & "))
+        base_aliases += more
+
+        aliases_norm = {_normalize_text(a) for a in base_aliases}
+        # compact (remove spaces/punct) to catch 'bmwus'
+        aliases_compact = {_canon_compact(a) for a in base_aliases}
+
+        out[c] = {"aliases_norm": aliases_norm, "aliases_compact": aliases_compact}
+    return out
+
+def detect_clients_from_text(text: str, available: list[str]) -> list[str]:
+    norm_text = f" {_normalize_text(text)} "
+    compact_text = _canon_compact(text)
+    alias_map = _build_alias_map(available)
+
+    detected = []
+    # 1) exact-ish containment (spaces kept)
+    for cid, packs in alias_map.items():
+        if any(f" {a} " in norm_text for a in packs["aliases_norm"] if a):
+            detected.append(cid)
+
+    # 2) compact containment (no spaces) e.g., 'bmwus'
+    for cid, packs in alias_map.items():
+        if cid in detected:
+            continue
+        if any(a and a in compact_text for a in packs["aliases_compact"]):
+            detected.append(cid)
+
+    # 3) OPTIONAL: fuzzy typo tolerance (e.g., 'bwm us', 'erst & young')
+    #   pip install rapidfuzz
+    try:
+        from rapidfuzz import fuzz
+        for cid, packs in alias_map.items():
+            if cid in detected:
+                continue
+            score = max(
+                (fuzz.partial_ratio(a, compact_text) for a in packs["aliases_compact"] if a),
+                default=0
+            )
+            if score >= 90:  # tune 85–92
+                detected.append(cid)
+    except Exception:
+        pass
+
+    return detected
