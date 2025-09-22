@@ -1,0 +1,349 @@
+# index_clients_s3_textract.py
+# Build per-client FAISS indexes from PDFs stored in an S3 bucket.
+# Uses AWS Textract (async) for OCR/text extraction on PDFs.
+# Saves FAISS locally under faiss_indices/<client>/ and writes manifest.json
+# (optional) uploads indices + manifest back to S3.
+
+import os
+import re
+import io
+import json
+import time
+import argparse
+from pathlib import Path
+from typing import List, Dict, Any, Tuple, Optional
+
+import boto3
+from botocore.config import Config as BotoConfig
+
+from langchain_aws import BedrockEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain.schema import Document
+
+# ========= EDIT THESE VALUES =========
+REGION       = "us-east-1"
+S3_BUCKET    = "YOUR_BUCKET_NAME"
+S3_PREFIX    = "pdfs/"              # where your PDFs live, e.g. pdfs/, inputs/, or "" for bucket root
+INDEX_DIR    = Path("/ABS/PATH/TO/faiss_indices").resolve()
+CONFIGS_PATH = Path("/ABS/PATH/TO/configs/clients.yaml").resolve()  # optional YAML for aliases + chunking
+UPLOAD_INDICES_TO_S3 = True         # set False to keep indices only local
+S3_INDEX_PREFIX      = "faiss_indices/"  # where to upload indices if UPLOAD_INDICES_TO_S3
+
+# ========= AWS / Bedrock (for embeddings) =========
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+
+# ⚠️ Dev creds (the user asked to avoid env vars). Replace placeholders with *your* keys.
+AWS_ACCESS_KEY_ID     = "REPLACE_WITH_YOUR_ACCESS_KEY_ID"
+AWS_SECRET_ACCESS_KEY = "REPLACE_WITH_YOUR_SECRET_ACCESS_KEY"
+
+# DO NOT CHECK REAL CREDENTIALS INTO VERSION CONTROL.
+
+# ========= Chunking defaults (can be overridden per client in YAML) =========
+DEFAULT_CHUNK_SIZE    = 1200
+DEFAULT_CHUNK_OVERLAP = 180
+
+# ========= Helpers: aliases & canonicalization =========
+
+def _norm_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 &]+", " ", s.lower())).strip()
+
+
+def _compact(s: str) -> str:
+    s = s.lower().replace("&", " and ")
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+def load_yaml_overrides() -> Dict[str, Any]:
+    if not CONFIGS_PATH.exists():
+        return {}
+    try:
+        import yaml
+    except Exception:
+        return {}
+    raw = yaml.safe_load(CONFIGS_PATH.read_text()) or {}
+    return {str(k).strip().lower(): (v or {}) for k, v in raw.items()}
+
+
+OVERRIDES = load_yaml_overrides()
+
+
+def build_canon_map(overrides: dict) -> dict:
+    m = {}
+    for key, cfg in (overrides or {}).items():
+        canon = str(key).strip().lower()
+        names = [canon] + [str(a).strip().lower() for a in cfg.get("aliases", [])]
+        extra = []
+        for a in list(names):
+            if " & " in a:
+                extra.append(a.replace(" & ", " and "))
+            if " and " in a:
+                extra.append(a.replace(" and ", " & "))
+        names += extra
+        for n in names:
+            m[_norm_spaces(n)] = canon
+            m[_compact(n)] = canon
+    return m
+
+
+CANON_MAP = build_canon_map(OVERRIDES)
+
+
+def canonicalize_client_id(s: str) -> str:
+    n = _norm_spaces(s)
+    c = _compact(s)
+    return CANON_MAP.get(n) or CANON_MAP.get(c) or n
+
+
+# ========= AWS clients =========
+
+BOTO_COMMON = dict(
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=REGION,
+)
+
+_session = boto3.Session(**BOTO_COMMON)
+s3 = _session.client("s3", config=BotoConfig(retries={"max_attempts": 10, "mode": "standard"}))
+textract = _session.client("textract", config=BotoConfig(retries={"max_attempts": 10, "mode": "standard"}))
+bedrock_rt = _session.client("bedrock-runtime", config=BotoConfig(retries={"max_attempts": 10, "mode": "standard"}))
+EMB = BedrockEmbeddings(model_id=EMBED_MODEL, client=bedrock_rt)
+
+INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+# ========= S3 PDF discovery =========
+
+def list_s3_pdfs(bucket: str, prefix: str) -> List[str]:
+    keys: List[str] = []
+    token: Optional[str] = None
+    while True:
+        kwargs = dict(Bucket=bucket, Prefix=prefix)
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents", []):
+            k = obj["Key"]
+            if k.lower().endswith(".pdf"):
+                keys.append(k)
+        token = resp.get("NextContinuationToken")
+        if not token:
+            break
+    return keys
+
+
+# ========= Client id from S3 key =========
+
+def client_from_key(key: str) -> str:
+    base = Path(key).name
+    stem = Path(base).stem
+    if "__" in stem:
+        head = stem.split("__", 1)[0]
+    else:
+        head = re.split(r"[_-]", stem, maxsplit=1)[0]
+    return canonicalize_client_id(head.strip())
+
+
+# ========= Textract extraction =========
+
+def start_textract_pdf_job(bucket: str, key: str) -> str:
+    resp = textract.start_document_text_detection(
+        DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}}
+    )
+    return resp["JobId"]
+
+
+def wait_for_job(job_id: str, poll_secs: int = 5, timeout_secs: int = 60 * 30) -> None:
+    deadline = time.time() + timeout_secs
+    while True:
+        if time.time() > deadline:
+            raise TimeoutError(f"Textract job {job_id} timed out")
+        resp = textract.get_document_text_detection(JobId=job_id, MaxResults=1000)
+        status = resp.get("JobStatus")
+        if status == "SUCCEEDED":
+            return
+        if status in {"FAILED", "PARTIAL_SUCCESS"}:
+            raise RuntimeError(f"Textract job {job_id} ended with {status}")
+        time.sleep(poll_secs)
+
+
+def fetch_textract_pages(job_id: str) -> Tuple[Dict[int, str], Dict[int, list]]:
+    """Return per-page text and per-page word boxes.
+    words schema: [{text, left, top, width, height}] in Textract's normalized units (0..1).
+    """
+    pages_text: Dict[int, List[str]] = {}
+    pages_words: Dict[int, List[Dict[str, float]]] = {}
+    token: Optional[str] = None
+    while True:
+        kwargs = dict(JobId=job_id, MaxResults=1000)
+        if token:
+            kwargs["NextToken"] = token
+        resp = textract.get_document_text_detection(**kwargs)
+        for b in resp.get("Blocks", []):
+            if b.get("BlockType") == "LINE":
+                page = b.get("Page", 1)
+                pages_text.setdefault(page, []).append(b.get("Text", ""))
+            elif b.get("BlockType") == "WORD":
+                page = b.get("Page", 1)
+                bb = (b.get("Geometry", {}) or {}).get("BoundingBox", {})
+                pages_words.setdefault(page, []).append({
+                    "text": b.get("Text", ""),
+                    "left": float(bb.get("Left", 0.0)),
+                    "top": float(bb.get("Top", 0.0)),
+                    "width": float(bb.get("Width", 0.0)),
+                    "height": float(bb.get("Height", 0.0)),
+                })
+        token = resp.get("NextToken")
+        if not token:
+            break
+    # Join lines per page
+    out_text = {p: "\n".join(lines) for p, lines in pages_text.items()}
+    return out_text, pages_words
+
+
+def textract_documents_from_pdf_s3(bucket: str, key: str, client_id: str, policy_id: str) -> List[Document]:
+    job_id = start_textract_pdf_job(bucket, key)
+    wait_for_job(job_id)
+    pages_text, pages_words = fetch_textract_pages(job_id)
+    docs: List[Document] = []
+    if not pages_text:
+        return docs
+    max_page = max(pages_text.keys())
+    for p in range(1, max_page + 1):
+        text = pages_text.get(p, "").strip()
+        if not text:
+            continue
+        docs.append(Document(
+            page_content=text,
+            metadata={
+                "client_id": client_id,
+                "policy_id": policy_id,
+                "page": p,
+                "source_s3": f"s3://{bucket}/{key}",
+                "ocr_words": pages_words.get(p, []),   # normalized 0..1 coords
+                # Textract doesn't provide absolute page width/height
+            }
+        ))
+    return docs
+
+
+# ========= Build per client =========
+
+def build_client(client_id: str, s3_keys: List[str], force: bool = False):
+    outdir = INDEX_DIR / client_id
+    if outdir.exists() and (outdir / "index.faiss").exists() and (outdir / "index.pkl").exists() and not force:
+        print(f"[skip] {client_id}: index already exists (use --force to rebuild).")
+        return
+
+    cfg = OVERRIDES.get(client_id, {})
+    chunk_size = int(cfg.get("chunk_size", DEFAULT_CHUNK_SIZE))
+    chunk_overlap = int(cfg.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP))
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap, add_start_index=True)
+
+    all_chunks: List[Document] = []
+    manifest_docs: List[Dict[str, Any]] = []
+
+    for key in s3_keys:
+        policy_id = Path(key).name
+        # Textract for every PDF (works for scanned & digital alike)
+        page_docs = textract_documents_from_pdf_s3(S3_BUCKET, key, client_id, policy_id)
+
+        # split + propagate metadata
+        for d in page_docs:
+            parts = splitter.split_documents([d])
+            for c in parts:
+                md = dict(c.metadata)
+                md.setdefault("client_id", client_id)
+                md.setdefault("policy_id", policy_id)
+                md.setdefault("page", d.metadata.get("page"))
+                md.setdefault("source_s3", f"s3://{S3_BUCKET}/{key}")
+                if "ocr_words" in d.metadata:
+                    md["ocr_words"] = d.metadata["ocr_words"]
+                c.metadata = md
+                all_chunks.append(c)
+
+        # manifest entry (we don't know page count without extra calls; leave None)
+        head = s3.head_object(Bucket=S3_BUCKET, Key=key)
+        manifest_docs.append({
+            "policy_id": policy_id,
+            "source_s3": f"s3://{S3_BUCKET}/{key}",
+            "pages": None,
+            "modified_time": int(head["LastModified"].timestamp()),
+            "size": int(head.get("ContentLength", 0)),
+        })
+
+    if not all_chunks:
+        print(f"[warn] {client_id}: no chunks")
+        return
+
+    vs = FAISS.from_documents(all_chunks, EMB)
+    outdir.mkdir(parents=True, exist_ok=True)
+    vs.save_local(str(outdir))
+
+    # write manifest
+    (outdir / "manifest.json").write_text(json.dumps({
+        "client_id": client_id,
+        "region": REGION,
+        "embed_model": EMBED_MODEL,
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "docs": manifest_docs,
+        "updated_at": int(time.time()),
+    }, indent=2))
+
+    print(f"[ok] {client_id}: {len(all_chunks)} chunks → {outdir}")
+
+    if UPLOAD_INDICES_TO_S3:
+        upload_index_to_s3(client_id, outdir)
+
+
+# ========= Upload indices back to S3 (optional) =========
+
+def upload_index_to_s3(client_id: str, local_dir: Path) -> None:
+    prefix = f"{S3_INDEX_PREFIX.rstrip('/')}/{client_id}/"
+    for fname in ["index.faiss", "index.pkl", "manifest.json"]:
+        p = local_dir / fname
+        if p.exists():
+            key = prefix + fname
+            s3.upload_file(str(p), S3_BUCKET, key)
+            print(f"[s3] uploaded {p.name} → s3://{S3_BUCKET}/{key}")
+
+
+# ========= Grouping =========
+
+def group_by_client(keys: List[str]) -> Dict[str, List[str]]:
+    buckets: Dict[str, List[str]] = {}
+    for k in keys:
+        cid = client_from_key(k)
+        buckets.setdefault(cid, []).append(k)
+    return buckets
+
+
+# ========= Main =========
+
+def main():
+    keys = list_s3_pdfs(S3_BUCKET, S3_PREFIX)
+    if not keys:
+        print(f"No PDFs found at s3://{S3_BUCKET}/{S3_PREFIX}")
+        return
+
+    buckets = group_by_client(keys)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", help="build only this client id")
+    parser.add_argument("--force", action="store_true", help="force rebuild even if index exists")
+    args = parser.parse_args()
+
+    if args.client:
+        cid = canonicalize_client_id(args.client.strip().lower())
+        s3_keys = buckets.get(cid, [])
+        if not s3_keys:
+            print(f"No PDFs for client '{cid}' under s3://{S3_BUCKET}/{S3_PREFIX}")
+            return
+        build_client(cid, s3_keys, force=args.force)
+    else:
+        for cid, s3_keys in buckets.items():
+            build_client(cid, s3_keys, force=args.force)
+
+
+if __name__ == "__main__":
+    main()
