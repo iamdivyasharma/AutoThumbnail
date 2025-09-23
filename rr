@@ -1,0 +1,275 @@
+# streamlit_app.py
+# Contract Assistant with:
+# 1) Client → Category → Content explorer (Excel-backed)
+# 2) Existing free-text RAG Q&A
+# 3) Side-by-side PDF viewer (streamlit-pdf-viewer)
+
+import os
+from pathlib import Path
+from typing import Optional, List, Tuple
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import requests
+import pandas as pd
+import streamlit as st
+from streamlit_pdf_viewer import pdf_viewer  # pip install streamlit-pdf-viewer
+
+# -------------------- Config --------------------
+API_URL   = "http://localhost:8000"
+LOGO_PATH = "abc.jpg"   # optional logo file
+IST = ZoneInfo("Asia/Kolkata")
+
+EXCEL_PATH = "your_file.xlsx"  # 👈 replace with your real path
+# If your column names vary slightly, you can list synonyms here:
+COLUMN_ALIASES = {
+    "client": ["Client Name", "Client", "Client_Name", "client", "client name"],
+    "category": ["Category", "Topic", "Label", "category"],
+    "content": ["Client Content", "Content", "Text", "Details", "Answer", "client content"],
+}
+
+st.set_page_config(page_title="Contract Assistant", page_icon="📄", layout="wide")
+
+
+# -------------------- Helpers --------------------
+def _resolve_local(path_or_none: str) -> Optional[str]:
+    if not path_or_none:
+        return None
+    p = Path(path_or_none)
+    return str(p if p.is_absolute() else (Path.cwd() / p))
+
+def _fmt_ist(ts: int | None) -> Optional[str]:
+    if not ts:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts), IST).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+
+def _fetch_all_docs_for_client(client_id: str):
+    try:
+        resp = requests.get(f"{API_URL}/clients/{client_id}/documents", timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.warning(f"Could not fetch docs for {client_id}: {e}")
+        return []
+
+def _first_matching_column(df_cols: List[str], candidates: List[str]) -> Optional[str]:
+    """Find the first column in df_cols that matches any of the aliases (case/space-insensitive)."""
+    normalized = {c.strip().lower(): c for c in df_cols}
+    for alias in candidates:
+        key = alias.strip().lower()
+        if key in normalized:
+            return normalized[key]
+    # fallback: fuzzy contains
+    for c in df_cols:
+        for alias in candidates:
+            if alias.strip().lower() in c.strip().lower():
+                return c
+    return None
+
+@st.cache_data(show_spinner=False)
+def load_excel(path: str) -> Tuple[pd.DataFrame, str, str, str]:
+    """Load Excel and resolve canonical columns for client, category, content."""
+    df = pd.read_excel(path)
+    # strip whitespace from headers
+    df.columns = [str(c).strip() for c in df.columns]
+    client_col = _first_matching_column(df.columns.tolist(), COLUMN_ALIASES["client"])
+    cat_col    = _first_matching_column(df.columns.tolist(), COLUMN_ALIASES["category"])
+    cont_col   = _first_matching_column(df.columns.tolist(), COLUMN_ALIASES["content"])
+
+    if not client_col or not cat_col or not cont_col:
+        missing = []
+        if not client_col: missing.append("Client Name")
+        if not cat_col:    missing.append("Category")
+        if not cont_col:   missing.append("Client Content")
+        raise ValueError(
+            "Missing expected column(s) in Excel. "
+            f"Required (or aliases): {missing}. "
+            f"Found columns: {list(df.columns)}"
+        )
+
+    # tidy: coerce to string, strip; keeps original values for display
+    for col in [client_col, cat_col]:
+        df[col] = df[col].astype(str).str.strip()
+    return df, client_col, cat_col, cont_col
+
+
+# -------------------- App Header --------------------
+if os.path.exists(LOGO_PATH):
+    st.markdown("<div style='text-align:center;'>", unsafe_allow_html=True)
+    st.image(LOGO_PATH, width=160)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+st.title("Contract Assistant — Multi-Client with Document Viewer")
+
+
+# -------------------- Session State --------------------
+if "answer" not in st.session_state: st.session_state.answer = ""
+if "used_clients" not in st.session_state: st.session_state.used_clients = []
+if "sources" not in st.session_state: st.session_state.sources = []
+if "client_docs" not in st.session_state: st.session_state.client_docs = {}   # {client: [docs]}
+if "selected_pdf_src" not in st.session_state: st.session_state.selected_pdf_src = None
+if "selected_label" not in st.session_state: st.session_state.selected_label = None
+if "selected_scroll_page" not in st.session_state: st.session_state.selected_scroll_page = None
+if "selected_annotations" not in st.session_state: st.session_state.selected_annotations = None
+
+
+# -------------------- Layout --------------------
+left, right = st.columns([0.55, 0.45], gap="large")
+
+with left:
+    # ---------- Client Content Explorer (Excel) ----------
+    st.markdown("### Client Content Explorer")
+
+    try:
+        df, CLIENT_COL, CAT_COL, CONTENT_COL = load_excel(EXCEL_PATH)
+        clients = sorted(df[CLIENT_COL].dropna().unique().tolist())
+
+        sel_client = st.selectbox("Select a Client", ["-- Select --"] + clients, key="sel_client_excel")
+        if sel_client and sel_client != "-- Select --":
+            # categories for this client
+            cat_opts = (
+                df[df[CLIENT_COL] == sel_client][CAT_COL]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .unique()
+                .tolist()
+            )
+            cat_opts = sorted(cat_opts)
+            sel_category = st.selectbox("Select a Category", ["-- Select --"] + cat_opts, key="sel_category_excel")
+
+            if sel_category and sel_category != "-- Select --":
+                # Filter rows
+                selection = df[(df[CLIENT_COL] == sel_client) & (df[CAT_COL].astype(str).str.strip() == sel_category)]
+
+                if len(selection) == 0:
+                    st.warning("No content found for this selection.")
+                elif len(selection) == 1:
+                    row = selection.iloc[0]
+                    st.success(f"Content for **{sel_client}** — **{sel_category}**")
+                    # Prefer rich text rendering if the cell contains markdown-like text
+                    st.markdown(str(row[CONTENT_COL]))
+                else:
+                    # When multiple rows match, let user pick one by row index (or show all)
+                    st.info(f"Found {len(selection)} matching rows. Showing the first by default.")
+                    which = st.number_input("Row to show (1-based):", min_value=1, max_value=len(selection), value=1, step=1)
+                    row = selection.iloc[which - 1]
+                    st.success(f"Content for **{sel_client}** — **{sel_category}** (row {which}/{len(selection)})")
+                    st.markdown(str(row[CONTENT_COL]))
+
+                    with st.expander("See all matching rows"):
+                        st.dataframe(selection[[CLIENT_COL, CAT_COL, CONTENT_COL]], use_container_width=True)
+
+        st.divider()
+
+    except Exception as e:
+        st.error(f"Could not load Excel: {e}")
+        st.caption("Make sure the file path and column names are correct. "
+                   "Expected columns (or aliases): "
+                   f"client={COLUMN_ALIASES['client']}, "
+                   f"category={COLUMN_ALIASES['category']}, "
+                   f"content={COLUMN_ALIASES['content']}.")
+
+    # ---------- Free-text RAG Q&A (unchanged) ----------
+    question = st.text_input("Ask a question (mention client name(s), e.g., 'EY', 'Bain', 'KPMG', 'BMW', 'Estee'):")
+
+    if st.button("Ask"):
+        if not question.strip():
+            st.warning("Please enter a question.")
+        else:
+            with st.spinner("Thinking..."):
+                try:
+                    resp = requests.post(f"{API_URL}/ask", json={"question": question}, timeout=120)
+                    if resp.status_code != 200:
+                        st.error(resp.text)
+                    else:
+                        data = resp.json()
+                        st.session_state.used_clients = [c.lower() for c in data.get("used_clients", [])]
+                        st.session_state.sources = data.get("sources", [])
+                        st.session_state.client_docs = {}
+                        st.session_state.selected_pdf_src = None
+                        st.session_state.selected_label = None
+                        st.session_state.selected_scroll_page = None
+                        st.session_state.selected_annotations = None
+                        st.session_state.answer = data.get("answer", "")
+
+                        for c in st.session_state.used_clients:
+                            st.session_state.client_docs[c] = _fetch_all_docs_for_client(c)
+
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Request failed: {e}")
+
+    # Render answer ONCE
+    if st.session_state.answer:
+        st.markdown("### Answer")
+        st.markdown(st.session_state.answer)
+
+    if st.session_state.used_clients:
+        st.caption(f"Detected client(s): {', '.join(st.session_state.used_clients)}")
+
+    # ---- Sources (retrieved): clickable to open page + highlights ----
+    if st.session_state.sources:
+        st.markdown("### Sources (retrieved)")
+        for i, s in enumerate(st.session_state.sources, start=1):
+            policy = s.get("policy_id")
+            page = s.get("page")
+            src = _resolve_local(s.get("source_file", ""))
+            anns = s.get("annotations") or []
+            cols = st.columns([0.7, 0.3])
+            with cols[0]:
+                st.markdown(f"**[{i}]** `{policy}` — page **{page}**")
+            with cols[1]:
+                if st.button("Open in viewer", key=f"open_src_{i}"):
+                    st.session_state.selected_label = f"{policy} — page {page}"
+                    st.session_state.selected_pdf_src = src
+                    st.session_state.selected_scroll_page = int(page) if isinstance(page, int) else None
+                    st.session_state.selected_annotations = anns
+                    st.rerun()
+
+    # ---- All documents (browse): clickable; open full PDF ----
+    if st.session_state.client_docs:
+        st.markdown("### All documents (browse)")
+        for client, docs in st.session_state.client_docs.items():
+            with st.expander(f"Client: {client}", expanded=False):
+                if not docs:
+                    st.caption("No PDFs found.")
+                for j, d in enumerate(docs):
+                    src = _resolve_local(d.get("source_file", ""))
+                    if not src:
+                        continue
+                    pages = d.get("pages") or "?"
+                    mod_ist = _fmt_ist(d.get("modified_time"))
+                    label = f"📄 {d.get('policy_id')} ({pages} pages" + (f", modified {mod_ist} IST" if mod_ist else "") + ")"
+                    if st.button(label, key=f"alldoc_{client}_{j}"):
+                        st.session_state.selected_label = label
+                        st.session_state.selected_pdf_src = src
+                        st.session_state.selected_scroll_page = None
+                        st.session_state.selected_annotations = None
+                        st.rerun()
+
+
+with right:
+    st.markdown("### Document Viewer")
+    if st.session_state.selected_pdf_src:
+        st.caption(f"Showing: {st.session_state.selected_label or Path(str(st.session_state.selected_pdf_src)).name}")
+        try:
+            # local-only path reading
+            p = Path(st.session_state.selected_pdf_src)
+            if not p.exists():
+                raise FileNotFoundError(f"PDF not found: {p}")
+            pdf_bytes = p.read_bytes()
+            pdf_viewer(
+                pdf_bytes,
+                width="100%", height=820, zoom_level="auto", viewer_align="center",
+                show_page_separator=True, render_text=True,
+                scroll_to_page=st.session_state.selected_scroll_page,
+                annotations=st.session_state.get("selected_annotations") or []
+            )
+        except Exception as e:
+            st.error(f"Could not display PDF: {e}")
+    else:
+        st.info("Select a source or any document on the left to preview it here.")
