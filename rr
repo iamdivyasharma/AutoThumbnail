@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""
+Export RAG answers per client & clause into an Excel file (.xlsx) using FAISS + ChatBedrock.
+- No command-line args needed.
+- Clauses are hardcoded below in CLAUSES.
+- Scans FAISS_INDEX_DIR/<client>/ automatically for all clients.
+- Writes: Client | Clause | Content
+
+Deps:
+  pip install -U pandas openpyxl "langchain-aws>=0.2.5" "langchain-community" "boto3>=1.34"
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import List, Dict, Any
+
+import pandas as pd
+from boto3 import Session
+from langchain_aws import BedrockEmbeddings, ChatBedrock
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# ===================== EDIT THESE =====================
+FAISS_INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve()    # <-- set your path
+OUTPUT_XLSX     = Path("./client_clauses.xlsx").resolve()         # output file
+
+# AWS (direct keys as you requested) — for local testing only
+AWS_REGION = "us-east-1"
+AWS_ACCESS_KEY_ID     = "YOUR_ACCESS_KEY_ID"
+AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
+
+# Models
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+
+# Retrieval / generation
+K_PER_CLIENT = 4
+MAX_TOKENS   = 1200
+TEMPERATURE  = 0.2
+
+# ✅ Hardcoded clauses (edit this list)
+CLAUSES = [
+    "Data Management",
+    "Data Suppression",
+    "Data Restrictions",
+    "Data Consent",
+    # add more here if needed:
+    # "Data Retention",
+    # "Third-Party Sharing",
+]
+
+# Clause-wise prompt tuning (optional: edit these texts)
+CLAUSE_PROMPTS: Dict[str, str] = {
+    "Data Management": (
+        "Focus on lifecycle: collection, storage, processing, sharing, deletion. "
+        "Extract definitions, responsibilities, retention, and governance controls."
+    ),
+    "Data Suppression": (
+        "Emphasize opt-out/suppression triggers, timelines, systems, who can request, "
+        "audit trails, exceptions, and procedural steps."
+    ),
+    "Data Restrictions": (
+        "Detail prohibited uses, geo or BU limits, consent prerequisites, access controls, "
+        "and exception escalation paths."
+    ),
+    "Data Consent": (
+        "Cover consent collection/renewal/withdrawal, lawful bases, records, UI/notice language, "
+        "and sensitive/age-related considerations."
+    ),
+}
+
+# ===================== Prompt =====================
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a precise, client-scoped contract assistant. Use ONLY the Provided Context. "
+     "Respond specifically for the client's policies. Be complete and specific to the clause. "
+     "If the context is insufficient, say you don't know and list what is missing. No citations.\n\n"
+     "Clause-specific guidance:\n{clause_instructions}"),
+    ("human",
+     "Client: {client_id}\nClause: {clause}\n\nProvided Context:\n{context}\n\n"
+     "Write the best possible answer now.")
+])
+
+# ===================== Helpers =====================
+def list_clients_from_faiss(root: Path) -> List[str]:
+    if not root.exists():
+        return []
+    out = []
+    for p in root.iterdir():
+        if p.is_dir() and not p.name.startswith(".") and (p / "index.faiss").exists() and (p / "index.pkl").exists():
+            out.append(p.name)
+    return sorted(out)
+
+def load_vs_for_client(client_id: str, session: Session) -> FAISS:
+    emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=session.client("bedrock-runtime"))
+    return FAISS.load_local(str(FAISS_INDEX_DIR / client_id), emb, allow_dangerous_deserialization=True)
+
+def format_docs(docs) -> str:
+    return "\n\n".join(
+        f"(client: {d.metadata.get('client_id')}, policy: {d.metadata.get('policy_id')}, page: {d.metadata.get('page','?')})\n{d.page_content}"
+        for d in docs
+    )
+
+def clause_instructions_for(clause: str) -> str:
+    # exact or case-insensitive match; otherwise generic
+    if clause in CLAUSE_PROMPTS:
+        return CLAUSE_PROMPTS[clause]
+    for k, v in CLAUSE_PROMPTS.items():
+        if k.lower() == clause.lower():
+            return v
+    return ("Extract specific policy details, steps, limits, definitions, and exceptions for this clause. "
+            "Use concise, actionable language grounded in the provided context.")
+
+def answer_for_clause(session: Session, client_id: str, clause: str) -> str:
+    # 1) Retrieve
+    vs = load_vs_for_client(client_id, session)
+    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": K_PER_CLIENT})
+    query = f"Extract contract policy content related to '{clause}' relevant to client '{client_id}'."
+    docs = retriever.get_relevant_documents(query)
+    docs = [d for d in docs if str(d.metadata.get("client_id", "")).strip().lower() == client_id.strip().lower()]
+    if not docs:
+        return f"(No matching context found in {client_id} for clause '{clause}'.)"
+
+    context = format_docs(docs)
+
+    # 2) LLM: ChatBedrock (classic)
+    llm = ChatBedrock(
+        client=session.client("bedrock-runtime"),
+        model_id=LLM_MODEL,
+        model_kwargs={"temperature": float(TEMPERATURE), "max_tokens": int(MAX_TOKENS)},
+    )
+    chain = PROMPT | llm | StrOutputParser()
+
+    try:
+        return chain.invoke({
+            "client_id": client_id,
+            "clause": clause,
+            "context": context,
+            "clause_instructions": clause_instructions_for(clause),
+        })
+    except Exception as e:
+        return f"(LLM error for {client_id} / '{clause}': {type(e).__name__}: {e})"
+
+# ===================== Main =====================
+def main():
+    # Discover clients automatically
+    clients = list_clients_from_faiss(FAISS_INDEX_DIR)
+    if not clients:
+        raise SystemExit(f"No clients found under {FAISS_INDEX_DIR}")
+
+    # AWS session (using hardcoded keys — do not use in prod)
+    session = Session(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for client_id in clients:
+        print(f"=== {client_id} ===")
+        for clause in CLAUSES:
+            print(f"  - {clause} ...", end="", flush=True)
+            content = answer_for_clause(session, client_id, clause)
+            rows.append({"Client": client_id, "Clause": clause, "Content": content})
+            print(" done.")
+
+    df = pd.DataFrame(rows, columns=["Client", "Clause", "Content"])
+    OUTPUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(OUTPUT_XLSX, index=False)
+    print(f"\nSaved: {OUTPUT_XLSX}")
+
+if __name__ == "__main__":
+    main()
