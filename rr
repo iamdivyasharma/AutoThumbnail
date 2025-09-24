@@ -1,294 +1,74 @@
-import re
-import json
-from decimal import Decimal, InvalidOperation
-from typing import Any, Callable, Dict, Optional, Tuple
+import re, json
+from typing import Optional, Dict
 
-import pandas as pd
-
-
-Number = Optional[Decimal]
-
-
-def _to_decimal(s: Optional[str]) -> Number:
-    """Convert a numeric-looking string to Decimal. Handles commas, currency symbols, and spaces."""
-    if s is None:
+def _to_number(s: Optional[str]) -> Optional[float]:
+    if not s:
         return None
-    # Strip currency symbols and common noise, keep digits, dot, minus
-    cleaned = re.sub(r"[^\d\.\-]", "", s)
-    try:
-        return Decimal(cleaned) if cleaned not in ("", ".", "-", "-.", ".-") else None
-    except InvalidOperation:
-        return None
-
-
-def _search_number_after(label: str, text: str) -> Number:
-    """
-    Find a number after a label like 'Minimum', 'Maximum', 'Exact'.
-    Matches patterns like:
-      'Minimum: $123,456'
-      '**Minimum** - 123.45 USD'
-      'Minimum price ~ INR 1,23,456.78'
-    """
-    # case-insensitive, tolerate punctuation and colon after label
-    pattern = rf"{label}\s*(?:price|amount)?\s*[:\-–~]?\s*([^\n\r]*)"
-    m = re.search(pattern, text, flags=re.IGNORECASE)
+    m = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", s)
     if not m:
         return None
-    # Take first numeric token in the captured group
-    candidate = re.search(r"[-]?\d[\d,]*(?:\.\d+)?", m.group(1))
-    return _to_decimal(candidate.group(0)) if candidate else None
+    return float(m.group(0).replace(",", ""))
 
-
-def _find_range(text: str) -> Tuple[Number, Number]:
+def extract_recommended_wish_price(text: str) -> Dict[str, Optional[float]]:
     """
-    Try to find a 'min - max' style range if explicit Minimum/Maximum labels are absent.
-    Examples:
-      'expected price range: $120k–$150k'
-      'between 12,000 and 15,500'
+    Extracts values from a section like:
+      Recommended Wish Price:
+        - Minimum: $12,345
+        - Maximum: 15,000
+        - Exact: 13,200
+    Also works if they're inline: "Recommended Wish Price: -Minimum: $10 -Maximum: $12 -Exact: $11"
+    Returns a dict: {"minimum": float|None, "maximum": float|None, "exact": float|None}
     """
-    # 1) hyphen/en-dash range
-    m = re.search(r"(-?\d[\d,]*(?:\.\d+)?)\s*[–-]\s*(-?\d[\d,]*(?:\.\d+)?)", text)
+    # 1) Isolate the "Recommended Wish Price" block (until a blank line or end)
+    block = None
+    m = re.search(r"Recommended\s+Wish\s+Price\s*:?(.*?)(?:\n\s*\n|$)", text, flags=re.IGNORECASE|re.DOTALL)
     if m:
-        a, b = _to_decimal(m.group(1)), _to_decimal(m.group(2))
-        if a is not None and b is not None:
-            return (min(a, b), max(a, b))
-    # 2) 'between X and Y'
-    m = re.search(r"between\s+(-?\d[\d,]*(?:\.\d+)?)\s+and\s+(-?\d[\d,]*(?:\.\d+)?)", text, flags=re.IGNORECASE)
-    if m:
-        a, b = _to_decimal(m.group(1)), _to_decimal(m.group(2))
-        if a is not None and b is not None:
-            return (min(a, b), max(a, b))
-    return (None, None)
-
-
-def _extract_rationale(text: str) -> Optional[str]:
-    """
-    Try to pull a concise rationale/explanation section if labeled.
-    Falls back to the whole text if nothing better is found (you can trim downstream).
-    """
-    # Look for a section labeled Rationale/Explanation/Reasoning
-    section = re.search(
-        r"(?:Rationale|Explanation|Reasoning|Why)\s*[:\-–]\s*(.+)",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if section:
-        # Stop at a common next heading to avoid grabbing everything
-        stop = re.search(r"\n\s*(?:Minimum|Maximum|Exact|Average|Conclusion)\b", section.group(1), flags=re.IGNORECASE)
-        return section.group(1)[: stop.start()] if stop else section.group(1).strip()
-
-    # If the LLM returned a JSON block with rationale, the JSON path takes priority (handled elsewhere).
-    # As a fallback, return the last 2-5 sentences heuristically.
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-    if len(sentences) >= 2:
-        return " ".join(sentences[-3:])
-    return text.strip() or None
-
-
-def parse_llm_answer(raw_text: str) -> Dict[str, Any]:
-    """
-    Robust parser for LLM outputs.
-    Supports:
-      - JSON object with keys: minimum, maximum, exact_price, rationale
-      - Labeled text lines (Minimum/Maximum/Exact/Rationale)
-      - Range expressions to infer min/max
-    Returns Decimals for numeric fields when possible.
-    """
-    result: Dict[str, Any] = {
-        "Minimum": None,
-        "Maximum": None,
-        "ExactPrice": None,
-        "Rationale": None,
-    }
-
-    text = raw_text.strip()
-
-    # 1) Try to extract JSON block first (most reliable if your RAG prompts enforce it)
-    #    We tolerate text before/after the JSON.
-    json_block = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if json_block:
-        try:
-            obj = json.loads(json_block.group(0))
-            # Looser key handling
-            def pick(obj_: dict, *names):
-                for n in names:
-                    for key in obj_.keys():
-                        if key.strip().lower() == n.lower():
-                            return obj_[key]
-                return None
-
-            result["Minimum"]    = _to_decimal(pick(obj, "minimum", "min", "min_price", "low"))
-            result["Maximum"]    = _to_decimal(pick(obj, "maximum", "max", "max_price", "high"))
-            result["ExactPrice"] = _to_decimal(pick(obj, "exact_price", "exact", "price", "point_estimate"))
-            result["Rationale"]  = pick(obj, "rationale", "explanation", "reasoning", "why")
-        except Exception:
-            pass  # Fall through to text parsing
-
-    # 2) Labeled text parsing (fills missing pieces)
-    if result["Minimum"] is None:
-        result["Minimum"] = _search_number_after("Minimum", text)
-    if result["Maximum"] is None:
-        result["Maximum"] = _search_number_after("Maximum", text)
-    if result["ExactPrice"] is None:
-        # Try both "Exact" and "Exact price"
-        ep = _search_number_after("Exact", text)
-        if ep is None:
-            ep = _search_number_after("Exact price", text)
-        result["ExactPrice"] = ep
-
-    # 3) Infer range if still missing
-    if result["Minimum"] is None or result["Maximum"] is None:
-        rng_min, rng_max = _find_range(text)
-        result["Minimum"] = result["Minimum"] or rng_min
-        result["Maximum"] = result["Maximum"] or rng_max
-
-    # 4) Rationale, if still missing
-    if not result["Rationale"]:
-        result["Rationale"] = _extract_rationale(text)
-
-    return result
-
-
-def process_excel_with_llm(
-    input_excel_path: str,
-    output_excel_path: str,
-    prompt_builder: Callable[[pd.Series], str],
-    llm_call: Callable[[str], str],
-    *,
-    sheet_name: Any = 0,
-    index_is_excel_row_number: bool = True,
-) -> pd.DataFrame:
-    """
-    Main pipeline:
-      - Reads Excel
-      - For each row: builds a prompt (via prompt_builder), calls your LLM (via llm_call)
-      - Parses LLM answer (Minimum, Maximum, ExactPrice, Rationale)
-      - Computes Average_Min_Max
-      - Adds RowNumber (Excel row index if index_is_excel_row_number=True)
-      - Writes enriched data to output_excel_path
-    Returns the enriched DataFrame.
-
-    Parameters
-    ----------
-    input_excel_path : str
-        Path to the source Excel file.
-    output_excel_path : str
-        Path to write the enriched Excel file.
-    prompt_builder : Callable[[pd.Series], str]
-        Function that receives a pandas Series (the row) and returns a prompt string for the LLM.
-    llm_call : Callable[[str], str]
-        Function that receives a prompt string and returns the LLM's raw text answer.
-        Plug your RAG/LLM integration here.
-    sheet_name : Any
-        Passed to pandas.read_excel; 0 (first sheet) by default.
-    index_is_excel_row_number : bool
-        If True, RowNumber = df.index + 2 (since row 1 is header in Excel).
-        If False, RowNumber = df.index (useful if you already have explicit row numbers).
-    """
-    df = pd.read_excel(input_excel_path, sheet_name=sheet_name)
-    df_out = df.copy()
-
-    parsed_cols = {
-        "Minimum": [],
-        "Maximum": [],
-        "ExactPrice": [],
-        "Rationale": [],
-        "Average_Min_Max": [],
-        "LLM_Raw_Answer": [],  # optional: keeps the raw output for auditing
-    }
-
-    for idx, row in df.iterrows():
-        prompt = prompt_builder(row)
-        raw_answer = llm_call(prompt)
-
-        parsed = parse_llm_answer(raw_answer)
-
-        min_v = parsed["Minimum"]
-        max_v = parsed["Maximum"]
-        exact_v = parsed["ExactPrice"]
-        rationale = parsed["Rationale"]
-
-        # Average only when both min and max are present
-        avg = None
-        if isinstance(min_v, Decimal) and isinstance(max_v, Decimal):
-            avg = (min_v + max_v) / Decimal(2)
-
-        parsed_cols["Minimum"].append(float(min_v) if isinstance(min_v, Decimal) else None)
-        parsed_cols["Maximum"].append(float(max_v) if isinstance(max_v, Decimal) else None)
-        parsed_cols["ExactPrice"].append(float(exact_v) if isinstance(exact_v, Decimal) else None)
-        parsed_cols["Rationale"].append(rationale)
-        parsed_cols["Average_Min_Max"].append(float(avg) if isinstance(avg, Decimal) else None)
-        parsed_cols["LLM_Raw_Answer"].append(raw_answer)
-
-    # Attach parsed columns
-    for k, v in parsed_cols.items():
-        df_out[k] = v
-
-    # Add RowNumber
-    if index_is_excel_row_number:
-        # Excel row numbers: header is row 1 -> first data row is 2
-        df_out["RowNumber"] = df_out.index + 2
+        block = m.group(1)
     else:
-        df_out["RowNumber"] = df_out.index
+        # fallback: use whole text if the tag isn't cleanly formatted
+        block = text
 
-    # Save as Excel
-    df_out.to_excel(output_excel_path, index=False)
-    return df_out
+    # 2) Try to capture each label within the block (handles bullets, dashes, punctuation)
+    def grab(label: str) -> Optional[float]:
+        pat = rf"{label}\s*(?:price)?\s*[:\-–]\s*([^\n\r;]+)"
+        mm = re.search(pat, block, flags=re.IGNORECASE)
+        return _to_number(mm.group(1)) if mm else None
 
+    minimum = grab("Minimum")
+    maximum = grab("Maximum")
+    exact   = grab("Exact")
 
-# -----------------------------
-# Example wiring (replace these)
-# -----------------------------
+    # 3) Fallbacks (in case labels are missing but values appear inline after label tokens)
+    if minimum is None or maximum is None or exact is None:
+        # Look for compact "-Minimum: X -Maximum: Y -Exact: Z" pattern
+        compact = re.search(
+            r"Minimum\s*[:\-–]\s*([^\n\r\-]+).*?Maximum\s*[:\-–]\s*([^\n\r\-]+).*?Exact\s*[:\-–]\s*([^\n\r\-]+)",
+            block, flags=re.IGNORECASE|re.DOTALL
+        )
+        if compact:
+            minimum = minimum or _to_number(compact.group(1))
+            maximum = maximum or _to_number(compact.group(2))
+            exact   = exact   or _to_number(compact.group(3))
+
+    return {"minimum": minimum, "maximum": maximum, "exact": exact}
+
+def extract_as_json(text: str) -> str:
+    """Convenience wrapper: returns a JSON string."""
+    data = extract_recommended_wish_price(text)
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+# -------------------------
+# Example
 if __name__ == "__main__":
-    # 1) You define how to turn each row into a prompt
-    def my_prompt_builder(row: pd.Series) -> str:
-        """
-        Example prompt builder.
-        Use row['colname'] fields to ground your RAG retrieval and ask the LLM
-        to respond in a STRICT JSON schema to make parsing trivial.
-        """
-        product = row.get("product_name", "")
-        market  = row.get("market", "")
-        features = row.get("key_features", "")
-        return f"""
-You are a pricing analyst. Given the context below, estimate a price.
+    sample = """
+Some long paragraph...
+Recommended Wish Price:
+ - Minimum: $12,345
+ - Maximum: 15,000 USD
+ - Exact: 13,200
+Notes after this.
 
-Context:
-- Product: {product}
-- Market: {market}
-- Key features: {features}
-
-Return ONLY a JSON object with this EXACT schema and no extra text:
-{{
-  "minimum": number,       // lower bound price
-  "maximum": number,       // upper bound price
-  "exact_price": number,   // your point estimate
-  "rationale": string      // brief explanation (<= 80 words)
-}}
+Another section...
 """
-
-    # 2) You plug in your LLM/RAG call here
-    def my_llm_call(prompt: str) -> str:
-        """
-        Replace this stub with your actual LLM call.
-        For example, call your RAG pipeline then your model.
-        Must return a STRING (ideally JSON as requested).
-        """
-        # --- PSEUDO EXAMPLE ONLY ---
-        # response = my_rag_llm.generate(prompt=prompt, temperature=0.2)
-        # return response.text
-        # Here we return a dummy JSON for illustration:
-        return json.dumps({
-            "minimum": 12000,
-            "maximum": 15500,
-            "exact_price": 13800,
-            "rationale": "Benchmarked against similar SKUs; supply constraints push ceiling, while base BOM sets the floor."
-        })
-
-    # 3) Run once end-to-end
-    # process_excel_with_llm(
-    #     input_excel_path="input.xlsx",
-    #     output_excel_path="output_with_prices.xlsx",
-    #     prompt_builder=my_prompt_builder,
-    #     llm_call=my_llm_call,
-    # )
+    print(extract_as_json(sample))
+    # -> {"minimum":12345.0,"maximum":15000.0,"exact":13200.0}
