@@ -1,338 +1,351 @@
-# index_clients.py
-# Build per-client FAISS indexes from PDFs in S3.
-# - Text PDFs  -> PyPDFLoader (local temp)
-# - Scanned    -> AmazonTextractPDFLoader (S3 path, async Textract)
-# Saves FAISS locally under faiss_indices/<client>/ and writes manifest.json
+# app.py
+# FastAPI backend (S3-aware):
+# - Uses S3 presigned URLs for sources (and All documents)
+# - For text PDFs, downloads a temp copy to compute exact-text highlights
+# - For Textract-sourced docs, highlights may be empty (unless you add geometry)
+
+from __future__ import annotations
 
 import os
 import re
 import json
-import time
-import shutil
-import argparse
+import math
+import tempfile
 from pathlib import Path
-from collections import defaultdict
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional
 
+import fitz  # PyMuPDF (used for text-PDF highlighting)
+import yaml
 import boto3
-from boto3 import Session
+from botocore.config import Config
 
-# PDF inspection & local parsing for text PDFs
-from pypdf import PdfReader
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-# LangChain loaders
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.document_loaders import AmazonTextractPDFLoader
-
-# Chunking / vectors
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
+from langchain_aws import BedrockEmbeddings, ChatBedrockConverse
 from langchain_community.vectorstores import FAISS
-from langchain_aws import BedrockEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
-# ========= EDIT THESE =========
-REGION      = "us-east-1"
+# ========= ABSOLUTE PATHS YOU ALREADY USE =========
+FAISS_INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve()
+CONFIGS_PATH    = Path("/ABS/PATH/TO/configs/clients.yaml").resolve()
 
-# S3 location of your PDFs (Textract requires S3)
-S3_BUCKET   = "YOUR_BUCKET_NAME"           # e.g., "my-bucket"
-S3_PREFIX   = "sagemaker/contracts/"       # e.g., "sagemaker/contracts/"
-
-# Local outputs (absolute paths recommended)
-INDEX_DIR    = Path("/ABS/PATH/TO/faiss_indices").resolve()
-CONFIGS_PATH = Path("/ABS/PATH/TO/configs/clients.yaml").resolve()
-TMP_DIR      = Path("/ABS/PATH/TO/_tmp_pdf_dl").resolve()
-
-INDEX_DIR.mkdir(parents=True, exist_ok=True)
-TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-# Bedrock models
+# ========= AWS / Bedrock / S3 =========
+REGION = "us-east-1"
 EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
 
-# ⚠️ Dev creds (prefer IAM role in prod)
 AWS_ACCESS_KEY_ID     = "YOUR_ACCESS_KEY_ID"
 AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
 
-# Default chunking (can be overridden per client in YAML)
-DEFAULT_CHUNK_SIZE    = 1200
-DEFAULT_CHUNK_OVERLAP = 180
-SAMPLE_PAGES_FOR_CHECK = 3  # first N pages to decide text vs scanned
-# =============================
-
-# ---- AWS Sessions/clients (shared) ----
-SESSION = Session(
+SESSION = boto3.Session(
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
     region_name=REGION,
 )
-S3 = SESSION.client("s3")
-TEXTRACT = SESSION.client("textract")
-EMB = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
+RUNTIME = SESSION.client("bedrock-runtime", config=Config(retries={"max_attempts": 8, "mode": "adaptive"}))
+S3      = SESSION.client("s3", config=Config(signature_version="s3v4"))
 
-# ---- Load per-client overrides from YAML ----
-def load_yaml_overrides() -> Dict[str, Any]:
+EMB = BedrockEmbeddings(model_id=EMBED_MODEL, client=RUNTIME)
+
+GLOBAL_DEFAULTS = {"k": 4, "temperature": 0.20, "max_tokens": 1200}
+MAX_COMBINED_K  = 12
+
+_VS_CACHE: Dict[str, Any] = {}
+_STEP = 0
+MAX_LOADED = 5
+
+app = FastAPI(title="Contract RAG Backend")
+
+# ========= Models =========
+class AskRequest(BaseModel):
+    question: str
+    client_ids: Optional[List[str]] = None
+
+class AskResponse(BaseModel):
+    answer: str
+    used_clients: List[str]
+    sources: List[Dict[str, Any]]
+
+# ========= YAML / overrides =========
+def _load_overrides() -> Dict[str, Dict[str, Any]]:
     if not CONFIGS_PATH.exists():
         return {}
-    import yaml
     raw = yaml.safe_load(CONFIGS_PATH.read_text()) or {}
-    # normalize keys to lowercase
-    return {str(k).strip().lower(): (v or {}) for k, v in raw.items()}
+    out: Dict[str, Dict[str, Any]] = {}
+    for k, v in raw.items():
+        if not isinstance(v, dict):
+            continue
+        ck = str(k).strip().lower()
+        out[ck] = {
+            "k": int(v.get("k", GLOBAL_DEFAULTS["k"])),
+            "temperature": float(v.get("temperature", GLOBAL_DEFAULTS["temperature"])),
+            "max_tokens": int(v.get("max_tokens", GLOBAL_DEFAULTS["max_tokens"])),
+            "aliases": [str(a).strip().lower() for a in v.get("aliases", [])],
+        }
+        # Optional index-time overrides present in YAML are used by the indexer only
+    return out
 
-OVERRIDES = load_yaml_overrides()
+CLIENT_OVERRIDES = _load_overrides()
 
-# ---- Canonicalization helpers (map many spellings to a single ID) ----
-def _norm_spaces(s: str) -> str:
+def list_clients() -> List[str]:
+    if not FAISS_INDEX_DIR.exists():
+        return []
+    out = []
+    for p in FAISS_INDEX_DIR.iterdir():
+        if not p.is_dir() or p.name.startswith("."):
+            continue
+        if (p / "index.faiss").exists() and (p / "index.pkl").exists():
+            out.append(p.name)
+    return sorted(out)
+
+def _load_index(client_id: str) -> FAISS:
+    global _STEP
+    _STEP += 1
+    cid = client_id.strip().lower()
+    if cid in _VS_CACHE:
+        vs, _ = _VS_CACHE[cid]
+        _VS_CACHE[cid] = (vs, _STEP)
+        return vs
+    vs = FAISS.load_local(str(FAISS_INDEX_DIR / cid), EMB, allow_dangerous_deserialization=True)
+    _VS_CACHE[cid] = (vs, _STEP)
+    if len(_VS_CACHE) > MAX_LOADED:
+        oldest = min(_VS_CACHE.items(), key=lambda kv: kv[1][1])[0]
+        _VS_CACHE.pop(oldest, None)
+    return vs
+
+def choose_params(client_id: str) -> Dict[str, Any]:
+    return CLIENT_OVERRIDES.get(client_id.strip().lower(), GLOBAL_DEFAULTS.copy())
+
+# ========= Client detection (robust) =========
+def _normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 &]+", " ", s.lower())).strip()
 
-def _compact(s: str) -> str:
+def _canon_compact(s: str) -> str:
     s = s.lower().replace("&", " and ")
     return re.sub(r"[^a-z0-9]+", "", s)
 
-def build_canon_map(overrides: dict) -> dict:
-    """
-    Map many alias spellings -> canonical YAML key.
-    Includes: key itself, aliases, '&' <-> 'and' variants, compact (no-space) forms.
-    """
-    m = {}
-    for key, cfg in (overrides or {}).items():
-        canon = str(key).strip().lower()
-        names = [canon] + [str(a).strip().lower() for a in cfg.get("aliases", [])]
-        extra = []
-        for a in list(names):
-            if " & " in a:   extra.append(a.replace(" & ", " and "))
-            if " and " in a: extra.append(a.replace(" and ", " & "))
-        names += extra
-        for n in names:
-            m[_norm_spaces(n)] = canon
-            m[_compact(n)]     = canon
-    return m
-
-CANON_MAP = build_canon_map(OVERRIDES)
-
-def canonicalize_client_id(s: str) -> str:
-    """Return canonical YAML key if known; else normalized fallback."""
-    return CANON_MAP.get(_norm_spaces(s)) or CANON_MAP.get(_compact(s)) or _norm_spaces(s)
-
-# ---- S3 Utilities ----
-def list_s3_pdfs(bucket: str, prefix: str) -> List[Dict[str, Any]]:
-    """Return [{'key':..., 'size':..., 'last_modified': epoch, 'basename':..., 'client_raw':...}]"""
-    out = []
-    token = None
-    while True:
-        kwargs = {"Bucket": bucket, "Prefix": prefix}
-        if token:
-            kwargs["ContinuationToken"] = token
-        resp = S3.list_objects_v2(**kwargs)
-        for obj in resp.get("Contents", []):
-            key = obj["Key"]
-            if not key.lower().endswith(".pdf"):
-                continue
-            base = Path(key).name
-            client_raw = client_from_filename(base)
-            out.append({
-                "key": key,
-                "basename": base,
-                "client_raw": client_raw,
-                "size": obj.get("Size"),
-                "last_modified": int(obj.get("LastModified").timestamp()) if obj.get("LastModified") else None,
-            })
-        if resp.get("IsTruncated"):
-            token = resp.get("NextContinuationToken")
-        else:
-            break
+def _build_alias_map(available: List[str]) -> Dict[str, Dict[str, set]]:
+    out = {}
+    for cid in available:
+        c = cid.strip().lower()
+        base = [c] + [str(a).strip().lower() for a in CLIENT_OVERRIDES.get(c, {}).get("aliases", [])]
+        more = []
+        for a in list(base):
+            if " & " in a:   more.append(a.replace(" & ", " and "))
+            if " and " in a: more.append(a.replace(" and ", " & "))
+        base += more
+        out[c] = {
+            "aliases_norm": {_normalize_text(a) for a in base},
+            "aliases_compact": {_canon_compact(a) for a in base},
+        }
     return out
 
-def download_to_tmp(bucket: str, key: str) -> Path:
-    local = TMP_DIR / Path(key).name
-    with open(local, "wb") as f:
-        S3.download_fileobj(bucket, key, f)
-    return local
-
-# ---- Filename → client id (use the head *before* first "__" or "_" or "-" ; keep spaces) ----
-def client_from_filename(name: str) -> str:
-    stem = Path(name).stem
-    if "__" in stem:
-        head = stem.split("__", 1)[0]
-    else:
-        head = re.split(r"[_-]", stem, maxsplit=1)[0]  # DO NOT split on spaces
-    return head.strip()
-
-# ---- Text vs scanned heuristic (fast, local) ----
-def has_text_first_pages(local_pdf: Path, sample_pages: int = SAMPLE_PAGES_FOR_CHECK) -> bool:
-    """If any of the first few pages has extractable text via pypdf → treat as text-PDF."""
+def detect_clients_from_text(text: str, available: List[str]) -> List[str]:
+    norm = f" {_normalize_text(text)} "
+    compact = _canon_compact(text)
+    amap = _build_alias_map(available)
+    detected = []
+    for cid, packs in amap.items():
+        if any(f" {a} " in norm for a in packs["aliases_norm"] if a):
+            detected.append(cid)
+    for cid, packs in amap.items():
+        if cid in detected: continue
+        if any(a and a in compact for a in packs["aliases_compact"]):
+            detected.append(cid)
     try:
-        reader = PdfReader(str(local_pdf))
-        n = min(sample_pages, len(reader.pages))
-        for i in range(n):
-            txt = (reader.pages[i].extract_text() or "").strip()
-            if txt:
-                return True
-        return False
+        from rapidfuzz import fuzz
+        for cid, packs in amap.items():
+            if cid in detected: continue
+            score = max((fuzz.partial_ratio(a, compact) for a in packs["aliases_compact"] if a), default=0)
+            if score >= 90:
+                detected.append(cid)
     except Exception:
-        return False
+        pass
+    return detected
 
-# ---- Build one client's FAISS ----
-def build_client(client_id: str, items: List[Dict[str, Any]], force: bool = False):
-    outdir = INDEX_DIR / client_id
-    if outdir.exists() and (outdir / "index.faiss").exists() and (outdir / "index.pkl").exists() and not force:
-        print(f"[skip] {client_id}: index already exists (use --force to rebuild).")
-        return
+# ========= Prompt =========
+prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a precise, client-scoped contract assistant. Use ONLY the Provided Context. "
+     "Provide complete information related to the query—do not skip any part. "
+     "Cover relevant clauses, definitions, conditions, exceptions, limits, timelines, "
+     "eligibility, required documents, steps, and edge cases found in the context. "
+     "If the context is insufficient, say what is missing and that you don't know. "
+     "No citations or bracket labels."),
+    ("human",
+     "Question: {question}\n\nProvided Context:\n{context}\n\nWrite the best possible answer now.")
+])
 
-    # chunking (can be per-client in YAML)
-    cfg = OVERRIDES.get(client_id, {})
-    chunk_size    = int(cfg.get("chunk_size", DEFAULT_CHUNK_SIZE))
-    chunk_overlap = int(cfg.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP))
-    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap, add_start_index=True)
+def _format_docs(docs) -> str:
+    return "\n\n".join(
+        f"(client: {d.metadata.get('client_id')}, policy: {d.metadata.get('policy_id')}, page: {d.metadata.get('page','?')})\n{d.page_content}"
+        for d in docs
+    )
 
-    all_chunks: List[Document] = []
-    manifest_docs: List[Dict[str, Any]] = []
+# ========= S3 helpers =========
+def presign(bucket: str, key: str, ttl: int = 3600) -> str:
+    return S3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=ttl,
+    )
 
-    for it in items:
-        key      = it["key"]
-        basename = it["basename"]
+def _download_s3_to_tmp(bucket: str, key: str) -> str:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp.close()
+    S3.download_file(bucket, key, tmp.name)
+    return tmp.name
 
-        # Download once to (a) decide text vs scanned and (b) get page count for manifest
-        local_pdf = download_to_tmp(S3_BUCKET, key)
+# ========= Highlight helpers =========
+from difflib import SequenceMatcher
 
-        # quick page count + mtime/size
-        try:
-            reader = PdfReader(str(local_pdf))
-            page_count = len(reader.pages)
-        except Exception:
-            page_count = None
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
-        # decision: text or scanned
-        is_text = has_text_first_pages(local_pdf)
+def _pick_phrases(answer: str, chunk_text: str, max_phrases: int = 3) -> list[str]:
+    ans = _norm(answer).lower()
+    phrases = []
+    sentences = re.split(r"[.\n]+", chunk_text or "")
+    for s in sentences:
+        s2 = _norm(s)
+        if len(s2) >= 30 and s2.lower() in ans:
+            phrases.append(s2[:180])
+            if len(phrases) >= max_phrases: return phrases
+    for s in sentences:
+        s2 = _norm(s)
+        if len(s2) >= 40 and SequenceMatcher(None, s2.lower(), ans).quick_ratio() >= 0.65:
+            phrases.append(s2[:180])
+            if len(phrases) >= max_phrases: return phrases
+    return phrases
 
-        # Load per-page docs
-        per_page_docs: List[Document] = []
-        if is_text:
-            # Text PDF: use PyPDFLoader on local temp
-            docs = PyPDFLoader(str(local_pdf)).load()
-            for d in docs:
-                md = dict(d.metadata)
-                md.update({
-                    "client_id": client_id,
-                    "policy_id": basename,
-                    "page": int(md.get("page", 0)) + 1,    # 1-based
-                    "source_s3_bucket": S3_BUCKET,
-                    "source_s3_key": key,
-                })
-                per_page_docs.append(Document(page_content=d.page_content, metadata=md))
-        else:
-            # Scanned PDF: use AWS Textract loader against S3 URI
-            s3_uri = f"s3://{S3_BUCKET}/{key}"
+def _ann_from_pymupdf_file(local_pdf_path: str, page_num: int, phrases: list[str]) -> list[dict]:
+    ann = []
+    try:
+        with fitz.open(local_pdf_path) as doc:
+            if page_num < 1 or page_num > doc.page_count:
+                return ann
+            page = doc.load_page(page_num - 1)
+            seen = set()
+            for phrase in phrases:
+                if len(_norm(phrase)) < 8:
+                    continue
+                for r in page.search_for(phrase):
+                    key = (round(r.x0,1), round(r.y0,1), round(r.width,1), round(r.height,1))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    ann.append({
+                        "page": page_num,
+                        "x": float(r.x0), "y": float(r.y0),
+                        "width": float(r.width), "height": float(r.height),
+                        "color": "yellow",
+                    })
+                    if len(ann) >= 30:
+                        return ann
+    except Exception:
+        pass
+    return ann
+
+# ========= Routes =========
+@app.get("/clients")
+def api_list_clients() -> List[str]:
+    return list_clients()
+
+@app.get("/clients/{client_id}/documents")
+def api_client_documents(client_id: str):
+    cid = client_id.strip().lower()
+    manifest = (FAISS_INDEX_DIR / cid / "manifest.json")
+    docs = []
+    if manifest.exists():
+        data = json.loads(manifest.read_text())
+        for d in data.get("docs", []):
+            b = d.get("s3_bucket"); k = d.get("s3_key")
+            url = presign(b, k) if (b and k) else None
+            docs.append({
+                "policy_id": d.get("policy_id"),
+                "source_url": url,
+                "s3_bucket": b,
+                "s3_key": k,
+                "pages": d.get("pages"),
+                "client_id": cid,
+                "modified_time": d.get("modified_time"),
+            })
+    return sorted(docs, key=lambda x: x["policy_id"])
+
+class _AskReq(BaseModel):
+    question: str
+    client_ids: Optional[List[str]] = None
+
+@app.post("/ask", response_model=AskResponse)
+def ask(payload: _AskReq):
+    available = list_clients()
+    if not available:
+        raise HTTPException(404, "No client indexes available. Build indexes first.")
+
+    if payload.client_ids:
+        requested = sorted({c.strip().lower() for c in payload.client_ids})
+    else:
+        requested = detect_clients_from_text(payload.question, available)
+    if not requested:
+        raise HTTPException(400, f"No client detected. Mention a client name (e.g., {', '.join(available[:5])} …)")
+
+    invalid = [c for c in requested if c not in available]
+    if invalid:
+        raise HTTPException(404, f"Unknown client id(s): {invalid}. Available: {available}")
+
+    per_client_params = {c: choose_params(c) for c in requested}
+    temperature = min(p["temperature"] for p in per_client_params.values())
+    max_tokens  = max(p["max_tokens"]  for p in per_client_params.values())
+    n_clients   = len(requested)
+    per_cap     = max(1, math.ceil(MAX_COMBINED_K / n_clients))
+
+    combined_docs = []
+    for cid in requested:
+        vs = _load_index(cid)
+        k_yaml      = per_client_params[cid]["k"]
+        k_effective = min(k_yaml, per_cap)
+        retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": k_effective})
+        docs = retriever.get_relevant_documents(payload.question)
+        docs = [d for d in docs if str(d.metadata.get("client_id", "")).strip().lower() == cid]
+        combined_docs.extend(docs)
+
+    if not combined_docs:
+        raise HTTPException(404, f"No matching content for clients {requested}.")
+    if len(combined_docs) > MAX_COMBINED_K:
+        combined_docs = combined_docs[:MAX_COMBINED_K]
+
+    context = _format_docs(combined_docs)
+    llm = ChatBedrockConverse(model_id=LLM_MODEL, client=RUNTIME,
+                              temperature=temperature, max_tokens=max_tokens)
+    answer = (prompt | llm | StrOutputParser()).invoke({"question": payload.question, "context": context})
+
+    sources = []
+    for d in combined_docs:
+        meta = d.metadata
+        page_num = int(meta.get("page") or 1)
+        b = meta.get("source_s3_bucket"); k = meta.get("source_s3_key")
+        url = presign(b, k) if (b and k) else None
+
+        anns = []
+        # Try highlighting for text PDFs by downloading a temp copy
+        if b and k and url:
             try:
-                tex_loader = AmazonTextractPDFLoader(
-                    file_path=s3_uri,
-                    client=TEXTRACT,          # reuse our boto3 client
-                    # default mode extracts detected text lines; you can add features if needed
-                )
-                docs = tex_loader.load()
-                # The loader usually includes page numbers in metadata; normalize just in case.
-                for d in docs:
-                    md = dict(d.metadata)
-                    page = md.get("page") or md.get("Page") or 1
-                    try:
-                        page = int(page)
-                    except Exception:
-                        page = 1
-                    md.update({
-                        "client_id": client_id,
-                        "policy_id": basename,
-                        "page": page,                     # already 1-based typically
-                        "source_s3_bucket": S3_BUCKET,
-                        "source_s3_key": key,
-                    })
-                    per_page_docs.append(Document(page_content=d.page_content, metadata=md))
-            except Exception as e:
-                print(f"[warn] Textract failed for {basename}: {e}. Falling back to PyPDFLoader.")
-                docs = PyPDFLoader(str(local_pdf)).load()
-                for d in docs:
-                    md = dict(d.metadata)
-                    md.update({
-                        "client_id": client_id,
-                        "policy_id": basename,
-                        "page": int(md.get("page", 0)) + 1,
-                        "source_s3_bucket": S3_BUCKET,
-                        "source_s3_key": key,
-                    })
-                    per_page_docs.append(Document(page_content=d.page_content, metadata=md))
+                local_tmp = _download_s3_to_tmp(b, k)
+                phrases = _pick_phrases(answer, d.page_content, max_phrases=3)
+                anns = _ann_from_pymupdf_file(local_tmp, page_num, phrases)
+                try: os.unlink(local_tmp)
+                except Exception: pass
+            except Exception:
+                pass
 
-        # split + propagate metadata
-        for d in per_page_docs:
-            parts = splitter.split_documents([d])
-            for c in parts:
-                md = dict(c.metadata)
-                # ensure required fields exist
-                md.setdefault("client_id", client_id)
-                md.setdefault("policy_id", basename)
-                md.setdefault("page", d.metadata.get("page"))
-                md.setdefault("source_s3_bucket", S3_BUCKET)
-                md.setdefault("source_s3_key", key)
-                c.metadata = md
-                all_chunks.append(c)
-
-        # manifest entry
-        manifest_docs.append({
-            "policy_id": basename,
-            "s3_bucket": S3_BUCKET,
-            "s3_key": key,
-            "pages": page_count,
-            "modified_time": it.get("last_modified"),
-            "size": it.get("size"),
+        sources.append({
+            "policy_id": meta.get("policy_id"),
+            "page": page_num,
+            "client_id": meta.get("client_id"),
+            "source_url": url,      # <— Streamlit will fetch bytes from this
+            "annotations": anns,    # may be empty for Textract-only docs
         })
 
-    if not all_chunks:
-        print(f"[warn] {client_id}: no chunks")
-        return
-
-    vs = FAISS.from_documents(all_chunks, EMB)
-    outdir.mkdir(parents=True, exist_ok=True)
-    vs.save_local(str(outdir))
-    # write manifest
-    (outdir / "manifest.json").write_text(json.dumps({
-        "client_id": client_id,
-        "region": REGION,
-        "embed_model": EMBED_MODEL,
-        "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
-        "docs": manifest_docs,
-        "updated_at": int(time.time()),
-    }, indent=2))
-    print(f"[ok] {client_id}: {len(all_chunks)} chunks → {outdir}")
-
-# ---- Group by canonical client ----
-def group_items_by_client(objs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for it in objs:
-        raw = it["client_raw"]                # e.g., "BMW US" from filename head
-        cid = canonicalize_client_id(raw)     # -> "bmw" if configured in YAML
-        buckets[cid].append(it)
-    return buckets
-
-# ---- Main ----
-def main():
-    objs = list_s3_pdfs(S3_BUCKET, S3_PREFIX)
-    if not objs:
-        print(f"No PDFs found at s3://{S3_BUCKET}/{S3_PREFIX}")
-        return
-    by_client = group_items_by_client(objs)
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--client", help="build only this (canonical) client id (per YAML key)")
-    parser.add_argument("--force", action="store_true", help="force rebuild even if index exists")
-    args = parser.parse_args()
-
-    if args.client:
-        cid = canonicalize_client_id(args.client)
-        items = by_client.get(cid, [])
-        if not items:
-            print(f"No PDFs for client '{cid}' under s3://{S3_BUCKET}/{S3_PREFIX}")
-            return
-        build_client(cid, items, force=args.force)
-    else:
-        for cid, items in by_client.items():
-            build_client(cid, items, force=args.force)
-
-if __name__ == "__main__":
-    main()
+    return AskResponse(answer=answer, used_clients=requested, sources=sources)
