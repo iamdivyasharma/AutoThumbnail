@@ -1,0 +1,338 @@
+# index_clients.py
+# Build per-client FAISS indexes from PDFs in S3.
+# - Text PDFs  -> PyPDFLoader (local temp)
+# - Scanned    -> AmazonTextractPDFLoader (S3 path, async Textract)
+# Saves FAISS locally under faiss_indices/<client>/ and writes manifest.json
+
+import os
+import re
+import json
+import time
+import shutil
+import argparse
+from pathlib import Path
+from collections import defaultdict
+from typing import List, Dict, Any
+
+import boto3
+from boto3 import Session
+
+# PDF inspection & local parsing for text PDFs
+from pypdf import PdfReader
+
+# LangChain loaders
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import AmazonTextractPDFLoader
+
+# Chunking / vectors
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
+from langchain_community.vectorstores import FAISS
+from langchain_aws import BedrockEmbeddings
+
+# ========= EDIT THESE =========
+REGION      = "us-east-1"
+
+# S3 location of your PDFs (Textract requires S3)
+S3_BUCKET   = "YOUR_BUCKET_NAME"           # e.g., "my-bucket"
+S3_PREFIX   = "sagemaker/contracts/"       # e.g., "sagemaker/contracts/"
+
+# Local outputs (absolute paths recommended)
+INDEX_DIR    = Path("/ABS/PATH/TO/faiss_indices").resolve()
+CONFIGS_PATH = Path("/ABS/PATH/TO/configs/clients.yaml").resolve()
+TMP_DIR      = Path("/ABS/PATH/TO/_tmp_pdf_dl").resolve()
+
+INDEX_DIR.mkdir(parents=True, exist_ok=True)
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Bedrock models
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+
+# ⚠️ Dev creds (prefer IAM role in prod)
+AWS_ACCESS_KEY_ID     = "YOUR_ACCESS_KEY_ID"
+AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
+
+# Default chunking (can be overridden per client in YAML)
+DEFAULT_CHUNK_SIZE    = 1200
+DEFAULT_CHUNK_OVERLAP = 180
+SAMPLE_PAGES_FOR_CHECK = 3  # first N pages to decide text vs scanned
+# =============================
+
+# ---- AWS Sessions/clients (shared) ----
+SESSION = Session(
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=REGION,
+)
+S3 = SESSION.client("s3")
+TEXTRACT = SESSION.client("textract")
+EMB = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
+
+# ---- Load per-client overrides from YAML ----
+def load_yaml_overrides() -> Dict[str, Any]:
+    if not CONFIGS_PATH.exists():
+        return {}
+    import yaml
+    raw = yaml.safe_load(CONFIGS_PATH.read_text()) or {}
+    # normalize keys to lowercase
+    return {str(k).strip().lower(): (v or {}) for k, v in raw.items()}
+
+OVERRIDES = load_yaml_overrides()
+
+# ---- Canonicalization helpers (map many spellings to a single ID) ----
+def _norm_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 &]+", " ", s.lower())).strip()
+
+def _compact(s: str) -> str:
+    s = s.lower().replace("&", " and ")
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+def build_canon_map(overrides: dict) -> dict:
+    """
+    Map many alias spellings -> canonical YAML key.
+    Includes: key itself, aliases, '&' <-> 'and' variants, compact (no-space) forms.
+    """
+    m = {}
+    for key, cfg in (overrides or {}).items():
+        canon = str(key).strip().lower()
+        names = [canon] + [str(a).strip().lower() for a in cfg.get("aliases", [])]
+        extra = []
+        for a in list(names):
+            if " & " in a:   extra.append(a.replace(" & ", " and "))
+            if " and " in a: extra.append(a.replace(" and ", " & "))
+        names += extra
+        for n in names:
+            m[_norm_spaces(n)] = canon
+            m[_compact(n)]     = canon
+    return m
+
+CANON_MAP = build_canon_map(OVERRIDES)
+
+def canonicalize_client_id(s: str) -> str:
+    """Return canonical YAML key if known; else normalized fallback."""
+    return CANON_MAP.get(_norm_spaces(s)) or CANON_MAP.get(_compact(s)) or _norm_spaces(s)
+
+# ---- S3 Utilities ----
+def list_s3_pdfs(bucket: str, prefix: str) -> List[Dict[str, Any]]:
+    """Return [{'key':..., 'size':..., 'last_modified': epoch, 'basename':..., 'client_raw':...}]"""
+    out = []
+    token = None
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = S3.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents", []):
+            key = obj["Key"]
+            if not key.lower().endswith(".pdf"):
+                continue
+            base = Path(key).name
+            client_raw = client_from_filename(base)
+            out.append({
+                "key": key,
+                "basename": base,
+                "client_raw": client_raw,
+                "size": obj.get("Size"),
+                "last_modified": int(obj.get("LastModified").timestamp()) if obj.get("LastModified") else None,
+            })
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+        else:
+            break
+    return out
+
+def download_to_tmp(bucket: str, key: str) -> Path:
+    local = TMP_DIR / Path(key).name
+    with open(local, "wb") as f:
+        S3.download_fileobj(bucket, key, f)
+    return local
+
+# ---- Filename → client id (use the head *before* first "__" or "_" or "-" ; keep spaces) ----
+def client_from_filename(name: str) -> str:
+    stem = Path(name).stem
+    if "__" in stem:
+        head = stem.split("__", 1)[0]
+    else:
+        head = re.split(r"[_-]", stem, maxsplit=1)[0]  # DO NOT split on spaces
+    return head.strip()
+
+# ---- Text vs scanned heuristic (fast, local) ----
+def has_text_first_pages(local_pdf: Path, sample_pages: int = SAMPLE_PAGES_FOR_CHECK) -> bool:
+    """If any of the first few pages has extractable text via pypdf → treat as text-PDF."""
+    try:
+        reader = PdfReader(str(local_pdf))
+        n = min(sample_pages, len(reader.pages))
+        for i in range(n):
+            txt = (reader.pages[i].extract_text() or "").strip()
+            if txt:
+                return True
+        return False
+    except Exception:
+        return False
+
+# ---- Build one client's FAISS ----
+def build_client(client_id: str, items: List[Dict[str, Any]], force: bool = False):
+    outdir = INDEX_DIR / client_id
+    if outdir.exists() and (outdir / "index.faiss").exists() and (outdir / "index.pkl").exists() and not force:
+        print(f"[skip] {client_id}: index already exists (use --force to rebuild).")
+        return
+
+    # chunking (can be per-client in YAML)
+    cfg = OVERRIDES.get(client_id, {})
+    chunk_size    = int(cfg.get("chunk_size", DEFAULT_CHUNK_SIZE))
+    chunk_overlap = int(cfg.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP))
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap, add_start_index=True)
+
+    all_chunks: List[Document] = []
+    manifest_docs: List[Dict[str, Any]] = []
+
+    for it in items:
+        key      = it["key"]
+        basename = it["basename"]
+
+        # Download once to (a) decide text vs scanned and (b) get page count for manifest
+        local_pdf = download_to_tmp(S3_BUCKET, key)
+
+        # quick page count + mtime/size
+        try:
+            reader = PdfReader(str(local_pdf))
+            page_count = len(reader.pages)
+        except Exception:
+            page_count = None
+
+        # decision: text or scanned
+        is_text = has_text_first_pages(local_pdf)
+
+        # Load per-page docs
+        per_page_docs: List[Document] = []
+        if is_text:
+            # Text PDF: use PyPDFLoader on local temp
+            docs = PyPDFLoader(str(local_pdf)).load()
+            for d in docs:
+                md = dict(d.metadata)
+                md.update({
+                    "client_id": client_id,
+                    "policy_id": basename,
+                    "page": int(md.get("page", 0)) + 1,    # 1-based
+                    "source_s3_bucket": S3_BUCKET,
+                    "source_s3_key": key,
+                })
+                per_page_docs.append(Document(page_content=d.page_content, metadata=md))
+        else:
+            # Scanned PDF: use AWS Textract loader against S3 URI
+            s3_uri = f"s3://{S3_BUCKET}/{key}"
+            try:
+                tex_loader = AmazonTextractPDFLoader(
+                    file_path=s3_uri,
+                    client=TEXTRACT,          # reuse our boto3 client
+                    # default mode extracts detected text lines; you can add features if needed
+                )
+                docs = tex_loader.load()
+                # The loader usually includes page numbers in metadata; normalize just in case.
+                for d in docs:
+                    md = dict(d.metadata)
+                    page = md.get("page") or md.get("Page") or 1
+                    try:
+                        page = int(page)
+                    except Exception:
+                        page = 1
+                    md.update({
+                        "client_id": client_id,
+                        "policy_id": basename,
+                        "page": page,                     # already 1-based typically
+                        "source_s3_bucket": S3_BUCKET,
+                        "source_s3_key": key,
+                    })
+                    per_page_docs.append(Document(page_content=d.page_content, metadata=md))
+            except Exception as e:
+                print(f"[warn] Textract failed for {basename}: {e}. Falling back to PyPDFLoader.")
+                docs = PyPDFLoader(str(local_pdf)).load()
+                for d in docs:
+                    md = dict(d.metadata)
+                    md.update({
+                        "client_id": client_id,
+                        "policy_id": basename,
+                        "page": int(md.get("page", 0)) + 1,
+                        "source_s3_bucket": S3_BUCKET,
+                        "source_s3_key": key,
+                    })
+                    per_page_docs.append(Document(page_content=d.page_content, metadata=md))
+
+        # split + propagate metadata
+        for d in per_page_docs:
+            parts = splitter.split_documents([d])
+            for c in parts:
+                md = dict(c.metadata)
+                # ensure required fields exist
+                md.setdefault("client_id", client_id)
+                md.setdefault("policy_id", basename)
+                md.setdefault("page", d.metadata.get("page"))
+                md.setdefault("source_s3_bucket", S3_BUCKET)
+                md.setdefault("source_s3_key", key)
+                c.metadata = md
+                all_chunks.append(c)
+
+        # manifest entry
+        manifest_docs.append({
+            "policy_id": basename,
+            "s3_bucket": S3_BUCKET,
+            "s3_key": key,
+            "pages": page_count,
+            "modified_time": it.get("last_modified"),
+            "size": it.get("size"),
+        })
+
+    if not all_chunks:
+        print(f"[warn] {client_id}: no chunks")
+        return
+
+    vs = FAISS.from_documents(all_chunks, EMB)
+    outdir.mkdir(parents=True, exist_ok=True)
+    vs.save_local(str(outdir))
+    # write manifest
+    (outdir / "manifest.json").write_text(json.dumps({
+        "client_id": client_id,
+        "region": REGION,
+        "embed_model": EMBED_MODEL,
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "docs": manifest_docs,
+        "updated_at": int(time.time()),
+    }, indent=2))
+    print(f"[ok] {client_id}: {len(all_chunks)} chunks → {outdir}")
+
+# ---- Group by canonical client ----
+def group_items_by_client(objs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for it in objs:
+        raw = it["client_raw"]                # e.g., "BMW US" from filename head
+        cid = canonicalize_client_id(raw)     # -> "bmw" if configured in YAML
+        buckets[cid].append(it)
+    return buckets
+
+# ---- Main ----
+def main():
+    objs = list_s3_pdfs(S3_BUCKET, S3_PREFIX)
+    if not objs:
+        print(f"No PDFs found at s3://{S3_BUCKET}/{S3_PREFIX}")
+        return
+    by_client = group_items_by_client(objs)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", help="build only this (canonical) client id (per YAML key)")
+    parser.add_argument("--force", action="store_true", help="force rebuild even if index exists")
+    args = parser.parse_args()
+
+    if args.client:
+        cid = canonicalize_client_id(args.client)
+        items = by_client.get(cid, [])
+        if not items:
+            print(f"No PDFs for client '{cid}' under s3://{S3_BUCKET}/{S3_PREFIX}")
+            return
+        build_client(cid, items, force=args.force)
+    else:
+        for cid, items in by_client.items():
+            build_client(cid, items, force=args.force)
+
+if __name__ == "__main__":
+    main()
