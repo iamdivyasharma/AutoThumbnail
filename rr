@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+# index_clients.py
+# Build per-client FAISS indexes from local PDFs (./pdfs) with native text + AWS Textract fallback (no S3).
+# - Native text (fast): PyMuPDF (fitz)
+# - OCR fallback (scanned pages): Textract DetectDocumentText, page -> PNG bytes -> Textract -> lines + word boxes
+# - Embeddings: Amazon Titan v2 via Bedrock (langchain-aws)
+# - Output: faiss_indices/<client>/index.faiss, index.pkl, manifest.json
+
+from __future__ import annotations
+
+import os
+import re
+import json
+import time
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Iterable
+
+import fitz  # PyMuPDF
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+from langchain_aws import BedrockEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.schema import Document
+
+# ========= EDIT THESE (paths relative to this file by default) =========
+ROOT             = Path(__file__).parent.resolve()
+PDF_ROOT         = (ROOT / "pdfs").resolve()            # your local PDFs folder
+FAISS_INDEX_DIR  = (ROOT / "faiss_indices").resolve()   # where to write FAISS
+CONFIGS_PATH     = (ROOT / "configs" / "clients.yaml").resolve()  # optional (not required here)
+
+# ========= AWS / Bedrock / Textract =========
+REGION      = "us-east-1"
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+
+# Prefer IAM role in SageMaker; else fill these for dev
+AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "YOUR_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "YOUR_SECRET_ACCESS_KEY")
+
+SESSION  = boto3.Session(
+    region_name=REGION,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+)
+RUNTIME  = SESSION.client("bedrock-runtime", config=Config(retries={"max_attempts": 8, "mode": "adaptive"}))
+TEXTRACT = SESSION.client("textract",         config=Config(retries={"max_attempts": 8, "mode": "standard"}))
+EMB      = BedrockEmbeddings(model_id=EMBED_MODEL, client=RUNTIME)
+
+# ========= Chunking / OCR settings =========
+CHUNK_SIZE       = 1200
+CHUNK_OVERLAP    = 150
+TEXT_MIN_LEN     = 120      # if page native text shorter than this -> try Textract
+OCR_DPI          = 300      # 200–300 good balance; Textract payload must stay < ~10 MB per page
+USE_TEXTRACT_OCR = True     # set False to disable OCR fallback entirely
+
+# ========= Helpers =========
+
+def client_from_filename(name: str) -> str:
+    """
+    Use everything before the first delimiter as client id.
+    Delimiters: '__' (preferred), '_' or '-'. Spaces are preserved.
+    Examples:
+      'BMW US_policy1.pdf'        -> 'bmw us'
+      'Ernst & Young--doc.pdf'    -> 'ernst & young'
+      'kpmg__benefits_2024.pdf'   -> 'kpmg'
+    """
+    stem = Path(name).stem
+    if "__" in stem:
+        head = stem.split("__", 1)[0]
+    else:
+        head = re.split(r"[_-]", stem, maxsplit=1)[0]
+    return head.strip().lower()
+
+def clean_text(t: str) -> str:
+    # keep punctuation/newlines; normalize whitespace
+    return re.sub(r"[ \t]+\n", "\n", (t or "")).strip()
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Tuple[int, int, str]]:
+    """Return list of (start_idx, end_idx, chunk_text)."""
+    text = text or ""
+    n = len(text)
+    if n <= chunk_size:
+        return [(0, n, text)]
+    chunks = []
+    start = 0
+    while start < n:
+        end = min(n, start + chunk_size)
+        chunk = text[start:end]
+        chunks.append((start, end, chunk))
+        if end == n:
+            break
+        start = max(0, end - overlap)
+    return chunks
+
+def textract_words_to_pdf_points(words: List[dict], page_rect: fitz.Rect) -> List[dict]:
+    """
+    Convert Textract word 'Geometry' boxes (normalized [0..1]) to PDF points.
+    Textract: top-left origin; PyMuPDF uses same orientation (y down).
+    """
+    pdf_w = float(page_rect.width)
+    pdf_h = float(page_rect.height)
+    x0 = float(page_rect.x0)
+    y0 = float(page_rect.y0)
+    out = []
+    for w in words:
+        bb = w.get("BoundingBox") or {}
+        left   = float(bb.get("Left", 0.0))
+        top    = float(bb.get("Top", 0.0))
+        width  = float(bb.get("Width", 0.0))
+        height = float(bb.get("Height", 0.0))
+        out.append({
+            "text": w.get("Text", ""),
+            "x": x0 + left * pdf_w,
+            "y": y0 + top  * pdf_h,
+            "width":  width * pdf_w,
+            "height": height * pdf_h,
+        })
+    return out
+
+def textract_detect_document_text(img_bytes: bytes, max_attempts: int = 6, base_delay: float = 0.6) -> dict:
+    """Call Textract DetectDocumentText with retries (for throttling). Returns response dict."""
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return TEXTRACT.detect_document_text(Document={"Bytes": img_bytes})
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            http = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            throttled = code in ("ThrottlingException", "ProvisionedThroughputExceededException") or http in (429, 503)
+            if throttled and attempt < max_attempts:
+                delay = min(8.0, base_delay * (2 ** (attempt - 1))) + random.uniform(0, 0.2)
+                time.sleep(delay)
+                continue
+            raise
+
+def ocr_page_with_textract(page: fitz.Page, dpi: int = OCR_DPI) -> tuple[str, List[dict]]:
+    """
+    Render the page to PNG (in-memory), run Textract DetectDocumentText, return (full_text, word_boxes_in_pdf_points).
+    """
+    # Render to image bytes (PNG)
+    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    pix = page.get_pixmap(matrix=mat, alpha=False)  # RGB
+    img_bytes = pix.tobytes("png")
+
+    # Textract (sync)
+    resp = textract_detect_document_text(img_bytes)
+
+    # Gather LINES for readable text; WORDS for boxes
+    lines: List[str] = []
+    words: List[dict] = []
+    for b in resp.get("Blocks", []):
+        bt = b.get("BlockType")
+        if bt == "LINE":
+            txt = (b.get("Text") or "").strip()
+            if txt:
+                lines.append(txt)
+        elif bt == "WORD":
+            if (b.get("Text") or "").strip():
+                words.append(b)
+
+    page_text = "\n".join(lines).strip()
+    pdf_words = textract_words_to_pdf_points(words, page.rect)
+    return page_text, pdf_words
+
+@dataclass
+class DocInfo:
+    policy_id: str
+    source_file: str
+    pages: int
+    modified_time: int
+
+def scan_pdfs(root: Path) -> Dict[str, List[Path]]:
+    out: Dict[str, List[Path]] = {}
+    for p in root.rglob("*.pdf"):
+        # skip notebook checkpoints or hidden dirs
+        if any(part.startswith(".") for part in p.parts):
+            continue
+        if ".ipynb_checkpoints" in p.as_posix():
+            continue
+        cid = client_from_filename(p.name)
+        out.setdefault(cid, []).append(p)
+    for k in out:
+        out[k] = sorted(out[k], key=lambda x: x.name.lower())
+    return out
+
+def build_manifest_entry(pdf_path: Path) -> DocInfo:
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            pages = doc.page_count
+    except Exception:
+        pages = 0
+    stat = pdf_path.stat()
+    return DocInfo(
+        policy_id=pdf_path.name,
+        source_file=str(pdf_path.resolve()),
+        pages=pages,
+        modified_time=int(stat.st_mtime),
+    )
+
+def make_chunks_for_pdf(pdf_path: Path, client_id: str) -> Iterable[Document]:
+    """
+    Yield LangChain Documents (chunks) with metadata including optional 'ocr_words' for highlights.
+    """
+    policy_id = pdf_path.name
+    with fitz.open(str(pdf_path)) as doc:
+        for pnum in range(doc.page_count):
+            page = doc.load_page(pnum)
+
+            # 1) Try native text first
+            native_text = clean_text(page.get_text("text") or "")
+            text = native_text
+            ocr_words: List[dict] = []
+
+            # 2) Fallback to Textract if native text is likely missing/poor
+            if USE_TEXTRACT_OCR and len(native_text) < TEXT_MIN_LEN:
+                try:
+                    ocr_text, ocr_words = ocr_page_with_textract(page, dpi=OCR_DPI)
+                    ocr_text = clean_text(ocr_text)
+                    if len(ocr_text) > len(native_text):
+                        text = ocr_text
+                except Exception as e:
+                    # Textract failed -> keep native text (may be empty)
+                    pass
+
+            # If completely empty, keep it empty; still create a chunk so page is discoverable
+            for _, _, chunk in chunk_text(text):
+                meta = {
+                    "client_id": client_id,
+                    "policy_id": policy_id,
+                    "page": pnum + 1,                           # 1-based page number
+                    "source_file": str(pdf_path.resolve()),
+                }
+                if ocr_words:
+                    meta["ocr_words"] = ocr_words              # used by viewer for highlights
+                yield Document(page_content=chunk, metadata=meta)
+
+def index_client(client_id: str, pdfs: List[Path], force: bool = False) -> None:
+    client_dir = (FAISS_INDEX_DIR / client_id)
+    client_dir.mkdir(parents=True, exist_ok=True)
+
+    # Skip if already exists (unless force)
+    if not force and (client_dir / "index.faiss").exists() and (client_dir / "index.pkl").exists():
+        print(f"[skip] {client_id}: index already exists. Use --force to rebuild.")
+        return
+
+    docs: List[Document] = []
+    manifest_rows: List[DocInfo] = []
+
+    for pdf in pdfs:
+        manifest_rows.append(build_manifest_entry(pdf))
+        for d in make_chunks_for_pdf(pdf, client_id):
+            docs.append(d)
+
+    if not docs:
+        print(f"[{client_id}] No extractable text; skipping index.")
+        return
+
+    print(f"[{client_id}] Building FAISS with {len(docs)} chunks…")
+    vs = FAISS.from_documents(docs, EMB)
+    vs.save_local(str(client_dir))
+
+    manifest = {
+        "client_id": client_id,
+        "docs": [
+            {
+                "policy_id": m.policy_id,
+                "source_file": m.source_file,
+                "pages": m.pages,
+                "modified_time": m.modified_time,
+            } for m in manifest_rows
+        ],
+        "embed_model": EMBED_MODEL,
+        "region": REGION,
+        "generated_time": int(time.time()),
+    }
+    (client_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[{client_id}] Done. Index at {client_dir}")
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true", help="Rebuild indexes even if they already exist")
+    parser.add_argument("--client", help="Only index this client id (derived from filenames)")
+    args = parser.parse_args()
+
+    if not PDF_ROOT.exists():
+        raise SystemExit(f"PDF_ROOT does not exist: {PDF_ROOT}")
+    FAISS_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+    by_client = scan_pdfs(PDF_ROOT)
+    if not by_client:
+        print("No PDFs found.")
+        return
+
+    if args.client:
+        cid = args.client.strip().lower()
+        pdfs = by_client.get(cid, [])
+        if not pdfs:
+            print(f"No PDFs for client '{cid}' in {PDF_ROOT}")
+            return
+        index_client(cid, pdfs, force=args.force)
+    else:
+        print(f"Found {sum(len(v) for v in by_client.values())} PDFs across {len(by_client)} client(s).")
+        for client_id, pdfs in by_client.items():
+            index_client(client_id, pdfs, force=args.force)
+
+if __name__ == "__main__":
+    main()
