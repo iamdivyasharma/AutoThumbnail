@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# index_clients.py — Local PDFs + Textract OCR fallback (no S3), safe for Bedrock (no empty chunks)
+# index_clients.py — OCR page-wise, chunk PDF-wise (local PDFs + AWS Textract sync, no S3)
 
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ FAISS_INDEX_DIR  = Path("/ABS/PATH/TO/faiss_indices").resolve()  # e.g., "/home/
 REGION      = "us-east-1"
 EMBED_MODEL = "amazon.titan-embed-text-v2:0"
 
-# Prefer IAM role; for dev you can hardcode
 AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "YOUR_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "YOUR_SECRET_ACCESS_KEY")
 
@@ -43,11 +42,13 @@ TEXTRACT = SESSION.client("textract",         config=Config(retries={"max_attemp
 EMB      = BedrockEmbeddings(model_id=EMBED_MODEL, client=RUNTIME)
 
 # ========= Chunking / OCR settings =========
-CHUNK_SIZE       = 1200
-CHUNK_OVERLAP    = 150
-TEXT_MIN_LEN     = 120      # if native page text shorter than this -> try Textract
-OCR_DPI          = 300      # 200–300 good; keep Textract payload < ~10 MB/page
-USE_TEXTRACT_OCR = True     # set False to disable OCR fallback
+CHUNK_SIZE        = 1200
+CHUNK_OVERLAP     = 150
+TEXT_MIN_LEN      = 120      # native text length threshold
+MIN_NATIVE_WORDS  = 10       # native word count threshold
+OCR_DPI_CANDIDATES = [300, 240, 200, 150]  # adaptive
+MAX_TEXTRACT_BYTES = 9_500_000
+USE_TEXTRACT_OCR  = True
 
 # ========= Helpers =========
 
@@ -64,7 +65,7 @@ def clean_text(t: str) -> str:
     return re.sub(r"[ \t]+\n", "\n", (t or "")).strip()
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Tuple[int, int, str]]:
-    """Return list of (start_idx, end_idx, chunk_text) for NON-EMPTY text only."""
+    """Return list of (start_idx, end_idx, chunk_text); skip empty."""
     text = (text or "").strip()
     if not text:
         return []
@@ -76,7 +77,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     while start < n:
         end = min(n, start + chunk_size)
         chunk = text[start:end]
-        if chunk.strip():  # safety
+        if chunk.strip():
             chunks.append((start, end, chunk))
         if end == n:
             break
@@ -106,7 +107,7 @@ def textract_words_to_pdf_points(words: List[dict], page_rect: fitz.Rect) -> Lis
     return out
 
 def textract_detect_document_text(img_bytes: bytes, max_attempts: int = 6, base_delay: float = 0.6) -> dict:
-    """DetectDocumentText with simple exponential backoff for throttling."""
+    """DetectDocumentText with exponential backoff."""
     attempt = 0
     while True:
         attempt += 1
@@ -122,28 +123,45 @@ def textract_detect_document_text(img_bytes: bytes, max_attempts: int = 6, base_
                 continue
             raise
 
-def ocr_page_with_textract(page: fitz.Page, dpi: int = OCR_DPI) -> tuple[str, List[dict]]:
-    """Render page -> PNG bytes -> Textract -> (full_text, word_boxes PDF points)."""
-    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    img_bytes = pix.tobytes("png")
+def ocr_page_with_textract_adaptive(page: fitz.Page) -> tuple[str, List[dict], int] | tuple[str, List[dict], None]:
+    """Try multiple DPIs until PNG small enough + Textract succeeds."""
+    for dpi in OCR_DPI_CANDIDATES:
+        try:
+            mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img_bytes = pix.tobytes("png")
+            if len(img_bytes) > MAX_TEXTRACT_BYTES:
+                continue  # try lower DPI
+            resp = textract_detect_document_text(img_bytes)
+            lines, words = [], []
+            for b in resp.get("Blocks", []):
+                bt = b.get("BlockType")
+                if bt == "LINE":
+                    txt = (b.get("Text") or "").strip()
+                    if txt: lines.append(txt)
+                elif bt == "WORD":
+                    if (b.get("Text") or "").strip(): words.append(b)
+            page_text = "\n".join(lines).strip()
+            pdf_words = textract_words_to_pdf_points(words, page.rect)
+            return page_text, pdf_words, dpi
+        except Exception:
+            continue
+    return "", [], None
 
-    resp = textract_detect_document_text(img_bytes)
-
-    lines: List[str] = []
-    words: List[dict] = []
-    for b in resp.get("Blocks", []):
-        bt = b.get("BlockType")
-        if bt == "LINE":
-            txt = (b.get("Text") or "").strip()
-            if txt:
-                lines.append(txt)
-        elif bt == "WORD":
-            if (b.get("Text") or "").strip():
-                words.append(b)
-    page_text = "\n".join(lines).strip()
-    pdf_words = textract_words_to_pdf_points(words, page.rect)
-    return page_text, pdf_words
+def page_has_machine_text(page: fitz.Page) -> bool:
+    """Heuristic: true text if enough words or text blocks exist."""
+    try:
+        if len(page.get_text("words") or []) >= MIN_NATIVE_WORDS:
+            return True
+    except Exception:
+        pass
+    try:
+        rd = page.get_text("rawdict") or {}
+        if any(b.get("type") == 0 for b in rd.get("blocks", [])):  # 0 = text block
+            return True
+    except Exception:
+        pass
+    return False
 
 @dataclass
 class DocInfo:
@@ -154,9 +172,14 @@ class DocInfo:
 
 def scan_pdfs(root: Path) -> Dict[str, List[Path]]:
     out: Dict[str, List[Path]] = {}
-    for p in root.rglob("*.pdf"):
-        # skip hidden/temporary folders
-        if any(part.startswith(".") for part in p.parts):       # .ipynb_checkpoints, etc.
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() != ".pdf":
+            continue
+        if any(part.startswith(".") for part in p.parts):
+            continue
+        if ".ipynb_checkpoints" in p.as_posix():
             continue
         cid = client_from_filename(p.name)
         out.setdefault(cid, []).append(p)
@@ -178,39 +201,77 @@ def build_manifest_entry(pdf_path: Path) -> DocInfo:
         modified_time=int(stat.st_mtime),
     )
 
-def make_chunks_for_pdf(pdf_path: Path, client_id: str) -> Iterable[Document]:
-    """Yield LangChain Documents (non-empty chunks) with optional 'ocr_words'."""
-    policy_id = pdf_path.name
+def extract_pdf_pages(pdf_path: Path) -> tuple[List[str], Dict[int, List[dict]]]:
+    """
+    Return (page_texts, ocr_words_by_page).
+      - page_texts[p-1] = final text for page p (native or OCR)
+      - ocr_words_by_page[p] = list of word boxes for page p (empty if native used)
+    """
+    page_texts: List[str] = []
+    ocr_words_by_page: Dict[int, List[dict]] = {}
     with fitz.open(str(pdf_path)) as doc:
         for pnum in range(doc.page_count):
             page = doc.load_page(pnum)
-
             native_text = clean_text(page.get_text("text") or "")
-            text = native_text
-            ocr_words: List[dict] = []
+            use_native = page_has_machine_text(page) and len(native_text) >= TEXT_MIN_LEN
+            if use_native or not USE_TEXTRACT_OCR:
+                txt = native_text
+                words = []
+            else:
+                ocr_text, o_words, used_dpi = ocr_page_with_textract_adaptive(page)
+                ocr_text = clean_text(ocr_text)
+                if len(ocr_text) > len(native_text):
+                    txt = ocr_text
+                    words = o_words
+                else:
+                    txt = native_text
+                    words = []
+            page_texts.append(txt)
+            if words:
+                ocr_words_by_page[pnum + 1] = words  # 1-based
+    return page_texts, ocr_words_by_page
 
-            if USE_TEXTRACT_OCR and len(native_text) < TEXT_MIN_LEN:
-                try:
-                    ocr_text, o_words = ocr_page_with_textract(page, dpi=OCR_DPI)
-                    ocr_text = clean_text(ocr_text)
-                    if len(ocr_text) > len(native_text):
-                        text = ocr_text
-                        ocr_words = o_words
-                except Exception:
-                    # Textract failed; keep native (maybe empty)
-                    pass
+def build_pdfwise_chunks(page_texts: List[str], sep: str = "\n\n—— Page Break ——\n\n") -> tuple[str, List[Tuple[int,int,int]]]:
+    """
+    Concatenate all page texts into one doc string with separators.
+    Returns:
+      combined_text,
+      page_spans = [(page_num, start_idx, end_idx), ...]  # char ranges per page in combined_text
+    """
+    parts = []
+    spans: List[Tuple[int,int,int]] = []
+    cursor = 0
+    for i, txt in enumerate(page_texts, start=1):
+        ptxt = (txt or "").strip()
+        if ptxt:
+            parts.append(ptxt)
+            start = cursor
+            end = cursor + len(ptxt)
+            spans.append((i, start, end))
+            cursor = end
+        # add separator between pages (doesn't get a span)
+        if i != len(page_texts):
+            parts.append(sep)
+            cursor += len(sep)
+    combined = "".join(parts)
+    return combined, spans
 
-            # Create chunks only if non-empty text
-            for _, _, chunk in chunk_text(text):
-                meta = {
-                    "client_id": client_id,
-                    "policy_id": policy_id,
-                    "page": pnum + 1,                           # 1-based
-                    "source_file": str(pdf_path.resolve()),
-                }
-                if ocr_words:
-                    meta["ocr_words"] = ocr_words
-                yield Document(page_content=chunk, metadata=meta)
+def pages_covered_by_span(span_start: int, span_end: int, page_spans: List[Tuple[int,int,int]]) -> Tuple[int, int]:
+    """Map doc-level [start,end) into first/last page numbers using page_spans."""
+    first, last = None, None
+    for pnum, s, e in page_spans:
+        if e <= span_start:
+            continue
+        if s >= span_end:
+            break
+        if first is None:
+            first = pnum
+        last = pnum
+    if first is None:
+        first = page_spans[0][0] if page_spans else 1
+    if last is None:
+        last = first
+    return first, last
 
 def index_client(client_id: str, pdfs: List[Path], force: bool = False) -> None:
     client_dir = FAISS_INDEX_DIR / client_id
@@ -227,30 +288,37 @@ def index_client(client_id: str, pdfs: List[Path], force: bool = False) -> None:
     for pdf in pdfs:
         info = build_manifest_entry(pdf)
         manifest_rows.append(info)
-        for d in make_chunks_for_pdf(pdf, client_id):
-            # Safety: ensure no empty content goes to embeddings
-            if d.page_content and d.page_content.strip():
-                docs.append(d)
 
-    if not docs:
-        print(f"[{client_id}] No non-empty text extracted; skipping FAISS. Manifest still written.")
-        # Still write manifest so you can see files; but no index files will be created
-        (client_dir / "manifest.json").write_text(json.dumps({
-            "client_id": client_id,
-            "docs": [
-                {"policy_id": m.policy_id, "source_file": m.source_file, "pages": m.pages, "modified_time": m.modified_time}
-                for m in manifest_rows
-            ],
-            "embed_model": EMBED_MODEL,
-            "region": REGION,
-            "generated_time": int(time.time()),
-        }, indent=2), encoding="utf-8")
-        return
+        # 1) per-page extraction (native or OCR)
+        page_texts, ocr_words_by_page = extract_pdf_pages(pdf)
 
-    print(f"[{client_id}] Building FAISS with {len(docs)} chunks…")
-    vs = FAISS.from_documents(docs, EMB)  # <-- no empty strings now
-    vs.save_local(str(client_dir))
+        # 2) build one combined string per PDF + page spans
+        combined_text, page_spans = build_pdfwise_chunks(page_texts)
+        if not combined_text.strip():
+            print(f"[skip-doc] {pdf.name}: no text after OCR/native")
+            continue
 
+        # 3) chunk across the whole PDF text
+        for start, end, chunk in chunk_text(combined_text):
+            if not chunk.strip():
+                continue
+            pg_start, pg_end = pages_covered_by_span(start, end, page_spans)
+
+            # put OCR words only for the first page of this chunk (for highlights)
+            ocr_words = ocr_words_by_page.get(pg_start, [])
+
+            meta = {
+                "client_id": client_id,
+                "policy_id": pdf.name,
+                "page": pg_start,                   # first page covered (UI scroll point)
+                "page_end": pg_end,                # last page covered (extra metadata)
+                "source_file": str(pdf.resolve()),
+            }
+            if ocr_words:
+                meta["ocr_words"] = ocr_words
+            docs.append(Document(page_content=chunk, metadata=meta))
+
+    # Always write manifest so UI can browse even if no chunks
     (client_dir / "manifest.json").write_text(json.dumps({
         "client_id": client_id,
         "docs": [
@@ -262,6 +330,13 @@ def index_client(client_id: str, pdfs: List[Path], force: bool = False) -> None:
         "generated_time": int(time.time()),
     }, indent=2), encoding="utf-8")
 
+    if not docs:
+        print(f"[{client_id}] No non-empty text extracted; FAISS not created (browse only).")
+        return
+
+    print(f"[{client_id}] Building FAISS with {len(docs)} chunks…")
+    vs = FAISS.from_documents(docs, EMB)
+    vs.save_local(str(client_dir))
     print(f"[{client_id}] Done. Index at {client_dir}")
 
 def main():
@@ -275,7 +350,15 @@ def main():
         raise SystemExit(f"PDF_ROOT does not exist: {PDF_ROOT}")
     FAISS_INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
-    by_client = scan_pdfs(PDF_ROOT)
+    # scan .pdf/.PDF, skip hidden & checkpoints
+    by_client: Dict[str, List[Path]] = {}
+    for p in PDF_ROOT.rglob("*"):
+        if p.is_file() and p.suffix.lower() == ".pdf" and ".ipynb_checkpoints" not in p.as_posix():
+            cid = client_from_filename(p.name)
+            by_client.setdefault(cid, []).append(p)
+    for k in by_client:
+        by_client[k] = sorted(by_client[k], key=lambda x: x.name.lower())
+
     if not by_client:
         print("No PDFs found.")
         return
