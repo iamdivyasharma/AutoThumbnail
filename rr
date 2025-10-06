@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+# Contract Assistant with:
+# 1) Client-only dropdown -> shows DataFrame of Clause (categrpy/Category) + Content
+# 2) Free-text RAG Q&A
+# 3) Side-by-side PDF viewer (prefers presigned/public HTTPS; no S3 GetObject)
+
+import os
+from pathlib import Path
+from typing import Optional, List, Tuple
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import requests
+import pandas as pd
+import streamlit as st
+from streamlit_pdf_viewer import pdf_viewer  # pip install streamlit-pdf-viewer
+
+# -------------------- Config --------------------
+API_URL   = os.getenv("CONTRACT_API_URL", "http://localhost:8000")
+LOGO_PATH = os.getenv("CONTRACT_LOGO_PATH", "abc.jpg")
+IST = ZoneInfo("Asia/Kolkata")
+
+EXCEL_PATH = os.getenv("CONTRACT_EXCEL_PATH", "your_file.xlsx")  # set to exporter output if available
+
+COLUMN_ALIASES = {
+    "client":   ["Client Name", "Client", "Client_Name", "client", "client name"],
+    "category": ["Category", "categrpy", "Clause", "Topic", "Label", "category"],
+    "content":  ["Client Content", "Content", "Text", "Details", "Answer", "client content"],
+}
+
+st.set_page_config(page_title="Contract Assistant", page_icon="📄", layout="wide")
+
+# -------------------- Helpers --------------------
+def _is_s3_uri(path_or_none: Optional[str]) -> bool:
+    return bool(path_or_none) and str(path_or_none).lower().startswith("s3://")
+
+def _is_http_url(u: Optional[str]) -> bool:
+    return bool(u) and str(u).lower().startswith(("http://", "https://"))
+
+def _resolve_src_for_label(path_or_none: str) -> Optional[str]:
+    """For display labels only. Do NOT convert s3:// to local paths."""
+    if not path_or_none:
+        return None
+    if _is_s3_uri(path_or_none) or _is_http_url(path_or_none):
+        return path_or_none
+    p = Path(path_or_none)
+    return str(p if p.is_absolute() else (Path.cwd() / p))
+
+def _fmt_ist(ts: int | None) -> Optional[str]:
+    if not ts: return None
+    try: return datetime.fromtimestamp(int(ts), IST).strftime("%Y-%m-%d %H:%M")
+    except Exception: return None
+
+def _fetch_all_docs_for_client(client_id: str):
+    try:
+        resp = requests.get(f"{API_URL}/clients/{client_id}/documents", timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.warning(f"Could not fetch docs for {client_id}: {e}")
+        return []
+
+def _first_matching_column(df_cols: List[str], candidates: List[str]) -> Optional[str]:
+    normalized = {c.strip().lower(): c for c in df_cols}
+    for alias in candidates:
+        key = alias.strip().lower()
+        if key in normalized:
+            return normalized[key]
+    for c in df_cols:
+        for alias in candidates:
+            if alias.strip().lower() in c.strip().lower():
+                return c
+    return None
+
+def _prefer_url(doc: dict) -> Optional[str]:
+    """
+    Pick a browser-fetchable URL, if present.
+    Expect backend to add 'presigned_url' (or any https).
+    """
+    # Priority: explicit presigned/public/cloudfront URL; else if source_file is already https, use it.
+    return (
+        doc.get("presigned_url")
+        or doc.get("public_url")
+        or doc.get("cloudfront_url")
+        or (doc.get("source_file") if _is_http_url(doc.get("source_file")) else None)
+    )
+
+def _read_pdf_bytes_local_or_http(path_or_url: str) -> Optional[bytes]:
+    """
+    Only local path or HTTP(S). No S3 GetObject here by design.
+    """
+    try:
+        if not path_or_url:
+            return None
+        u = str(path_or_url)
+        if _is_http_url(u):
+            r = requests.get(u, timeout=120)
+            r.raise_for_status()
+            return r.content
+        # Local file
+        return Path(u).read_bytes()
+    except Exception:
+        return None
+
+@st.cache_data(show_spinner=False)
+def load_excel(path: str) -> Tuple[pd.DataFrame, str, str, str]:
+    df = pd.read_excel(path)
+    df.columns = [str(c).strip() for c in df.columns]
+    client_col = _first_matching_column(df.columns.tolist(), COLUMN_ALIASES["client"])
+    cat_col    = _first_matching_column(df.columns.tolist(), COLUMN_ALIASES["category"])
+    cont_col   = _first_matching_column(df.columns.tolist(), COLUMN_ALIASES["content"])
+
+    if not client_col or not cat_col or not cont_col:
+        missing = []
+        if not client_col: missing.append("Client Name")
+        if not cat_col:    missing.append("Category/categrpy")
+        if not cont_col:   missing.append("Client Content")
+        raise ValueError(
+            "Missing expected column(s) in Excel. "
+            f"Required (or aliases): {missing}. "
+            f"Found columns: {list(df.columns)}"
+        )
+
+    for col in [client_col, cat_col]:
+        df[col] = df[col].astype(str).str.strip()
+    return df, client_col, cat_col, cont_col
+
+# -------------------- Header --------------------
+if os.path.exists(LOGO_PATH):
+    st.markdown("<div style='text-align:center;'>", unsafe_allow_html=True)
+    st.image(LOGO_PATH, width=160)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+st.title("Contract Assistant — Multi-Client with Document Viewer")
+
+# -------------------- State --------------------
+if "answer" not in st.session_state: st.session_state.answer = ""
+if "used_clients" not in st.session_state: st.session_state.used_clients = []
+if "sources" not in st.session_state: st.session_state.sources = []
+if "client_docs" not in st.session_state: st.session_state.client_docs = {}
+if "selected_pdf_src" not in st.session_state: st.session_state.selected_pdf_src = None
+if "selected_label" not in st.session_state: st.session_state.selected_label = None
+if "selected_scroll_page" not in st.session_state: st.session_state.selected_scroll_page = None
+if "selected_annotations" not in st.session_state: st.session_state.selected_annotations = None
+if "_selected_doc" not in st.session_state: st.session_state._selected_doc = {}
+
+# -------------------- Layout --------------------
+left, right = st.columns([0.55, 0.45], gap="large")
+
+with left:
+    # ---------- Client Content Explorer (Excel) ----------
+    st.markdown("### Client Content Explorer")
+    try:
+        df, CLIENT_COL, CAT_COL, CONTENT_COL = load_excel(EXCEL_PATH)
+
+        clients = sorted(df[CLIENT_COL].dropna().unique().tolist())
+        sel_client = st.selectbox("Select a Client", ["-- Select --"] + clients, key="sel_client_excel")
+
+        if sel_client and sel_client != "-- Select --":
+            selection = (
+                df[df[CLIENT_COL] == sel_client]
+                [[CAT_COL, CONTENT_COL]]
+                .rename(columns={CAT_COL: "Clause", CONTENT_COL: "Content"})
+                .reset_index(drop=True)
+            )
+
+            if selection.empty:
+                st.warning("No clauses/content found for this client.")
+            else:
+                st.success(f"Showing clauses & content for **{sel_client}**")
+                st.dataframe(selection, use_container_width=True)
+
+        st.divider()
+
+    except Exception as e:
+        st.error(f"Could not load Excel: {e}")
+        st.caption(
+            "Check the file path and column names. "
+            "Expected columns (or aliases): "
+            f"client={COLUMN_ALIASES['client']}, "
+            f"category={COLUMN_ALIASES['category']} (includes 'categrpy'), "
+            f"content={COLUMN_ALIASES['content']}."
+        )
+
+    # ---------- Free-text RAG Q&A ----------
+    question = st.text_input("Ask a question (mention client name(s), e.g., 'EY', 'Bain', 'KPMG', 'BMW', 'Estee'):")
+
+    if st.button("Ask"):
+        if not question.strip():
+            st.warning("Please enter a question.")
+        else:
+            with st.spinner("Thinking..."):
+                try:
+                    resp = requests.post(f"{API_URL}/ask", json={"question": question}, timeout=120)
+                    if resp.status_code != 200:
+                        try:
+                            err = resp.json().get("detail", resp.text)
+                        except Exception:
+                            err = resp.text
+                        st.error(f"API error {resp.status_code}: {err}")
+                    else:
+                        data = resp.json()
+                        st.session_state.used_clients = [c.lower() for c in data.get("used_clients", [])]
+                        st.session_state.sources = data.get("sources", [])
+                        st.session_state.client_docs = {}
+                        st.session_state.selected_pdf_src = None
+                        st.session_state.selected_label = None
+                        st.session_state.selected_scroll_page = None
+                        st.session_state.selected_annotations = None
+                        st.session_state.answer = data.get("answer", "")
+
+                        for c in st.session_state.used_clients:
+                            st.session_state.client_docs[c] = _fetch_all_docs_for_client(c)
+
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Request failed: {e}")
+
+    if st.session_state.answer:
+        st.markdown("### Answer")
+        st.markdown(st.session_state.answer)
+
+    if st.session_state.used_clients:
+        st.caption(f"Detected client(s): {', '.join(st.session_state.used_clients)}")
+
+    if st.session_state.sources:
+        st.markdown("### Sources (retrieved)")
+        for i, s in enumerate(st.session_state.sources, start=1):
+            policy = s.get("policy_id")
+            page   = s.get("page")
+            src    = s.get("source_file", "")  # may be s3://, local, or https
+            anns   = s.get("annotations") or []
+            cols = st.columns([0.7, 0.3])
+            with cols[0]:
+                st.markdown(f"**[{i}]** `{policy}` — page **{page}**")
+                short_src = _resolve_src_for_label(src)
+                if short_src:
+                    st.caption(short_src)
+            with cols[1]:
+                if st.button("Open in viewer", key=f"open_src_{i}"):
+                    st.session_state.selected_label = f"{policy} — page {page}"
+                    st.session_state.selected_pdf_src = src
+                    st.session_state.selected_scroll_page = int(page) if isinstance(page, int) else None
+                    st.session_state.selected_annotations = anns
+                    st.session_state._selected_doc = s   # keep full record (to get presigned_url)
+                    st.rerun()
+
+    if st.session_state.client_docs:
+        st.markdown("### All documents (browse)")
+        for client, docs in st.session_state.client_docs.items():
+            with st.expander(f"Client: {client}", expanded=False):
+                if not docs:
+                    st.caption("No PDFs found.")
+                for j, d in enumerate(docs):
+                    src = d.get("source_file", "")
+                    pages = d.get("pages") or "?"
+                    mod_ist = _fmt_ist(d.get("modified_time"))
+                    label = f"📄 {d.get('policy_id')} ({pages} pages" + (f", modified {mod_ist} IST" if mod_ist else "") + ")"
+                    if st.button(label, key=f"alldoc_{client}_{j}"):
+                        st.session_state.selected_label = label
+                        st.session_state.selected_pdf_src = src
+                        st.session_state.selected_scroll_page = None
+                        st.session_state.selected_annotations = None
+                        st.session_state._selected_doc = d   # keep full record (to get presigned_url)
+                        st.rerun()
+
+with right:
+    st.markdown("### Document Viewer")
+    if st.session_state.selected_pdf_src:
+        st.caption(f"Showing: {st.session_state.selected_label or Path(str(st.session_state.selected_pdf_src)).name}")
+
+        # Prefer a browser-fetchable URL (no S3 GetObject in this app)
+        selected_doc = st.session_state.get("_selected_doc", {}) or {}
+        url = _prefer_url(selected_doc)
+
+        if url:
+            # Try passing the URL directly to streamlit-pdf-viewer; if not supported, fallback to iframe.
+            try:
+                pdf_viewer(
+                    url,
+                    width="100%", height=820, zoom_level="auto", viewer_align="center",
+                    show_page_separator=True, render_text=True,
+                    scroll_to_page=st.session_state.selected_scroll_page,
+                    annotations=st.session_state.get("selected_annotations") or []
+                )
+            except Exception:
+                st.components.v1.iframe(url, height=820)
+        else:
+            # Last resort: local/HTTP bytes only (never s3:// here)
+            bytes_ = _read_pdf_bytes_local_or_http(st.session_state.selected_pdf_src)
+            if bytes_:
+                try:
+                    pdf_viewer(
+                        bytes_,
+                        width="100%", height=820, zoom_level="auto", viewer_align="center",
+                        show_page_separator=True, render_text=True,
+                        scroll_to_page=st.session_state.selected_scroll_page,
+                        annotations=st.session_state.get("selected_annotations") or []
+                    )
+                except Exception as e:
+                    st.error(f"Could not display PDF: {e}")
+            else:
+                if _is_s3_uri(st.session_state.selected_pdf_src):
+                    st.warning("This PDF is in S3 and no presigned/public URL was provided. Ask backend to include 'presigned_url'.")
+                else:
+                    st.warning("Could not fetch the PDF (permission or path issue).")
+    else:
+        st.info("Select a source or any document on the left to preview it here.")
