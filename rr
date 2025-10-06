@@ -1,377 +1,279 @@
 #!/usr/bin/env python3
-# FastAPI backend (S3-aware):
-# - Free-text client detection (with aliases) + strict per-client retrieval
-# - Loads FAISS per client from local disk
-# - Yellow highlights via PyMuPDF exact search, supporting local paths **and** s3:// URIs
-# - Lists documents from per-client manifest.json (no local filesystem fallback)
-
-from __future__ import annotations
+# Contract Assistant with:
+# 1) Client-only dropdown -> shows DataFrame of Clause (categrpy/Category) + Content
+# 2) Free-text RAG Q&A
+# 3) Side-by-side PDF viewer (local files and s3:// URIs)
 
 import os
-import re
-import json
-import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, List, Tuple
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-import fitz  # PyMuPDF
-import yaml
+import requests
+import pandas as pd
+import streamlit as st
+from streamlit_pdf_viewer import pdf_viewer  # pip install streamlit-pdf-viewer
 import boto3
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
-from langchain_aws import BedrockEmbeddings, ChatBedrockConverse
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+# -------------------- Config --------------------
+API_URL   = os.getenv("CONTRACT_API_URL", "http://localhost:8000")
+LOGO_PATH = os.getenv("CONTRACT_LOGO_PATH", "abc.jpg")
+IST = ZoneInfo("Asia/Kolkata")
 
-# ========= EDIT THESE ABSOLUTE PATHS =========
-FAISS_INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve()
-CONFIGS_PATH    = Path("/ABS/PATH/TO/configs/clients.yaml").resolve()
+EXCEL_PATH = os.getenv("CONTRACT_EXCEL_PATH", "your_file.xlsx")  # set to exporter output if available
 
-# ========= AWS / Bedrock =========
-REGION = os.getenv("AWS_REGION", "us-east-1")
-EMBED_MODEL = "amazon.titan-embed-text-v2:0"
-LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
-
-# ⚠️ Dev creds (prefer IAM roles in prod)
+# AWS creds/region (IAM role recommended in prod)
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "YOUR_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "YOUR_SECRET_ACCESS_KEY")
 
-from boto3 import Session
-SESSION = Session(
+SESSION = boto3.Session(
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=REGION,
+    region_name=AWS_REGION,
 )
 S3_CLIENT = SESSION.client("s3")
 
-GLOBAL_DEFAULTS = {"k": 4, "temperature": 0.20, "max_tokens": 1200}
-MAX_COMBINED_K  = 12
+COLUMN_ALIASES = {
+    "client":   ["Client Name", "Client", "Client_Name", "client", "client name"],
+    "category": ["Category", "categrpy", "Clause", "Topic", "Label", "category"],
+    "content":  ["Client Content", "Content", "Text", "Details", "Answer", "client content"],
+}
 
-# Cache of FAISS stores
-_VS_CACHE: Dict[str, Any] = {}
-_STEP = 0
-MAX_LOADED = 5  # simple LRU: keep last N clients loaded
+st.set_page_config(page_title="Contract Assistant", page_icon="📄", layout="wide")
 
-app = FastAPI(title="Contract RAG Backend")
+# -------------------- Helpers --------------------
+def _is_s3_uri(path_or_none: Optional[str]) -> bool:
+    return bool(path_or_none) and str(path_or_none).lower().startswith("s3://")
 
-# ========= Models =========
-class AskRequest(BaseModel):
-    question: str
-    client_ids: Optional[List[str]] = None
-
-class AskResponse(BaseModel):
-    answer: str
-    used_clients: List[str]
-    sources: List[Dict[str, Any]]
-
-# ========= YAML / overrides =========
-def _load_overrides() -> Dict[str, Dict[str, Any]]:
-    if not CONFIGS_PATH.exists():
-        return {}
-    raw = yaml.safe_load(CONFIGS_PATH.read_text()) or {}
-    out: Dict[str, Dict[str, Any]] = {}
-    for k, v in raw.items():
-        if not isinstance(v, dict):
-            continue
-        ck = str(k).strip().lower()
-        out[ck] = {
-            "k": int(v.get("k", GLOBAL_DEFAULTS["k"])),
-            "temperature": float(v.get("temperature", GLOBAL_DEFAULTS["temperature"])),
-            "max_tokens": int(v.get("max_tokens", GLOBAL_DEFAULTS["max_tokens"])),
-            "aliases": [str(a).strip().lower() for a in v.get("aliases", [])],
-        }
-    return out
-
-CLIENT_OVERRIDES = _load_overrides()
-
-def list_clients() -> List[str]:
-    if not FAISS_INDEX_DIR.exists():
-        return []
-    clients = []
-    for p in FAISS_INDEX_DIR.iterdir():
-        if not p.is_dir() or p.name.startswith("."):
-            continue
-        if not (p / "index.faiss").exists() or not (p / "index.pkl").exists():
-            continue
-        clients.append(p.name)
-    return sorted(clients)
-
-def _load_index(client_id: str) -> FAISS:
-    """Load FAISS for a client with simple LRU cache."""
-    global _STEP
-    _STEP += 1
-    cid = client_id.strip().lower()
-    if cid in _VS_CACHE:
-        vs, _ = _VS_CACHE[cid]
-        _VS_CACHE[cid] = (vs, _STEP)
-        return vs
-    emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
-    vs = FAISS.load_local(str(FAISS_INDEX_DIR / cid), emb, allow_dangerous_deserialization=True)
-    _VS_CACHE[cid] = (vs, _STEP)
-    if len(_VS_CACHE) > MAX_LOADED:
-        oldest = min(_VS_CACHE.items(), key=lambda kv: kv[1][1])[0]
-        _VS_CACHE.pop(oldest, None)
-    return vs
-
-def choose_params(client_id: str) -> Dict[str, Any]:
-    return CLIENT_OVERRIDES.get(client_id.strip().lower(), GLOBAL_DEFAULTS.copy())
-
-# ========= Client detection from question =========
-def _normalize_text(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
-
-def _build_alias_map(available: List[str]) -> Dict[str, str]:
-    alias_map: Dict[str, str] = {}
-    for cid in available:
-        c = cid.lower().strip()
-        alias_map[_normalize_text(c)] = c
-        for a in CLIENT_OVERRIDES.get(c, {}).get("aliases", []):
-            alias_map[_normalize_text(a)] = c
-    return alias_map
-
-def detect_clients_from_text(text: str, available: List[str]) -> List[str]:
-    norm_text = f" {_normalize_text(text)} "
-    alias_map = _build_alias_map(available)
-    detected: List[str] = []
-    for alias_norm, cid in sorted(alias_map.items(), key=lambda kv: len(kv[0]), reverse=True):
-        if alias_norm and f" {alias_norm} " in norm_text:
-            if cid not in detected:
-                detected.append(cid)
-    return detected
-
-# ========= Prompt =========
-prompt = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a precise, client-scoped contract assistant. Use ONLY the Provided Context. "
-     "Provide complete information related to the query—do not skip any part. "
-     "Cover relevant clauses, definitions, conditions, exceptions, limits, timelines, "
-     "eligibility, required documents, steps, and edge cases found in the context. "
-     "If the context is insufficient, say what is missing and that you don't know. "
-     "No citations or bracket labels."),
-    ("human",
-     "Question: {question}\n\nProvided Context:\n{context}\n\nWrite the best possible answer now.")
-])
-
-def _format_docs(docs) -> str:
-    return "\n\n".join(
-        f"(client: {d.metadata.get('client_id')}, policy: {d.metadata.get('policy_id')}, page: {d.metadata.get('page','?')})\n{d.page_content}"
-        for d in docs
-    )
-
-# ========= S3 helpers =========
-def _is_s3_uri(path: Optional[str]) -> bool:
-    return isinstance(path, str) and path.lower().startswith("s3://")
-
-def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
     # s3://bucket/key...
     _, rest = uri.split("://", 1)
     bucket, key = rest.split("/", 1)
     return bucket, key
 
 def _read_pdf_bytes(path_or_uri: str) -> bytes:
+    """
+    Fetch PDF bytes from either a local path or s3:// URI.
+    """
     if _is_s3_uri(path_or_uri):
-        bkt, key = _parse_s3_uri(path_or_uri)
-        obj = S3_CLIENT.get_object(Bucket=bkt, Key=key)
+        bucket, key = _parse_s3_uri(path_or_uri)
+        obj = S3_CLIENT.get_object(Bucket=bucket, Key=key)
         return obj["Body"].read()
     else:
-        p = Path(path_or_uri)
-        return p.read_bytes()
+        return Path(path_or_uri).read_bytes()
 
-# ========= Manifest / Documents =========
-@app.get("/clients")
-def api_list_clients() -> List[str]:
-    return list_clients()
-
-@app.get("/clients/{client_id}/documents")
-def api_client_documents(client_id: str):
+def _resolve_src_for_label(path_or_none: str) -> Optional[str]:
     """
-    Reads the per-client manifest.json written by the indexer.
-    No local-folder fallback (since PDFs live in S3 now).
+    For display only. Do NOT convert s3:// to local paths.
     """
-    cid = client_id.strip().lower()
-    manifest = (FAISS_INDEX_DIR / cid / "manifest.json")
-    if not manifest.exists():
-        # Prefer failing fast so the UI tells you to (re)run the indexer
-        return []
-    data = json.loads(manifest.read_text())
-    docs = []
-    for d in data.get("docs", []):
-        docs.append({
-            "policy_id": d.get("policy_id"),
-            "source_file": d.get("source_file"),  # may be s3://bucket/key
-            "pages": d.get("pages"),
-            "client_id": cid,
-            "modified_time": d.get("modified_time"),
-            "modified_iso": (None if not d.get("modified_time")
-                             else __import__("datetime").datetime.fromtimestamp(d["modified_time"]).isoformat(timespec="seconds")),
-        })
-    return sorted(docs, key=lambda x: x["policy_id"])
+    if not path_or_none:
+        return None
+    if _is_s3_uri(path_or_none):
+        return path_or_none
+    p = Path(path_or_none)
+    return str(p if p.is_absolute() else (Path.cwd() / p))
 
-def client_from_filename(name: str) -> str:
-    stem = Path(name).stem  # drop .pdf
-    if "__" in stem:
-        head = stem.split("__", 1)[0]
-    else:
-        head = re.split(r"[_-]", stem, maxsplit=1)[0]
-    return head.strip().lower()
+def _fmt_ist(ts: int | None) -> Optional[str]:
+    if not ts: return None
+    try: return datetime.fromtimestamp(int(ts), IST).strftime("%Y-%m-%d %H:%M")
+    except Exception: return None
 
-# ========= Highlights (PyMuPDF exact search) =========
-from difflib import SequenceMatcher
-
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
-
-def _pick_phrases(answer: str, chunk_text: str, max_phrases: int = 3) -> list[str]:
-    ans = _norm(answer).lower()
-    phrases = []
-    sentences = re.split(r"[.\n]+", chunk_text or "")
-    for s in sentences:
-        s2 = _norm(s)
-        if len(s2) >= 30 and s2.lower() in ans:
-            phrases.append(s2[:180])
-            if len(phrases) >= max_phrases: return phrases
-    for s in sentences:
-        s2 = _norm(s)
-        if len(s2) >= 40 and SequenceMatcher(None, s2.lower(), ans).quick_ratio() >= 0.65:
-            phrases.append(s2[:180])
-            if len(phrases) >= max_phrases: return phrases
-    return phrases
-
-def _ann_from_pdf_path_or_s3(path_or_uri: str, page_num: int, phrases: list[str]) -> list[dict]:
-    """
-    Open either a local path or an s3:// URI, then search & build highlight boxes.
-    """
-    ann = []
+def _fetch_all_docs_for_client(client_id: str):
     try:
-        pdf_bytes = _read_pdf_bytes(path_or_uri)
-        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-            if page_num < 1 or page_num > doc.page_count:
-                return ann
-            page = doc.load_page(page_num - 1)
-            seen = set()
-            for phrase in phrases:
-                if len(_norm(phrase)) < 8:
-                    continue
-                for r in page.search_for(phrase):
-                    key = (round(r.x0,1), round(r.y0,1), round(r.width,1), round(r.height,1))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    ann.append({
-                        "page": page_num,
-                        "x": float(r.x0), "y": float(r.y0),
-                        "width": float(r.width), "height": float(r.height),
-                        "color": "yellow",
-                    })
-                    if len(ann) >= 30:
-                        return ann
-    except Exception:
-        pass
-    return ann
+        resp = requests.get(f"{API_URL}/clients/{client_id}/documents", timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.warning(f"Could not fetch docs for {client_id}: {e}")
+        return []
 
-def _ann_from_ocr_words(meta: dict, phrases: list[str]) -> list[dict]:
-    """
-    Backward-compat: highlight OCR words if present (legacy indexes).
-    The new indexer may not populate 'ocr_words'.
-    """
-    ann = []
-    words = meta.get("ocr_words") or []
-    if not words:
-        return ann
-    want = [re.sub(r"\s+", " ", (p or "").lower()).strip() for p in phrases if p]
-    if not want:
-        return ann
-    for w in words:
-        t = str(w.get("text", "")).lower().strip()
-        if not t:
-            continue
-        if any(t in ph for ph in want) and all(k in w for k in ("x","y","width","height")):
-            ann.append({
-                "page": int(meta.get("page") or 1),
-                "x": float(w["x"]), "y": float(w["y"]),
-                "width": float(w["width"]), "height": float(w["height"]),
-                "color": "yellow",
-            })
-        if len(ann) >= 60:
-            break
-    return ann
+def _first_matching_column(df_cols: List[str], candidates: List[str]) -> Optional[str]:
+    normalized = {c.strip().lower(): c for c in df_cols}
+    for alias in candidates:
+        key = alias.strip().lower()
+        if key in normalized:
+            return normalized[key]
+    for c in df_cols:
+        for alias in candidates:
+            if alias.strip().lower() in c.strip().lower():
+                return c
+    return None
 
-# ========= Ask =========
-def _format_context(docs):
-    return _format_docs(docs)
+@st.cache_data(show_spinner=False)
+def load_excel(path: str) -> Tuple[pd.DataFrame, str, str, str]:
+    df = pd.read_excel(path)
+    df.columns = [str(c).strip() for c in df.columns]
+    client_col = _first_matching_column(df.columns.tolist(), COLUMN_ALIASES["client"])
+    cat_col    = _first_matching_column(df.columns.tolist(), COLUMN_ALIASES["category"])
+    cont_col   = _first_matching_column(df.columns.tolist(), COLUMN_ALIASES["content"])
 
-@app.post("/ask", response_model=AskResponse)
-def ask(payload: AskRequest):
-    available = list_clients()
-    if not available:
-        raise HTTPException(404, "No client indexes available. Build indexes first.")
+    if not client_col or not cat_col or not cont_col:
+        missing = []
+        if not client_col: missing.append("Client Name")
+        if not cat_col:    missing.append("Category/categrpy")
+        if not cont_col:   missing.append("Client Content")
+        raise ValueError(
+            "Missing expected column(s) in Excel. "
+            f"Required (or aliases): {missing}. "
+            f"Found columns: {list(df.columns)}"
+        )
 
-    # Determine clients
-    if payload.client_ids:
-        requested = sorted({c.strip().lower() for c in payload.client_ids})
+    for col in [client_col, cat_col]:
+        df[col] = df[col].astype(str).str.strip()
+    return df, client_col, cat_col, cont_col
+
+# -------------------- Header --------------------
+if os.path.exists(LOGO_PATH):
+    st.markdown("<div style='text-align:center;'>", unsafe_allow_html=True)
+    st.image(LOGO_PATH, width=160)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+st.title("Contract Assistant — Multi-Client with Document Viewer")
+
+# -------------------- State --------------------
+if "answer" not in st.session_state: st.session_state.answer = ""
+if "used_clients" not in st.session_state: st.session_state.used_clients = []
+if "sources" not in st.session_state: st.session_state.sources = []
+if "client_docs" not in st.session_state: st.session_state.client_docs = {}
+if "selected_pdf_src" not in st.session_state: st.session_state.selected_pdf_src = None
+if "selected_label" not in st.session_state: st.session_state.selected_label = None
+if "selected_scroll_page" not in st.session_state: st.session_state.selected_scroll_page = None
+if "selected_annotations" not in st.session_state: st.session_state.selected_annotations = None
+
+# -------------------- Layout --------------------
+left, right = st.columns([0.55, 0.45], gap="large")
+
+with left:
+    # ---------- Client Content Explorer (Excel) ----------
+    st.markdown("### Client Content Explorer")
+    try:
+        df, CLIENT_COL, CAT_COL, CONTENT_COL = load_excel(EXCEL_PATH)
+
+        clients = sorted(df[CLIENT_COL].dropna().unique().tolist())
+        sel_client = st.selectbox("Select a Client", ["-- Select --"] + clients, key="sel_client_excel")
+
+        if sel_client and sel_client != "-- Select --":
+            selection = (
+                df[df[CLIENT_COL] == sel_client]
+                [[CAT_COL, CONTENT_COL]]
+                .rename(columns={CAT_COL: "Clause", CONTENT_COL: "Content"})
+                .reset_index(drop=True)
+            )
+
+            if selection.empty:
+                st.warning("No clauses/content found for this client.")
+            else:
+                st.success(f"Showing clauses & content for **{sel_client}**")
+                st.dataframe(selection, use_container_width=True)
+
+        st.divider()
+
+    except Exception as e:
+        st.error(f"Could not load Excel: {e}")
+        st.caption(
+            "Check the file path and column names. "
+            "Expected columns (or aliases): "
+            f"client={COLUMN_ALIASES['client']}, "
+            f"category={COLUMN_ALIASES['category']} (includes 'categrpy'), "
+            f"content={COLUMN_ALIASES['content']}."
+        )
+
+    # ---------- Free-text RAG Q&A ----------
+    question = st.text_input("Ask a question (mention client name(s), e.g., 'EY', 'Bain', 'KPMG', 'BMW', 'Estee'):")
+
+    if st.button("Ask"):
+        if not question.strip():
+            st.warning("Please enter a question.")
+        else:
+            with st.spinner("Thinking..."):
+                try:
+                    resp = requests.post(f"{API_URL}/ask", json={"question": question}, timeout=120)
+                    if resp.status_code != 200:
+                        try:
+                            err = resp.json().get("detail", resp.text)
+                        except Exception:
+                            err = resp.text
+                        st.error(f"API error {resp.status_code}: {err}")
+                    else:
+                        data = resp.json()
+                        st.session_state.used_clients = [c.lower() for c in data.get("used_clients", [])]
+                        st.session_state.sources = data.get("sources", [])
+                        st.session_state.client_docs = {}
+                        st.session_state.selected_pdf_src = None
+                        st.session_state.selected_label = None
+                        st.session_state.selected_scroll_page = None
+                        st.session_state.selected_annotations = None
+                        st.session_state.answer = data.get("answer", "")
+
+                        for c in st.session_state.used_clients:
+                            st.session_state.client_docs[c] = _fetch_all_docs_for_client(c)
+
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Request failed: {e}")
+
+    if st.session_state.answer:
+        st.markdown("### Answer")
+        st.markdown(st.session_state.answer)
+
+    if st.session_state.used_clients:
+        st.caption(f"Detected client(s): {', '.join(st.session_state.used_clients)}")
+
+    if st.session_state.sources:
+        st.markdown("### Sources (retrieved)")
+        for i, s in enumerate(st.session_state.sources, start=1):
+            policy = s.get("policy_id")
+            page   = s.get("page")
+            src    = s.get("source_file", "")  # may be local path or s3://
+            anns   = s.get("annotations") or []
+            cols = st.columns([0.7, 0.3])
+            with cols[0]:
+                st.markdown(f"**[{i}]** `{policy}` — page **{page}**")
+                short_src = _resolve_src_for_label(src)
+                if short_src:
+                    st.caption(short_src)
+            with cols[1]:
+                if st.button("Open in viewer", key=f"open_src_{i}"):
+                    st.session_state.selected_label = f"{policy} — page {page}"
+                    st.session_state.selected_pdf_src = src
+                    st.session_state.selected_scroll_page = int(page) if isinstance(page, int) else None
+                    st.session_state.selected_annotations = anns
+                    st.rerun()
+
+    if st.session_state.client_docs:
+        st.markdown("### All documents (browse)")
+        for client, docs in st.session_state.client_docs.items():
+            with st.expander(f"Client: {client}", expanded=False):
+                if not docs:
+                    st.caption("No PDFs found.")
+                for j, d in enumerate(docs):
+                    src = d.get("source_file", "")
+                    pages = d.get("pages") or "?"
+                    mod_ist = _fmt_ist(d.get("modified_time"))
+                    label = f"📄 {d.get('policy_id')} ({pages} pages" + (f", modified {mod_ist} IST" if mod_ist else "") + ")"
+                    if st.button(label, key=f"alldoc_{client}_{j}"):
+                        st.session_state.selected_label = label
+                        st.session_state.selected_pdf_src = src
+                        st.session_state.selected_scroll_page = None
+                        st.session_state.selected_annotations = None
+                        st.rerun()
+
+with right:
+    st.markdown("### Document Viewer")
+    if st.session_state.selected_pdf_src:
+        st.caption(f"Showing: {st.session_state.selected_label or Path(str(st.session_state.selected_pdf_src)).name}")
+        try:
+            pdf_bytes = _read_pdf_bytes(st.session_state.selected_pdf_src)
+            pdf_viewer(
+                pdf_bytes,
+                width="100%", height=820, zoom_level="auto", viewer_align="center",
+                show_page_separator=True, render_text=True,
+                scroll_to_page=st.session_state.selected_scroll_page,
+                annotations=st.session_state.get("selected_annotations") or []
+            )
+        except Exception as e:
+            st.error(f"Could not display PDF: {e}")
     else:
-        requested = detect_clients_from_text(payload.question, available)
-    if not requested:
-        raise HTTPException(400, f"No client detected in the question. Mention a client name (e.g., {', '.join(available[:5])} ...)")
-
-    invalid = [c for c in requested if c not in available]
-    if invalid:
-        raise HTTPException(404, f"Unknown client id(s): {invalid}. Available: {available}")
-
-    # Params merge
-    per_client_params = {c: choose_params(c) for c in requested}
-    temperature = min(p["temperature"] for p in per_client_params.values())
-    max_tokens  = max(p["max_tokens"]  for p in per_client_params.values())
-    n_clients   = len(requested)
-    per_cap     = max(1, math.ceil(MAX_COMBINED_K / n_clients))
-
-    # Retrieve
-    combined_docs = []
-    for cid in requested:
-        vs = _load_index(cid)
-        k_yaml      = per_client_params[cid]["k"]
-        k_effective = min(k_yaml, per_cap)
-        retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": k_effective})
-        docs = retriever.get_relevant_documents(payload.question)
-        # hard guard: keep only this client's docs
-        docs = [d for d in docs if str(d.metadata.get("client_id", "")).strip().lower() == cid]
-        combined_docs.extend(docs)
-
-    if not combined_docs:
-        raise HTTPException(404, f"No matching content for clients {requested}.")
-
-    if len(combined_docs) > MAX_COMBINED_K:
-        combined_docs = combined_docs[:MAX_COMBINED_K]
-
-    context = _format_context(combined_docs)
-    llm = ChatBedrockConverse(model_id=LLM_MODEL, client=SESSION.client("bedrock-runtime"),
-                              temperature=temperature, max_tokens=max_tokens)
-    chain = prompt | llm | StrOutputParser()
-    answer = chain.invoke({"question": payload.question, "context": context})
-
-    # Build sources + annotations (supports local paths and s3:// URIs)
-    sources = []
-    for d in combined_docs:
-        meta = d.metadata
-        page_num = int(meta.get("page") or 1)
-        path_or_uri = meta.get("source_file")
-
-        phrases = _pick_phrases(answer, d.page_content, max_phrases=3)
-
-        anns = []
-        if path_or_uri:
-            anns = _ann_from_pdf_path_or_s3(path_or_uri, page_num, phrases)
-        if not anns and meta.get("ocr_words"):
-            anns = _ann_from_ocr_words(meta, phrases)
-
-        sources.append({
-            "policy_id": meta.get("policy_id"),
-            "page": page_num,
-            "client_id": meta.get("client_id"),
-            "source_file": path_or_uri,  # local or s3://
-            "annotations": anns,
-        })
-
-    return AskResponse(answer=answer, used_clients=requested, sources=sources)
+        st.info("Select a source or any document on the left to preview it here.")
