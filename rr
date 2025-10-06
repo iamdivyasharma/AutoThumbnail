@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+# index_clients.py (S3 version)
+# Build per-client FAISS indexes from PDFs stored in S3.
+# - Editable PDFs (native text present): PyMuPDF page-by-page
+# - Scanned/image PDFs: AmazonTextractPDFLoader (multi-page on S3)
+# - Embeddings: Bedrock
+# - Output: FAISS under FAISS_INDEX_DIR/<client>/ + manifest.json
+
+from __future__ import annotations
+
+import os
+import re
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Iterable
+
+import fitz  # PyMuPDF
+
+from langchain_aws import BedrockEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.schema import Document
+
+# ---- Textract loader (for scanned PDFs) ----
+try:
+    from langchain_community.document_loaders import AmazonTextractPDFLoader
+    _HAS_TEXTRACT_LOADER = True
+except Exception:
+    _HAS_TEXTRACT_LOADER = False
+
+# ========= EDIT THESE =========
+S3_BUCKET     = os.environ.get("PDF_S3_BUCKET", "YOUR_BUCKET_NAME")
+S3_PREFIX     = os.environ.get("PDF_S3_PREFIX", "ALL_PDFS/")   # optional; '' to scan whole bucket
+FAISS_INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve() # where FAISS indexes are saved
+
+# ========= AWS / Bedrock =========
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+
+# ⚠️ Dev creds (prefer IAM roles in prod)
+AWS_ACCESS_KEY_ID     = os.environ.get("AWS_ACCESS_KEY_ID", "YOUR_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "YOUR_SECRET_ACCESS_KEY")
+
+import boto3
+from boto3 import Session
+SESSION = Session(
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=REGION,
+)
+S3_CLIENT = SESSION.client("s3")
+TEXTRACT_CLIENT = SESSION.client("textract")  # Textract must be same-region as the S3 object for multi-page
+
+# ========= Chunking params =========
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 150
+
+# ========= Detection params =========
+# A PDF is treated as "editable/native" if the majority of pages (up to SAMPLE_MAX_PAGES)
+# have >= this many native text chars via PyMuPDF.
+MIN_NATIVE_TEXT_CHARS = 120
+SAMPLE_MAX_PAGES = 50  # cap detection work on huge PDFs
+
+# ========= Helpers =========
+
+def s3_uri(bucket: str, key: str) -> str:
+    return f"s3://{bucket}/{key}"
+
+def client_from_filename(name_or_key: str) -> str:
+    """
+    Use everything before the first delimiter as client id.
+    Delimiters: '__' (preferred), '_' or '-'. Spaces preserved.
+    """
+    base = os.path.basename(name_or_key)
+    stem = os.path.splitext(base)[0]
+    if "__" in stem:
+        head = stem.split("__", 1)[0]
+    else:
+        head = re.split(r"[_-]", stem, maxsplit=1)[0]
+    return head.strip().lower()
+
+def clean_text(t: str) -> str:
+    return re.sub(r"[ \t]+\n", "\n", (t or "")).strip()
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Tuple[int, int, str]]:
+    text = text or ""
+    n = len(text)
+    if n == 0:
+        return []
+    if n <= chunk_size:
+        return [(0, n, text)]
+    chunks = []
+    start = 0
+    while start < n:
+        end = min(n, start + chunk_size)
+        chunks.append((start, end, text[start:end]))
+        if end == n:
+            break
+        start = max(0, end - overlap)
+    return chunks
+
+def s3_list_pdfs(bucket: str, prefix: str = "") -> List[str]:
+    """List all .pdf keys under bucket/prefix."""
+    keys: List[str] = []
+    kwargs = {"Bucket": bucket}
+    if prefix:
+        kwargs["Prefix"] = prefix
+    while True:
+        resp = S3_CLIENT.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents", []):
+            key = obj["Key"]
+            if key.lower().endswith(".pdf"):
+                keys.append(key)
+        token = resp.get("NextContinuationToken")
+        if not token:
+            break
+        kwargs["ContinuationToken"] = token
+    return sorted(keys, key=str.lower)
+
+def s3_get_object_bytes(bucket: str, key: str) -> bytes:
+    """Download full object bytes (simple, robust)."""
+    r = S3_CLIENT.get_object(Bucket=bucket, Key=key)
+    return r["Body"].read()
+
+def s3_head_modified_epoch(bucket: str, key: str) -> int:
+    try:
+        h = S3_CLIENT.head_object(Bucket=bucket, Key=key)
+        return int(h["LastModified"].timestamp())
+    except Exception:
+        return int(time.time())
+
+@dataclass
+class DocInfo:
+    policy_id: str
+    source_file: str
+    pages: int
+    modified_time: int
+
+def embedder():
+    return BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
+
+# ========= Editable vs. Scanned detection =========
+
+def is_editable_pdf_s3(bucket: str, key: str) -> bool:
+    """
+    Heuristic: open the PDF from S3 in-memory; if >50% of (up to SAMPLE_MAX_PAGES) pages
+    have >= MIN_NATIVE_TEXT_CHARS via PyMuPDF's native extraction, treat as editable.
+    Otherwise treat as scanned/image (Textract).
+    """
+    try:
+        b = s3_get_object_bytes(bucket, key)
+        with fitz.open(stream=b, filetype="pdf") as doc:
+            n = doc.page_count
+            if n == 0:
+                return False
+            check_pages = min(n, SAMPLE_MAX_PAGES)
+            hits = 0
+            for i in range(check_pages):
+                t = clean_text(doc.load_page(i).get_text("text"))
+                if len(t) >= MIN_NATIVE_TEXT_CHARS:
+                    hits += 1
+            return (hits / check_pages) >= 0.5
+    except Exception:
+        # If we can't open with PyMuPDF, defer to Textract
+        return False
+
+# ========= Textract extraction (multi-page on S3) =========
+
+def textract_by_page_s3(bucket: str, key: str) -> Dict[int, str]:
+    """
+    Use AmazonTextractPDFLoader directly on S3 object.
+    Returns {page_number: text}. If page metadata missing, falls back to {1: full_text}.
+    """
+    page_texts: Dict[int, str] = {}
+    if not _HAS_TEXTRACT_LOADER:
+        print(f"[WARN] AmazonTextractPDFLoader not available; skipping Textract for {key}")
+        return page_texts
+
+    try:
+        loader = AmazonTextractPDFLoader(
+            file_path=s3_uri(bucket, key),
+            client=TEXTRACT_CLIENT,  # ensure region matches bucket region for multi-page
+        )
+        docs = loader.load()  # list[Document], typically with metadata["page"]
+        if not docs:
+            return page_texts
+
+        any_page_meta = any(int(d.metadata.get("page", 0) or 0) > 0 for d in docs)
+        if any_page_meta:
+            for d in docs:
+                pno = int(d.metadata.get("page", 0) or 0) or 1
+                page_texts.setdefault(pno, "")
+                page_texts[pno] += ("\n\n" if page_texts[pno] else "") + clean_text(d.page_content or "")
+        else:
+            full = "\n\n".join(clean_text(d.page_content or "") for d in docs)
+            if full.strip():
+                page_texts[1] = full
+    except Exception as e:
+        print(f"[WARN] Textract extraction failed for s3://{bucket}/{key}: {e}")
+    return page_texts
+
+# ========= Chunkers =========
+
+def yield_chunks_editable_s3(bucket: str, key: str, client_id: str) -> Iterable[Document]:
+    """
+    PyMuPDF native text from S3, page-by-page.
+    """
+    policy_id = os.path.basename(key)
+    src = s3_uri(bucket, key)
+    b = s3_get_object_bytes(bucket, key)
+    with fitz.open(stream=b, filetype="pdf") as doc:
+        for pnum in range(doc.page_count):
+            text = clean_text(doc.load_page(pnum).get_text("text"))
+            if not text:
+                continue
+            for _, _, chunk in chunk_text(text):
+                if not chunk.strip():
+                    continue
+                meta = {
+                    "client_id": client_id,
+                    "policy_id": policy_id,
+                    "page": pnum + 1,
+                    "source_file": src,
+                    "extracted_by": "pymupdf",
+                }
+                yield Document(page_content=chunk, metadata=meta)
+
+def yield_chunks_scanned_s3(bucket: str, key: str, client_id: str) -> Iterable[Document]:
+    """
+    Amazon Textract for the whole (possibly multi-page) scanned PDF on S3.
+    """
+    policy_id = os.path.basename(key)
+    src = s3_uri(bucket, key)
+    page_texts = textract_by_page_s3(bucket, key)
+    for pno in sorted(page_texts.keys()):
+        text = clean_text(page_texts[pno])
+        if not text:
+            continue
+        for _, _, chunk in chunk_text(text):
+            if not chunk.strip():
+                continue
+            meta = {
+                "client_id": client_id,
+                "policy_id": policy_id,
+                "page": int(pno),
+                "source_file": src,
+                "extracted_by": "textract",
+            }
+            yield Document(page_content=chunk, metadata=meta)
+
+def make_chunks_for_pdf_s3(bucket: str, key: str, client_id: str) -> Iterable[Document]:
+    """
+    Decide per-file which path to use: editable/native (PyMuPDF) vs scanned/image (Textract).
+    """
+    if is_editable_pdf_s3(bucket, key):
+        yield from yield_chunks_editable_s3(bucket, key, client_id)
+    else:
+        yield from yield_chunks_scanned_s3(bucket, key, client_id)
+
+# ========= Group keys by client =========
+
+def scan_s3_pdfs_by_client(bucket: str, prefix: str = "") -> Dict[str, List[str]]:
+    keys = s3_list_pdfs(bucket, prefix)
+    out: Dict[str, List[str]] = {}
+    for key in keys:
+        cid = client_from_filename(key)
+        out.setdefault(cid, []).append(key)
+    for k in out:
+        out[k] = sorted(out[k], key=str.lower)
+    return out
+
+# ========= Manifest & Index =========
+
+def build_manifest_entry_s3(bucket: str, key: str) -> DocInfo:
+    pages = 0
+    try:
+        b = s3_get_object_bytes(bucket, key)
+        with fitz.open(stream=b, filetype="pdf") as doc:
+            pages = int(doc.page_count)
+    except Exception:
+        pages = 0
+    return DocInfo(
+        policy_id=os.path.basename(key),
+        source_file=s3_uri(bucket, key),
+        pages=pages,
+        modified_time=s3_head_modified_epoch(bucket, key),
+    )
+
+def index_client(client_id: str, s3_keys: List[str]) -> None:
+    client_dir = (FAISS_INDEX_DIR / client_id)
+    client_dir.mkdir(parents=True, exist_ok=True)
+
+    docs: List[Document] = []
+    manifest_rows: List[DocInfo] = []
+    for key in s3_keys:
+        manifest_rows.append(build_manifest_entry_s3(S3_BUCKET, key))
+        for doc in make_chunks_for_pdf_s3(S3_BUCKET, key, client_id):
+            docs.append(doc)
+
+    if not docs:
+        print(f"[{client_id}] No extractable text; skipping index.")
+        return
+
+    print(f"[{client_id}] Building FAISS with {len(docs)} chunks…")
+    vs = FAISS.from_documents(docs, embedder())
+    vs.save_local(str(client_dir))
+
+    manifest = {
+        "client_id": client_id,
+        "docs": [
+            {
+                "policy_id": m.policy_id,
+                "source_file": m.source_file,      # s3://...
+                "pages": m.pages,
+                "modified_time": m.modified_time,
+            }
+            for m in manifest_rows
+        ],
+        "generated_time": int(time.time()),
+    }
+    (client_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[{client_id}] Done. Index at {client_dir}")
+
+# ========= Main =========
+
+def main():
+    if not S3_BUCKET:
+        raise SystemExit("S3_BUCKET not set. Define env var PDF_S3_BUCKET or edit the script.")
+    FAISS_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+    by_client = scan_s3_pdfs_by_client(S3_BUCKET, S3_PREFIX)
+    if not by_client:
+        print(f"No PDFs found in s3://{S3_BUCKET}/{S3_PREFIX}")
+        return
+
+    total = sum(len(v) for v in by_client.values())
+    print(f"Found {total} PDFs across {len(by_client)} client(s) in s3://{S3_BUCKET}/{S3_PREFIX}")
+    for client_id, keys in by_client.items():
+        index_client(client_id, keys)
+
+if __name__ == "__main__":
+    main()
