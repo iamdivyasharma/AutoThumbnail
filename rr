@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # FastAPI backend (LOCAL PDFs only):
-# - Free-text client detection (with aliases) + strict per-client retrieval
+# - Free-text client detection (aliases incl. token-set & nospace) + strict per-client retrieval
+# - YAML keys are resolved to actual FAISS client ids, even if spaced/punctuated differently
 # - Loads FAISS per client from local disk
-# - Yellow highlights via PyMuPDF exact search, reading PDFs from a local "pdfs" directory
+# - Highlights via PyMuPDF, reading PDFs from a local "pdfs" directory
 # - Lists documents from per-client manifest.json and maps them to local pdfs by filename
 # - Serves local PDFs at /local-pdfs/<filename.pdf> for UIs to fetch directly
 
@@ -26,9 +27,9 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# ========= EDIT THESE ABSOLUTE PATHS =========
-FAISS_INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve()
-CONFIGS_PATH    = Path("/ABS/PATH/TO/configs/clients.yaml").resolve()
+# ========= EDIT THESE ABSOLUTE PATHS (or envs) =========
+FAISS_INDEX_DIR = Path(os.getenv("CONTRACT_FAISS_DIR", "/ABS/PATH/TO/faiss_indices")).resolve()
+CONFIGS_PATH    = Path(os.getenv("CONTRACT_CLIENTS_YAML", "./configs/clients.yaml")).resolve()
 
 # ========= Local PDFs directory (no S3) =========
 PDFS_DIR = Path(os.getenv("CONTRACT_LOCAL_PDF_DIR", "pdfs")).resolve()
@@ -73,8 +74,29 @@ class AskResponse(BaseModel):
     used_clients: List[str]
     sources: List[Dict[str, Any]]
 
-# ========= YAML / overrides =========
-def _load_overrides() -> Dict[str, Dict[str, Any]]:
+# ========= Utility normalizers =========
+def _normalize_text(s: str) -> str:
+    # Lowercase, remove non-alphanumerics -> single spaces, trim.
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+def _canon(s: str) -> str:
+    return _normalize_text(s)
+
+def _tokset(s: str) -> Tuple[str, ...]:
+    return tuple(sorted(_canon(s).split()))
+
+def _raw_upper_tokens(s: str) -> set[str]:
+    """
+    Tokenize on non-alphanumerics directly from the original text,
+    return set of tokens in UPPERCASE to preserve signal for short aliases
+    like 'EL' while avoiding accidental matches with 'el' in Spanish.
+    """
+    toks = re.split(r"[^A-Za-z0-9]+", s or "")
+    return {t.upper() for t in toks if t}
+
+# ========= YAML / overrides (RAW load + resolver to FAISS ids) =========
+def _load_overrides_raw() -> Dict[str, Dict[str, Any]]:
+    """Read YAML without mapping keys to FAISS ids yet."""
     if not CONFIGS_PATH.exists():
         return {}
     raw = yaml.safe_load(CONFIGS_PATH.read_text()) or {}
@@ -82,16 +104,70 @@ def _load_overrides() -> Dict[str, Dict[str, Any]]:
     for k, v in raw.items():
         if not isinstance(v, dict):
             continue
-        ck = str(k).strip().lower()
-        out[ck] = {
+        out[str(k).strip()] = {
             "k": int(v.get("k", GLOBAL_DEFAULTS["k"])),
             "temperature": float(v.get("temperature", GLOBAL_DEFAULTS["temperature"])),
             "max_tokens": int(v.get("max_tokens", GLOBAL_DEFAULTS["max_tokens"])),
-            "aliases": [str(a).strip().lower() for a in v.get("aliases", [])],
+            "aliases": [str(a).strip() for a in v.get("aliases", [])],  # keep original case for short-guard
         }
     return out
 
-CLIENT_OVERRIDES = _load_overrides()
+_OVERRIDES_RAW = _load_overrides_raw()
+_OVERRIDES_CACHE: Dict[str, Any] = {"avail_tuple": None, "resolved": {}}
+
+def _resolve_overrides_for_available(available: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Reconcile YAML keys to real FAISS client ids.
+    Matching rules:
+      1) exact (case-insensitive) match
+      2) canonical (punctuation-insensitive) match
+      3) token-set (order-insensitive) match
+    If multiple YAML keys map to the same client, later ones override earlier.
+    """
+    avail_tuple = tuple(sorted(available))
+    if _OVERRIDES_CACHE["avail_tuple"] == avail_tuple:
+        return _OVERRIDES_CACHE["resolved"]
+
+    # Build lookup tables for available client ids
+    by_lower = {c.lower(): c for c in available}
+    by_canon = {_canon(c): c for c in available}
+    by_tok   = {_tokset(c): c for c in available}
+
+    resolved: Dict[str, Dict[str, Any]] = {}
+
+    for yaml_key, cfg in _OVERRIDES_RAW.items():
+        target = None
+        key_l  = yaml_key.lower()
+        key_c  = _canon(yaml_key)
+        key_t  = _tokset(yaml_key)
+
+        if key_l in by_lower:
+            target = by_lower[key_l]
+        elif key_c in by_canon:
+            target = by_canon[key_c]
+        elif key_t in by_tok:
+            target = by_tok[key_t]
+
+        if not target:
+            # Couldn’t map this YAML entry to a real FAISS id; skip it
+            continue
+
+        # Keep aliases as provided (case preserved for short-guard)
+        resolved[target] = {
+            "k": int(cfg.get("k", GLOBAL_DEFAULTS["k"])),
+            "temperature": float(cfg.get("temperature", GLOBAL_DEFAULTS["temperature"])),
+            "max_tokens": int(cfg.get("max_tokens", GLOBAL_DEFAULTS["max_tokens"])),
+            "aliases": list(cfg.get("aliases", [])),
+        }
+
+    _OVERRIDES_CACHE["avail_tuple"] = avail_tuple
+    _OVERRIDES_CACHE["resolved"] = resolved
+    return resolved
+
+def choose_params(client_id: str) -> Dict[str, Any]:
+    avail = list_clients()
+    ov = _resolve_overrides_for_available(avail)
+    return ov.get(client_id.strip().lower(), GLOBAL_DEFAULTS.copy())
 
 def list_clients() -> List[str]:
     if not FAISS_INDEX_DIR.exists():
@@ -122,26 +198,7 @@ def _load_index(client_id: str) -> FAISS:
         _VS_CACHE.pop(oldest, None)
     return vs
 
-def choose_params(client_id: str) -> Dict[str, Any]:
-    return CLIENT_OVERRIDES.get(client_id.strip().lower(), GLOBAL_DEFAULTS.copy())
-
 # ========= Client detection from question (enhanced) =========
-def _normalize_text(s: str) -> str:
-    # Lowercase, remove non-alphanumerics -> single spaces, trim.
-    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
-
-def _tokenize_norm(s: str) -> list[str]:
-    return _normalize_text(s).split()
-
-def _raw_upper_tokens(s: str) -> set[str]:
-    """
-    Tokenize on non-alphanumerics directly from the original text,
-    return set of tokens in UPPERCASE to preserve signal for short aliases
-    like 'EL' while avoiding accidental matches with 'el' in Spanish.
-    """
-    toks = re.split(r"[^A-Za-z0-9]+", s or "")
-    return {t.upper() for t in toks if t}
-
 def _build_alias_records(available: List[str]) -> List[Dict[str, Any]]:
     """
     Build a richer alias list per client with multiple matching strategies:
@@ -157,7 +214,7 @@ def _build_alias_records(available: List[str]) -> List[Dict[str, Any]]:
         if not alias_norm:
             return
         toks = alias_norm.split()
-        short_guard = (len(alias_norm.replace(" ", "")) <= 2)  # e.g., "el", "ai", "uk"
+        short_guard = (len(alias_norm.replace(" ", "")) <= 2)  # e.g., "EL"
 
         # spaced
         records.append({
@@ -192,11 +249,15 @@ def _build_alias_records(available: List[str]) -> List[Dict[str, Any]]:
                 "short_guard": short_guard,
             })
 
-    # Pull configured aliases (including client_id itself)
+    # Pull configured aliases (including client_id itself) using the resolved YAML map
+    resolved_overrides = _resolve_overrides_for_available(available)
+
     for cid in available:
         c = cid.strip().lower()
+        # Always include the client id itself as an alias
         add_one(c, c)
-        for a in CLIENT_OVERRIDES.get(c, {}).get("aliases", []):
+        # Include aliases from resolved YAML (mapped to this exact cid)
+        for a in resolved_overrides.get(c, {}).get("aliases", []):
             add_one(c, a)
 
     # Prefer more specific entries first:
@@ -270,7 +331,6 @@ def _basename_from_any(path_or_uri: Optional[str]) -> Optional[str]:
     if not path_or_uri:
         return None
     s = str(path_or_uri)
-    # If it looks like a URI, strip scheme and keep the tail
     if "://" in s:
         try:
             tail = s.split("://", 1)[1]
