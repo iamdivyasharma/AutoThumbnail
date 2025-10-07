@@ -1,0 +1,94 @@
+# NEW imports
+import re
+from itertools import permutations
+
+# -------------------- Client name normalization --------------------
+# Map each canonical name to:
+#  - tokens: words whose any-order combination should match
+#  - aliases: extra regexes for shortcuts/variations
+CLIENT_NORMALIZATION = {
+    "BMW US": {
+        "tokens": ["bmw", "us"],
+        "aliases": [
+            r"\bbmw\s*usa\b",           # "bmw usa"
+            r"\bbmw\s*us\b",            # "bmw us"
+        ],
+    },
+    "Estee Lauder": {
+        "tokens": ["est(?:e|é)e", "lauder"],  # estee / estée
+        "aliases": [
+            r"\best(?:e|é)e\s+lauder\b",  # "estee lauder" / "estée lauder"
+            r"\bel\b",                    # "el" (beware: may over-match Spanish "el")
+            r"\best(?:e|é)e\b",           # "estee" / "estée"
+            r"\blauder\b",                # "lauder"
+        ],
+    },
+    # add more canonical clients here...
+}
+
+def _compile_patterns():
+    compiled = []
+    for canon, spec in CLIENT_NORMALIZATION.items():
+        pats = set()
+
+        # any-order combos for tokens
+        tokens = spec.get("tokens", [])
+        if tokens:
+            for perm in permutations(tokens, len(tokens)):
+                # allow spaces or separators between words (space, -, _, /)
+                pats.add(r"\b" + r"\s*[-_/]*\s*".join(perm) + r"\b")
+
+        # explicit aliases
+        for a in spec.get("aliases", []):
+            pats.add(a)
+
+        compiled.append(
+            (canon, [re.compile(p, flags=re.IGNORECASE) for p in sorted(pats, key=len, reverse=True)])
+        )
+    return compiled
+
+_COMPILED_CLIENT_PATTERNS = _compile_patterns()
+
+def normalize_clients_in_text(text: str) -> tuple[str, list[str]]:
+    """
+    Replace any client synonyms/variants in `text` with their canonical name.
+    Returns (normalized_text, detected_clients).
+    """
+    detected = set()
+    out = text
+
+    # replace longer patterns first to avoid partial overlaps
+    for canon, patterns in _COMPILED_CLIENT_PATTERNS:
+        for pat in patterns:
+            # replace all occurrences of this pattern with the canonical label
+            def _repl(m, canon=canon):
+                detected.add(canon)
+                return canon
+            out = pat.sub(_repl, out)
+
+    # collapse extra spaces that might be left after replacements
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    return out, sorted(detected)
+
+
+
+
+# ---------- Free-text RAG Q&A ----------
+question = st.text_input("Ask a question (mention client name(s), e.g., 'EY', 'Bain', 'KPMG', 'BMW', 'Estee'):")
+
+if st.button("Ask"):
+    if not question.strip():
+        st.warning("Please enter a question.")
+    else:
+        with st.spinner("Thinking..."):
+            try:
+                # NEW: normalize client mentions before sending
+                normalized_q, mapped_clients = normalize_clients_in_text(question)
+
+                # (Optional) show what changed
+                if normalized_q != question:
+                    st.caption(f"🔁 Normalized client names → **{', '.join(mapped_clients)}**")
+                    st.caption(f"Query sent: `{normalized_q}`")
+
+                resp = requests.post(f"{API_URL}/ask", json={"question": normalized_q}, timeout=120)
+                ...
