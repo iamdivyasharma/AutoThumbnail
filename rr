@@ -1,281 +1,206 @@
-# ======================= EXCEL RAG CHANNEL ==========================
+#!/usr/bin/env python3
+"""
+Create a fresh Excel sheet of (Client Name, Clauses, Sub Clauses, Clause Status)
+by querying a client-scoped RAG (FAISS + Bedrock). No input Excel required.
+
+- Discovers clients from FAISS_INDEX_DIR/<client>/ (must contain index.faiss + index.pkl).
+- For each client and each (Clause -> list[Sub Clause]) in CLAUSES:
+    * Query = "Clause + SubClause"
+    * Retrieve context from that client's FAISS
+    * Classify Clause Status as: Yes / No / Partial (ONLY from provided context)
+- Saves OUTPUT_XLSX with columns:
+    Client Name | Clauses | Sub Clauses | Clause Status
+
+Dependencies:
+  pip install -U pandas openpyxl "langchain-aws>=0.2.5" "langchain-community" "boto3>=1.34" faiss-cpu
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
 import pandas as pd
-from datetime import datetime
-from threading import RLock
+from boto3 import Session
+from langchain_aws import BedrockEmbeddings, ChatBedrock
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
-EXCEL_FILE = Path(os.getenv("LOCAL_EXCEL_PATH", "data/workbook.xlsx")).resolve()
-EXCEL_INDEX_DIR = Path(os.getenv("LOCAL_EXCEL_INDEX_DIR", "excel_faiss")).resolve()
-EXCEL_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+# ===================== EDIT THESE =====================
+FAISS_INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve()     # <-- set your FAISS root
+OUTPUT_XLSX     = Path("./client_clause_matrix.xlsx").resolve()    # <-- destination workbook
 
-EXCEL_HISTORY_DIR = Path(os.getenv("LOCAL_EXCEL_HISTORY_DIR", "excel_history")).resolve()
-EXCEL_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-
-_HISTORY_LOCK = RLock()
-
-_EXCEL = {
-    "df_by_sheet": {},     # {sheet_name: DataFrame}
-    "meta": {},            # {"sheets": [...], "rows": {...}, "mtime": "...", "path": "..."}
-    "vs": None,            # FAISS vectorstore for Excel chunks
-    "chunk_meta": [],      # [{sheet, start_row, end_row}]
-    "last_loaded_at": None,
+# Define your clauses with MULTIPLE sub-clauses each
+# Example structure:
+CLAUSES: Dict[str, List[str]] = {
+    "Data Management": [
+        "Data retention duration and deletion timelines",
+        "Data storage location and encryption at rest",
+        "Processing purposes and lawful bases",
+        "Data sharing and onward transfer restrictions",
+        "Responsibilities for incident response",
+    ],
+    "Data Suppression": [
+        "Opt-out process and suppression triggers",
+        "Suppression propagation timelines across systems",
+        "Audit trail / logging for suppression events",
+    ],
+    "Data Restrictions": [
+        "Prohibited uses (advertising / combining datasets)",
+        "Geographic restrictions or BU limitations",
+        "Access controls and least privilege",
+    ],
+    "Data Consent": [
+        "Consent withdrawal process and records",
+        "Renewal / re-consent cadence",
+        "Sensitive categories / age gating",
+    ],
+    # Add more clauses with lists of sub-clauses...
 }
-_EXCEL_HISTORY: Dict[str, List[Dict[str, Any]]] = {}   # session_id -> [{"role": "...", "text": "...", "time": iso}]
 
-# ---------- tiny disk persistence for history ----------
-def _hist_path(session_id: str) -> Path:
-    return EXCEL_HISTORY_DIR / f"{session_id}.jsonl"
+# AWS (for local testing only — prefer IAM roles in prod)
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "YOUR_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "YOUR_SECRET_ACCESS_KEY")
 
-def _load_history(session_id: str) -> List[Dict[str, Any]]:
-    with _HISTORY_LOCK:
-        if session_id in _EXCEL_HISTORY:
-            return _EXCEL_HISTORY[session_id]
-        p = _hist_path(session_id)
-        if not p.exists():
-            _EXCEL_HISTORY[session_id] = []
-            return []
-        out = []
-        for line in p.read_text().splitlines():
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                continue
-        _EXCEL_HISTORY[session_id] = out[-200:]
-        return _EXCEL_HISTORY[session_id]
+# Models
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
 
-def _append_history(session_id: str, role: str, text: str):
-    now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    rec = {"role": role, "text": text, "time": now}
-    with _HISTORY_LOCK:
-        sess = _EXCEL_HISTORY.setdefault(session_id, [])
-        sess.append(rec)
-        if len(sess) > 200:
-            _EXCEL_HISTORY[session_id] = sess[-200:]
-        # persist
-        _hist_path(session_id).write_text(
-            "\n".join(json.dumps(x, ensure_ascii=False) for x in _EXCEL_HISTORY[session_id])
-        )
+# Retrieval / generation
+K_PER_CLIENT = 6
+MAX_TOKENS   = 700
+TEMPERATURE  = 0.2
 
-# ---------- load & index workbook ----------
-def _load_excel_into_frames() -> Dict[str, pd.DataFrame]:
-    if not EXCEL_FILE.exists():
-        raise HTTPException(404, f"Excel file not found at {EXCEL_FILE}")
-    frames = pd.read_excel(EXCEL_FILE, sheet_name=None, engine=None)
-    norm = {}
-    for sh, df in frames.items():
-        df = df.copy()
-        df.columns = [str(c) for c in df.columns]
-        norm[str(sh)] = df
-    return norm
+# Valid statuses
+VALID_STATUSES = {"yes", "no", "partial"}
 
-def _df_rows_to_text(df: pd.DataFrame, sheet: str, start: int, end: int) -> str:
-    lines = [f"[sheet: {sheet}] rows {start+1}-{end}"]
-    for i in range(start, end):
-        row = df.iloc[i]
-        kv = ", ".join(f"{col}={repr(row[col])}" for col in df.columns)
-        lines.append(f"r{i+1}: {kv}")
-    return "\n".join(lines)
+# ===================== Prompt (JSON classification) =====================
+PROMPT_CLASSIFY = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a precise, client-scoped contract assistant. Use ONLY the Provided Context.\n"
+     "Task: Decide if the SPECIFIC sub-clause exists or is satisfied in the client's documents.\n"
+     "Return SINGLE-LINE JSON ONLY: {\"status\":\"Yes|No|Partial\"}.\n"
+     "- 'Yes'     = clear, specific evidence the sub-clause is present/affirmed.\n"
+     "- 'No'      = clear, specific evidence it is absent/contradicted or not found.\n"
+     "- 'Partial' = some evidence but incomplete/ambiguous/conditional.\n"
+     "DO NOT add code fences or any extra text; JSON only."
+    ),
+    ("human",
+     "Client: {client_id}\n"
+     "Clause: {clause}\n"
+     "Sub-Clause: {subclause}\n\n"
+     "Provided Context (from client PDFs):\n{context}\n\n"
+     "Classify status now. Output JSON only.")
+])
 
-def _build_excel_faiss() -> None:
-    df_by_sheet = _load_excel_into_frames()
-    sheets = list(df_by_sheet.keys())
-    rows = {s: int(len(df_by_sheet[s])) for s in sheets}
-    mtime = datetime.fromtimestamp(EXCEL_FILE.stat().st_mtime).isoformat(timespec="seconds")
+# ===================== Helpers =====================
+def list_clients_from_faiss(root: Path) -> List[str]:
+    if not root.exists():
+        return []
+    out = []
+    for p in root.iterdir():
+        if p.is_dir() and not p.name.startswith(".") and (p / "index.faiss").exists() and (p / "index.pkl").exists():
+            out.append(p.name)
+    return sorted(out)
 
-    emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
+def load_vs_for_client(client_id: str, session: Session) -> Optional[FAISS]:
+    path = FAISS_INDEX_DIR / client_id
+    if not (path / "index.faiss").exists():
+        return None
+    emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=session.client("bedrock-runtime"))
+    return FAISS.load_local(str(path), emb, allow_dangerous_deserialization=True)
 
-    texts = []
-    chunk_meta = []
-    CHUNK_SIZE = int(os.getenv("EXCEL_CHUNK_ROWS", "40"))
-    for sh in sheets:
-        df = df_by_sheet[sh]
-        n = len(df)
-        if n == 0:
-            continue
-        for start in range(0, n, CHUNK_SIZE):
-            end = min(start + CHUNK_SIZE, n)
-            text = _df_rows_to_text(df, sh, start, end)
-            texts.append(text)
-            chunk_meta.append({"sheet": sh, "start_row": start+1, "end_row": end})
-
-    if not texts:
-        raise HTTPException(400, "Excel workbook has no rows to index.")
-
-    vs = FAISS.from_texts(texts=texts, embedding=emb)
-    vs.save_local(str(EXCEL_INDEX_DIR))
-
-    _EXCEL["df_by_sheet"] = df_by_sheet
-    _EXCEL["meta"] = {"sheets": sheets, "rows": rows, "mtime": mtime, "path": str(EXCEL_FILE)}
-    _EXCEL["vs"] = vs
-    _EXCEL["chunk_meta"] = chunk_meta
-    _EXCEL["last_loaded_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-def _ensure_excel_loaded():
-    # if we’ve got both frames and the index, we’re good
-    if _EXCEL.get("vs") is not None and _EXCEL.get("df_by_sheet"):
-        return
-    # try to load saved index
-    try:
-        emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
-        _EXCEL["vs"] = FAISS.load_local(str(EXCEL_INDEX_DIR), emb, allow_dangerous_deserialization=True)
-    except Exception:
-        _EXCEL["vs"] = None
-    # ensure frames
-    if not _EXCEL.get("df_by_sheet"):
-        try:
-            _EXCEL["df_by_sheet"] = _load_excel_into_frames()
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(500, f"Failed to read Excel: {e}")
-    # rebuild if no vs
-    if _EXCEL["vs"] is None:
-        _build_excel_faiss()
-
-# ---------- conversation-aware Excel answer ----------
-def _rewrite_followup_to_standalone(question: str, history: List[Dict[str, Any]]) -> str:
-    """
-    Make a standalone question from the latest user message + short conversation window.
-    """
-    if not history:
-        return question
-
-    # take last 6 messages (max 3 user turns)
-    window = history[-6:]
-    llm = ChatBedrockConverse(model_id=LLM_MODEL, client=SESSION.client("bedrock-runtime"),
-                              temperature=0.0, max_tokens=200)
-    prompt_rewrite = ChatPromptTemplate.from_messages([
-        ("system", "You convert follow-up questions into standalone questions using prior chat turns."),
-        *[("user" if t["role"]=="user" else "assistant", t["text"]) for t in window],
-        ("user", "Rewrite the last user question into a self-contained question. Do not answer.")
-    ])
-    chain = prompt_rewrite | llm | StrOutputParser()
-    try:
-        out = chain.invoke({})
-        return out.strip() or question
-    except Exception:
-        return question
-
-def _excel_answer(question: str, k: int = 6, session_id: Optional[str] = None) -> Dict[str, Any]:
-    _ensure_excel_loaded()
-    vs = _EXCEL["vs"]
-
-    # ---- history & rewrite ----
-    hist = _load_history(session_id) if session_id else []
-    standalone_q = _rewrite_followup_to_standalone(question, hist)
-
-    # ---- retrieve with the standalone question ----
-    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": k})
-    docs = retriever.get_relevant_documents(standalone_q)
-
-    # build previews (sheet+rows) based on our own chunk_meta indexing
-    previews = []
-    # NOTE: FAISS returns docs without our external meta, so we attach previews heuristically by re-searching text in chunk_meta order
-    for d in docs:
-        # find matching chunk_meta by header line "[sheet: X] rows a-b" at the top of d.page_content
-        header_match = re.match(r"\[sheet:\s*(?P<sh>.+?)\]\s*rows\s*(?P<a>\d+)-(?P<b>\d+)", d.page_content or "", re.I)
-        if header_match:
-            sh = header_match.group("sh")
-            a  = int(header_match.group("a"))
-            b  = int(header_match.group("b"))
-            df = _EXCEL["df_by_sheet"].get(sh)
-            if df is not None:
-                df_slice = df.iloc[max(0, a-1):min(b, a-1+8)]
-                preview = df_slice.to_string(index=False)
-                previews.append(f"(sheet: {sh}, rows {a}-{min(b, a-1+8)})\n{preview}")
-
-    context = "\n\n---\n\n".join(previews) if previews else "(no preview)"
-
-    # ---- answer with history in the prompt ----
-    llm = ChatBedrockConverse(
-        model_id=LLM_MODEL,
-        client=SESSION.client("bedrock-runtime"),
-        temperature=0.15,
-        max_tokens=900
+def format_docs(docs) -> str:
+    # Compact but traceable
+    return "\n\n".join(
+        f"(client: {d.metadata.get('client_id')}, policy: {d.metadata.get('policy_id')}, page: {d.metadata.get('page','?')})\n{d.page_content}"
+        for d in docs
     )
-    # take a generous memory window
-    memory_window = hist[-10:]
 
-    excel_prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "You are a precise data analyst. Answer ONLY using the Provided Context from the Excel sheets. "
-         "Be specific with rows/columns where possible. If the data needed isn't in the context, say you don't know."),
-        *[("user" if t["role"]=="user" else "assistant", t["text"]) for t in memory_window],
-        ("user", "Question: {question}\n\nProvided Context:\n{context}\n\nAnswer now with specifics.")
-    ])
-    chain = excel_prompt | llm | StrOutputParser()
-    answer = chain.invoke({"question": question, "context": context})
+def retrieve_context_for(session: Session, client_id: str, clause: str, subclause: str) -> str:
+    vs = load_vs_for_client(client_id, session)
+    if not vs:
+        return ""
+    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": K_PER_CLIENT})
+    query = f"{clause} + {subclause}"  # <- clause + sub-clause
+    docs = retriever.get_relevant_documents(query)
+    # strict client guard
+    docs = [d for d in docs if str(d.metadata.get("client_id", "")).strip().lower() == client_id.strip().lower()]
+    if not docs:
+        return ""
+    return format_docs(docs)
 
-    # ---- persist history ----
-    if session_id:
-        _append_history(session_id, "user", question)
-        _append_history(session_id, "assistant", answer)
+def classify_status(session: Session, client_id: str, clause: str, subclause: str, context: str) -> str:
+    """Return 'Yes' / 'No' / 'Partial'."""
+    llm = ChatBedrock(
+        client=session.client("bedrock-runtime"),
+        model_id=LLM_MODEL,
+        model_kwargs={"temperature": float(TEMPERATURE), "max_tokens": int(MAX_TOKENS)},
+    )
+    chain = PROMPT_CLASSIFY | llm | StrOutputParser()
+    try:
+        raw = chain.invoke({
+            "client_id": client_id,
+            "clause": clause,
+            "subclause": subclause,
+            "context": (context or "(no matching context found)"),
+        }).strip()
+        # strip accidental fences/backticks
+        raw = raw.strip().strip("`")
+        m = re.search(r'"status"\s*:\s*"(?P<v>yes|no|partial)"', raw, flags=re.I)
+        if m:
+            v = m.group("v").strip().lower()
+            if v in VALID_STATUSES:
+                return v.capitalize()
+    except Exception:
+        pass
+    # Fallback policy:
+    # - If no context at all was retrieved -> "No" (not found).
+    # - If parse failed but we had some context -> "Partial" (ambiguous).
+    return "No" if not context else "Partial"
 
-    # ---- sources list ----
-    srcs = []
-    for d in docs:
-        header_match = re.match(r"\[sheet:\s*(?P<sh>.+?)\]\s*rows\s*(?P<a>\d+)-(?P<b>\d+)", d.page_content or "", re.I)
-        if header_match:
-            srcs.append({
-                "sheet": header_match.group("sh"),
-                "start_row": int(header_match.group("a")),
-                "end_row": int(header_match.group("b")),
-                "snippet": (d.page_content or "")[:300]
-            })
+def build_matrix(session: Session) -> pd.DataFrame:
+    clients = list_clients_from_faiss(FAISS_INDEX_DIR)
+    if not clients:
+        raise SystemExit(f"No clients found under {FAISS_INDEX_DIR}")
 
-    return {"answer": answer, "sources": srcs, "history": _EXCEL_HISTORY.get(session_id or "", [])}
+    rows: List[Dict[str, Any]] = []
+    for client_id in clients:
+        print(f"=== {client_id} ===")
+        for clause, subclauses in CLAUSES.items():
+            # de-dup and keep order
+            seen = set()
+            ordered_subs = [s for s in subclauses if not (s in seen or seen.add(s))]
+            for subclause in ordered_subs:
+                print(f"  - {clause} :: {subclause} ...", end="", flush=True)
+                context = retrieve_context_for(session, client_id, clause, subclause)
+                status  = classify_status(session, client_id, clause, subclause, context)
+                rows.append({
+                    "Client Name":   client_id,
+                    "Clauses":       clause,
+                    "Sub Clauses":   subclause,
+                    "Clause Status": status,   # Yes / No / Partial
+                })
+                print(f" {status}.")
+    return pd.DataFrame(rows, columns=["Client Name", "Clauses", "Sub Clauses", "Clause Status"])
 
-# ======= MODELS (Excel) =======
-class ExcelChatRequest(BaseModel):
-    question: str
-    session_id: Optional[str] = None
-    k: Optional[int] = 6
-    persist: Optional[bool] = True  # not used server-side now, kept for forwards-compat
+# ===================== Main =====================
+def main():
+    # AWS session
+    session = Session(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
+    )
 
-class ExcelChatResponse(BaseModel):
-    answer: str
-    sources: List[Dict[str, Any]]
-    history: List[Dict[str, Any]]
-    meta: Dict[str, Any]
+    df = build_matrix(session)
+    OUTPUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(OUTPUT_XLSX, index=False)
+    print(f"\nSaved: {OUTPUT_XLSX}")
 
-# ======= ROUTES (Excel) =======
-@app.get("/excel/metadata")
-def excel_metadata():
-    _ensure_excel_loaded()
-    return {
-        "path": _EXCEL["meta"].get("path"),
-        "mtime": _EXCEL["meta"].get("mtime"),
-        "sheets": _EXCEL["meta"].get("sheets"),
-        "rows": _EXCEL["meta"].get("rows"),
-        "last_loaded_at": _EXCEL.get("last_loaded_at"),
-    }
-
-@app.post("/excel/chat", response_model=ExcelChatResponse)
-def excel_chat(payload: ExcelChatRequest):
-    if not payload.question or not payload.question.strip():
-        raise HTTPException(400, "Missing question.")
-    res = _excel_answer(payload.question.strip(), k=int(payload.k or 6), session_id=payload.session_id or "default")
-    meta = {
-        "path": _EXCEL["meta"].get("path"),
-        "mtime": _EXCEL["meta"].get("mtime"),
-        "sheets": _EXCEL["meta"].get("sheets"),
-    }
-    return ExcelChatResponse(answer=res["answer"], sources=res["sources"], history=res["history"], meta=meta)
-
-@app.post("/excel/refresh")
-def excel_refresh():
-    _build_excel_faiss()
-    return {"status": "ok", "message": "Excel reloaded and indexed.", "meta": _EXCEL["meta"]}
-
-@app.get("/excel/history/{session_id}")
-def get_excel_history(session_id: str):
-    return {"session_id": session_id, "history": _load_history(session_id)}
-
-@app.delete("/excel/history/{session_id}")
-def clear_excel_history(session_id: str):
-    with _HISTORY_LOCK:
-        _EXCEL_HISTORY.pop(session_id, None)
-        p = _hist_path(session_id)
-        if p.exists():
-            try: p.unlink()
-            except Exception: pass
-    return {"status": "ok", "session_id": session_id, "cleared": True}
+if __name__ == "__main__":
+    main()
