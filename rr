@@ -1,57 +1,215 @@
-# ... (imports and existing code stay the same) ...
+#!/usr/bin/env python3
+"""
+Create a fresh Excel sheet of:
+  Client Name | Clauses | Sub Clauses | Clause Status | Content | Evidence Snippets
+
+- Discovers clients from FAISS_INDEX_DIR/<client>/ (index.faiss + index.pkl).
+- For each client and each (Clause -> list[Sub Clause]) in CLAUSES:
+    * Query RAG using several query variants
+    * Classify status (Yes/No/Partial) from provided context
+    * Generate concise Content answer grounded in context (or clearly say unknown)
+    * Save separate Evidence Snippets for traceability
+
+Deps:
+  pip install -U pandas openpyxl "langchain-aws>=0.2.5" "langchain-community" "boto3>=1.34" faiss-cpu
+"""
+
+from __future__ import annotations
+
+import os, re
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+import pandas as pd
+from boto3 import Session
+from langchain_aws import BedrockEmbeddings, ChatBedrock
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# ===================== EDIT THESE =====================
+FAISS_INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve()
+OUTPUT_XLSX     = Path("./client_clause_matrix.xlsx").resolve()
+
+CLAUSES: Dict[str, List[str]] = {
+    "Data Management": [
+        "Data retention duration and deletion timelines",
+        "Data storage location and encryption at rest",
+        "Processing purposes and lawful bases",
+        "Data sharing and onward transfer restrictions",
+        "Responsibilities for incident response",
+    ],
+    "Data Suppression": [
+        "Opt-out process and suppression triggers",
+        "Suppression propagation timelines across systems",
+        "Audit trail / logging for suppression events",
+    ],
+    "Data Restrictions": [
+        "Prohibited uses (advertising / combining datasets)",
+        "Geographic restrictions or BU limitations",
+        "Access controls and least privilege",
+    ],
+    "Data Consent": [
+        "Consent withdrawal process and records",
+        "Renewal / re-consent cadence",
+        "Sensitive categories / age gating",
+    ],
+}
+
+# AWS (prefer IAM roles in prod)
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "YOUR_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "YOUR_SECRET_ACCESS_KEY")
+
+# Models
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
 
 # Retrieval / generation
 K_PER_CLIENT = 6
 MAX_TOKENS   = 700
 TEMPERATURE  = 0.2
-MAX_CONTEXT_CHARS = 8000   # prevent oversized prompts
-USE_MMR = False            # set True to diversify retrieval
+MAX_CONTEXT_CHARS = 8000   # clamp prompt size
+USE_MMR = False            # set True to diversify
 
-# Valid statuses
 VALID_STATUSES = {"yes", "no", "partial"}
 
-# ===== New: Answer prompt (generate brief answer grounded in context) =====
+# ===== Clause-specific guidance =====
+CLAUSE_PROMPTS: Dict[str, str] = {
+    "Data Management": (
+        "Focus on lifecycle: collection, storage, processing, sharing, deletion. "
+        "Extract definitions, responsibilities, retention, and governance controls."
+    ),
+    "Data Suppression": (
+        "Emphasize opt-out/suppression triggers, timelines, systems, who can request, "
+        "audit trails, exceptions, and procedural steps."
+    ),
+    "Data Restrictions": (
+        "Detail prohibited uses, geo or BU limits, consent prerequisites, access controls, "
+        "and exception escalation paths."
+    ),
+    "Data Consent": (
+        "Cover consent collection/renewal/withdrawal, lawful bases, records, UI/notice language, "
+        "and sensitive/age-related considerations."
+    ),
+}
+def clause_instructions_for(clause: str) -> str:
+    if clause in CLAUSE_PROMPTS:
+        return CLAUSE_PROMPTS[clause]
+    for k,v in CLAUSE_PROMPTS.items():
+        if k.lower() == clause.lower():
+            return v
+    return ("Extract specific policy details, steps, limits, definitions, and exceptions for this clause. "
+            "Use concise, actionable language grounded in the provided context.")
+
+# ===== Prompts =====
+PROMPT_CLASSIFY = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a precise, client-scoped contract assistant. Use ONLY the Provided Context.\n"
+     "Task: Decide if the SPECIFIC sub-clause exists or is satisfied in the client's documents.\n"
+     "Return SINGLE-LINE JSON ONLY: {\"status\":\"Yes|No|Partial\"}.\n"
+     "- 'Yes'     = clear, specific evidence the sub-clause is present/affirmed.\n"
+     "- 'No'      = clear, specific evidence it is absent/contradicted or not found.\n"
+     "- 'Partial' = some evidence but incomplete/ambiguous/conditional.\n"
+     "Do not fabricate. JSON only, no extra text.\n\n"
+     "Clause-specific guidance:\n{clause_instructions}"
+    ),
+    ("human",
+     "Client: {client_id}\nClause: {clause}\nSub-Clause: {subclause}\n\n"
+     "Provided Context (from client PDFs):\n{context}\n\n"
+     "Classify status now. Output JSON only.")
+])
+
 PROMPT_ANSWER = ChatPromptTemplate.from_messages([
     ("system",
      "You are a precise, client-scoped contract assistant. Use ONLY the Provided Context.\n"
      "Write a concise answer that directly addresses the sub-clause for this client.\n"
-     "Prefer bullet points and concrete details; no citations; no speculation.\n\n"
-     "Clause-specific guidance:\n{clause_instructions}"),
+     "Prefer bullet points and concrete details; no citations.\n"
+     "If context is insufficient, explicitly say you don't know and list what specific info is missing.\n\n"
+     "Clause-specific guidance:\n{clause_instructions}"
+    ),
     ("human",
-     "Client: {client_id}\n"
-     "Clause: {clause}\n"
-     "Sub-Clause: {subclause}\n\n"
+     "Client: {client_id}\nClause: {clause}\nSub-Clause: {subclause}\n\n"
      "Provided Context (from client PDFs):\n{context}\n\n"
      "Write the best possible answer now.")
 ])
 
-# ... CLAUSE_PROMPTS and clause_instructions_for(...) remain as added earlier ...
+# ===== Helpers =====
+def list_clients_from_faiss(root: Path) -> List[str]:
+    if not root.exists():
+        return []
+    out = []
+    for p in root.iterdir():
+        if p.is_dir() and not p.name.startswith(".") and (p / "index.faiss").exists() and (p / "index.pkl").exists():
+            out.append(p.name)
+    return sorted(out)
 
-def _nl_query(clause: str, subclause: str) -> str:
-    # Friendlier to retrieval than "A + B"
-    return f"Policy details for clause '{clause}' focusing on: {subclause}. Extract exact relevant language."
+def load_vs_for_client(client_id: str, session: Session) -> Optional[FAISS]:
+    path = FAISS_INDEX_DIR / client_id
+    if not (path / "index.faiss").exists():
+        return None
+    emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=session.client("bedrock-runtime"))
+    # Note: requires trusted indices; rebuild to drop allow_dangerous_deserialization if possible.
+    return FAISS.load_local(str(path), emb, allow_dangerous_deserialization=True)
 
 def _trim(s: str, limit: int = MAX_CONTEXT_CHARS) -> str:
     if s and len(s) > limit:
         return s[:limit] + "\n...\n[context trimmed]"
     return s or ""
 
+def format_docs(docs) -> str:
+    return "\n\n".join(
+        f"(client: {d.metadata.get('client_id')}, policy: {d.metadata.get('policy_id')}, page: {d.metadata.get('page','?')})\n{d.page_content}"
+        for d in docs
+    )
+
+def _nl_queries(clause: str, subclause: str) -> List[str]:
+    # try several flavors; dedupe by content later
+    return [
+        f"Policy details for clause '{clause}' focusing on: {subclause}. Extract exact relevant language.",
+        subclause,
+        f"{clause} — {subclause}",
+    ]
+
 def retrieve_context_for(session: Session, client_id: str, clause: str, subclause: str) -> str:
     vs = load_vs_for_client(client_id, session)
     if not vs:
+        print(f"[WARN] No index for client {client_id}")
         return ""
     search_type = "mmr" if USE_MMR else "similarity"
     retriever = vs.as_retriever(search_type=search_type, search_kwargs={"k": K_PER_CLIENT})
-    query = _nl_query(clause, subclause)
-    docs = retriever.get_relevant_documents(query)
-    # strict client guard
-    docs = [d for d in docs if str(d.metadata.get("client_id", "")).strip().lower() == client_id.strip().lower()]
-    if not docs:
+
+    # Collect docs across several query variants; keep order & dedupe
+    seen_ids = set()
+    collected = []
+    for q in _nl_queries(clause, subclause):
+        docs = retriever.get_relevant_documents(q) or []
+        for d in docs:
+            doc_id = getattr(d, "id", None) or (d.metadata.get("source"), d.metadata.get("page"))
+            if doc_id not in seen_ids:
+                seen_ids.add(doc_id)
+                collected.append(d)
+
+    pre = len(collected)
+
+    # Prefer strict client match, but be tolerant if metadata is missing
+    strict = [
+        d for d in collected
+        if str(d.metadata.get("client_id", "")).strip().lower() == client_id.strip().lower()
+    ]
+    post = len(strict)
+
+    # Fallback: if strict filtering nukes everything (common when metadata is missing),
+    # use the unfiltered docs since each client has its own FAISS folder anyway.
+    final_docs = strict if post > 0 else collected
+
+    print(f"[DEBUG] {client_id} :: {clause} :: {subclause} -> docs pre={pre}, post_strict={post}, used={len(final_docs)}")
+
+    if not final_docs:
         return ""
-    return _trim(format_docs(docs))
+    return _trim(format_docs(final_docs))
 
 def classify_status(session: Session, client_id: str, clause: str, subclause: str, context: str) -> str:
-    """Return 'Yes' / 'No' / 'Partial'."""
     llm = ChatBedrock(
         client=session.client("bedrock-runtime"),
         model_id=LLM_MODEL,
@@ -71,14 +229,13 @@ def classify_status(session: Session, client_id: str, clause: str, subclause: st
             v = m.group("v").strip().lower()
             if v in VALID_STATUSES:
                 return v.capitalize()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[ERROR] classify_status: {client_id} / {clause} / {subclause}: {e}")
+    # If no parse: assume No when no context, Partial otherwise
     return "No" if not context else "Partial"
 
-# ===== New: generate an answer string for the table =====
 def generate_answer(session: Session, client_id: str, clause: str, subclause: str, context: str) -> str:
-    if not context:
-        return ""  # nothing to ground on
+    """Always produce a non-empty Content: if context is empty, the LLM will explicitly say it doesn't know."""
     llm = ChatBedrock(
         client=session.client("bedrock-runtime"),
         model_id=LLM_MODEL,
@@ -86,19 +243,19 @@ def generate_answer(session: Session, client_id: str, clause: str, subclause: st
     )
     chain = PROMPT_ANSWER | llm | StrOutputParser()
     try:
-        return chain.invoke({
+        return (chain.invoke({
             "client_id": client_id,
             "clause": clause,
             "subclause": subclause,
-            "context": context,
+            "context": (context or "(no matching context found)"),
             "clause_instructions": clause_instructions_for(clause),
-        }).strip()
-    except Exception:
-        return ""
+        }) or "").strip()
+    except Exception as e:
+        print(f"[ERROR] generate_answer: {client_id} / {clause} / {subclause}: {e}")
+        return "I don't know based on the available context."
 
-def _first_evidence_lines(context: str, n_chars: int = 400) -> str:
-    # short evidence preview for traceability
-    return context[:n_chars] if context else ""
+def _evidence_snippet(context: str, n_chars: int = 400) -> str:
+    return (context or "")[:n_chars]
 
 def build_matrix(session: Session) -> pd.DataFrame:
     clients = list_clients_from_faiss(FAISS_INDEX_DIR)
@@ -115,15 +272,15 @@ def build_matrix(session: Session) -> pd.DataFrame:
                 print(f"  - {clause} :: {subclause} ...", end="", flush=True)
                 context = retrieve_context_for(session, client_id, clause, subclause)
                 status  = classify_status(session, client_id, clause, subclause, context)
-                content = generate_answer(session, client_id, clause, subclause, context) if context else ""
-                evidence = _first_evidence_lines(context)
+                content = generate_answer(session, client_id, clause, subclause, context)
+                evidence = _evidence_snippet(context)
                 rows.append({
                     "Client Name":       client_id,
                     "Clauses":           clause,
                     "Sub Clauses":       subclause,
                     "Clause Status":     status,      # Yes / No / Partial
-                    "Content":           content,     # <-- NEW
-                    "Evidence Snippets": evidence,    # <-- NEW (optional but useful)
+                    "Content":           content,     # <-- separate column
+                    "Evidence Snippets": evidence,    # <-- separate column
                 })
                 print(f" {status}.")
     return pd.DataFrame(
