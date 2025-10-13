@@ -1,87 +1,14 @@
-#!/usr/bin/env python3
-"""
-Creates:
-  Client Name | Clauses | Sub Clauses | Clause Status | Content
+# ... imports & config unchanged ...
 
-Behavior:
-- Discovers clients from FAISS_INDEX_DIR/<client>/ (index.faiss + index.pkl).
-- For each client and each (Clause -> list[Sub Clause]) in CLAUSES:
-    * Retrieve context with EXACT query:
-        "what are the content related to {clause} and {subclause}"
-    * Classify status (Yes/No/Partial) strictly from provided context (JSON)
-    * Ask the LLM to ANSWER the query grounded ONLY in the retrieved context
-    * Write that LLM answer into the "Content" column (never blank)
-
-Deps:
-  pip install -U pandas openpyxl "langchain-aws>=0.2.5" "langchain-community" "boto3>=1.34" faiss-cpu
-"""
-
-from __future__ import annotations
-
-import os, re
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-
-import pandas as pd
-from boto3 import Session
-from langchain_aws import BedrockEmbeddings, ChatBedrock
-from langchain_community.vectorstores import FAISS
+# ===================== Prompts (escaped braces FIX) =====================
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# ===================== EDIT THESE =====================
-FAISS_INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve()
-OUTPUT_XLSX     = Path("./client_clause_matrix.xlsx").resolve()
-
-CLAUSES: Dict[str, List[str]] = {
-    "Data Management": [
-        "Data retention duration and deletion timelines",
-        "Data storage location and encryption at rest",
-        "Processing purposes and lawful bases",
-        "Data sharing and onward transfer restrictions",
-        "Responsibilities for incident response",
-    ],
-    "Data Suppression": [
-        "Opt-out process and suppression triggers",
-        "Suppression propagation timelines across systems",
-        "Audit trail / logging for suppression events",
-    ],
-    "Data Restrictions": [
-        "Prohibited uses (advertising / combining datasets)",
-        "Geographic restrictions or BU limitations",
-        "Access controls and least privilege",
-    ],
-    "Data Consent": [
-        "Consent withdrawal process and records",
-        "Renewal / re-consent cadence",
-        "Sensitive categories / age gating",
-    ],
-}
-
-# AWS (prefer IAM roles in prod)
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "YOUR_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "YOUR_SECRET_ACCESS_KEY")
-
-# Models
-EMBED_MODEL = "amazon.titan-embed-text-v2:0"
-LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
-
-# Retrieval / generation
-K_PER_CLIENT = 8
-MAX_TOKENS   = 900
-TEMPERATURE  = 0.2
-MAX_CONTEXT_CHARS = 8000   # clamp prompt size to avoid token errors
-USE_MMR = False            # set True to diversify (query text remains identical)
-
-VALID_STATUSES = {"yes", "no", "partial"}
-
-# ===================== Prompts (no clause prompts) =====================
 PROMPT_CLASSIFY = ChatPromptTemplate.from_messages([
     ("system",
      "You are a precise, client-scoped contract assistant. Use ONLY the Provided Context.\n"
      "Task: Decide if the SPECIFIC sub-clause exists or is satisfied in the client's documents.\n"
-     "Return SINGLE-LINE JSON ONLY like: {\"status\":\"Yes|No|Partial\"}.\n"
+     "Return SINGLE-LINE JSON ONLY like: {{\"status\":\"Yes|No|Partial\"}}.\n"
      "- 'Yes'     = clear, specific evidence the sub-clause is present/affirmed.\n"
      "- 'No'      = clear, specific evidence it is absent/contradicted or not found.\n"
      "- 'Partial' = some evidence but incomplete/ambiguous/conditional.\n"
@@ -101,72 +28,12 @@ PROMPT_ANSWER = ChatPromptTemplate.from_messages([
      "If context is insufficient, explicitly say you don't know and list what info is missing."
     ),
     ("human",
-     # The question the LLM is answering is effectively:
-     #   "what are the content related to {clause} and {subclause}?"
-     # We include that wording implicitly by providing Clause/Sub-Clause and the context.
      "Client: {client_id}\nClause: {clause}\nSub-Clause: {subclause}\n\n"
      "Provided Context (from client PDFs):\n{context}\n\n"
      "Based ONLY on the Provided Context, answer: what are the content related to the clause and sub-clause above?")
 ])
 
-# ===================== Helpers =====================
-def list_clients_from_faiss(root: Path) -> List[str]:
-    if not root.exists():
-        return []
-    out = []
-    for p in root.iterdir():
-        if p.is_dir() and not p.name.startswith(".") and (p / "index.faiss").exists() and (p / "index.pkl").exists():
-            out.append(p.name)
-    return sorted(out)
-
-def load_vs_for_client(client_id: str, session: Session) -> Optional[FAISS]:
-    path = FAISS_INDEX_DIR / client_id
-    if not (path / "index.faiss").exists():
-        return None
-    emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=session.client("bedrock-runtime"))
-    # WARNING: requires trusted indices; rebuild to drop allow_dangerous_deserialization if possible.
-    return FAISS.load_local(str(path), emb, allow_dangerous_deserialization=True)
-
-def _trim(s: str, limit: int = MAX_CONTEXT_CHARS) -> str:
-    if s and len(s) > limit:
-        return s[:limit] + "\n...\n[context trimmed]"
-    return s or ""
-
-def format_docs(docs) -> str:
-    return "\n\n".join(
-        f"(client: {d.metadata.get('client_id')}, policy: {d.metadata.get('policy_id')}, page: {d.metadata.get('page','?')})\n{d.page_content}"
-        for d in docs
-    )
-
-def _exact_query(clause: str, subclause: str) -> str:
-    # Your requested retrieval phrasing
-    return f"what are the content related to {clause} and {subclause}"
-
-def retrieve_context_for(session: Session, client_id: str, clause: str, subclause: str) -> str:
-    vs = load_vs_for_client(client_id, session)
-    if not vs:
-        print(f"[WARN] No index for client {client_id}")
-        return ""
-    search_type = "mmr" if USE_MMR else "similarity"
-    retriever = vs.as_retriever(search_type=search_type, search_kwargs={"k": K_PER_CLIENT})
-
-    q = _exact_query(clause, subclause)
-    docs = retriever.get_relevant_documents(q) or []
-
-    pre = len(docs)
-    # Prefer strict client match, but allow fallback if metadata is missing
-    strict = [
-        d for d in docs
-        if str(d.metadata.get("client_id", "")).strip().lower() == client_id.strip().lower()
-    ]
-    post = len(strict)
-    final_docs = strict if post > 0 else docs
-
-    print(f"[DEBUG] {client_id} :: {clause} :: {subclause} -> docs pre={pre}, post_strict={post}, used={len(final_docs)}")
-
-    if not final_docs:
-        return ""
-    return _trim(format_docs(final_docs))
+# ===================== Retrieval & LLM calls unchanged EXCEPT tiny regex tweak =====================
 
 def classify_status(session: Session, client_id: str, clause: str, subclause: str, context: str) -> str:
     llm = ChatBedrock(
@@ -182,82 +49,12 @@ def classify_status(session: Session, client_id: str, clause: str, subclause: st
             "subclause": subclause,
             "context": (context or "(no matching context found)"),
         }).strip().strip("`")
-        m = re.search(r'"status"\s*:\s*"(?P<v>yes|no|partial)"', raw, flags=re.I)
+        # allow Yes/No/Partial with any capitalization
+        m = re.search(r'\"status\"\s*:\s*\"(?P<v>yes|no|partial)\"', raw, flags=re.I)
         if m:
-            v = m.group("v").strip().lower()
-            if v in VALID_STATUSES:
-                return v.capitalize()
+            return m.group("v").strip().capitalize()
     except Exception as e:
         print(f"[ERROR] classify_status: {client_id} / {clause} / {subclause}: {e}")
-    # If parsing fails: assume No when no context, otherwise Partial
     return "No" if not context else "Partial"
 
-def generate_llm_answer(session: Session, client_id: str, clause: str, subclause: str, context: str) -> str:
-    """
-    Return the LLM's answer that goes into the 'Content' column.
-    Never return an empty string: if context is missing or the model returns empty,
-    respond with a clear 'don't know' message referencing the need for more context.
-    """
-    llm = ChatBedrock(
-        client=session.client("bedrock-runtime"),
-        model_id=LLM_MODEL,
-        model_kwargs={"temperature": float(TEMPERATURE), "max_tokens": int(MAX_TOKENS)},
-    )
-    chain = PROMPT_ANSWER | llm | StrOutputParser()
-    try:
-        out = (chain.invoke({
-            "client_id": client_id,
-            "clause": clause,
-            "subclause": subclause,
-            "context": (context or "(no matching context found)"),
-        }) or "").strip()
-        return out if out else "I don't know based on the available context."
-    except Exception as e:
-        print(f"[ERROR] generate_llm_answer: {client_id} / {clause} / {subclause}: {e}")
-        return "I don't know based on the available context."
-
-def build_matrix(session: Session) -> pd.DataFrame:
-    clients = list_clients_from_faiss(FAISS_INDEX_DIR)
-    if not clients:
-        raise SystemExit(f"No clients found under {FAISS_INDEX_DIR}")
-
-    rows: List[Dict[str, Any]] = []
-    for client_id in clients:
-        print(f"=== {client_id} ===")
-        for clause, subclauses in CLAUSES.items():
-            # de-dup and keep order
-            seen = set()
-            ordered_subs = [s for s in subclauses if not (s in seen or seen.add(s))]
-            for subclause in ordered_subs:
-                print(f"  - {clause} :: {subclause} ...", end="", flush=True)
-                context = retrieve_context_for(session, client_id, clause, subclause)
-                status  = classify_status(session, client_id, clause, subclause, context)
-                content = generate_llm_answer(session, client_id, clause, subclause, context)
-                rows.append({
-                    "Client Name":   client_id,
-                    "Clauses":       clause,
-                    "Sub Clauses":   subclause,
-                    "Clause Status": status,
-                    "Content":       content,   # <-- LLM answer here
-                })
-                print(f" {status}.")
-    return pd.DataFrame(
-        rows,
-        columns=["Client Name","Clauses","Sub Clauses","Clause Status","Content"]
-    )
-
-# ===================== Main =====================
-def main():
-    # AWS session
-    session = Session(
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        region_name=AWS_REGION,
-    )
-    df = build_matrix(session)
-    OUTPUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
-    df.to_excel(OUTPUT_XLSX, index=False)
-    print(f"\nSaved: {OUTPUT_XLSX}")
-
-if __name__ == "__main__":
-    main()
+# ===================== Everything else stays the same =====================
