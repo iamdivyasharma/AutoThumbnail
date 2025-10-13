@@ -1,166 +1,54 @@
-#!/usr/bin/env python3
-"""
-Create a fresh Excel sheet of (Client Name, Clauses, Sub Clauses, Clause Status)
-by querying a client-scoped RAG (FAISS + Bedrock). No input Excel required.
-
-Adds back the missing helpers from the previous script:
-- CLAUSE_PROMPTS (clause-specific guidance)
-- clause_instructions_for(clause) and *uses it* inside the classification prompt
-
-Dependencies:
-  pip install -U pandas openpyxl "langchain-aws>=0.2.5" "langchain-community" "boto3>=1.34" faiss-cpu
-"""
-
-from __future__ import annotations
-
-import os
-import re
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-
-import pandas as pd
-from boto3 import Session
-from langchain_aws import BedrockEmbeddings, ChatBedrock
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-
-# ===================== EDIT THESE =====================
-FAISS_INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve()     # <-- set your FAISS root
-OUTPUT_XLSX     = Path("./client_clause_matrix.xlsx").resolve()    # <-- destination workbook
-
-# Define your clauses with MULTIPLE sub-clauses each
-CLAUSES: Dict[str, List[str]] = {
-    "Data Management": [
-        "Data retention duration and deletion timelines",
-        "Data storage location and encryption at rest",
-        "Processing purposes and lawful bases",
-        "Data sharing and onward transfer restrictions",
-        "Responsibilities for incident response",
-    ],
-    "Data Suppression": [
-        "Opt-out process and suppression triggers",
-        "Suppression propagation timelines across systems",
-        "Audit trail / logging for suppression events",
-    ],
-    "Data Restrictions": [
-        "Prohibited uses (advertising / combining datasets)",
-        "Geographic restrictions or BU limitations",
-        "Access controls and least privilege",
-    ],
-    "Data Consent": [
-        "Consent withdrawal process and records",
-        "Renewal / re-consent cadence",
-        "Sensitive categories / age gating",
-    ],
-    # Add more clauses with lists of sub-clauses...
-}
-
-# === Clause-specific guidance (brought back) ===
-CLAUSE_PROMPTS: Dict[str, str] = {
-    "Data Management": (
-        "Focus on lifecycle: collection, storage, processing, sharing, deletion. "
-        "Extract definitions, responsibilities, retention, and governance controls."
-    ),
-    "Data Suppression": (
-        "Emphasize opt-out/suppression triggers, timelines, systems, who can request, "
-        "audit trails, exceptions, and procedural steps."
-    ),
-    "Data Restrictions": (
-        "Detail prohibited uses, geo or BU limits, consent prerequisites, access controls, "
-        "and exception escalation paths."
-    ),
-    "Data Consent": (
-        "Cover consent collection/renewal/withdrawal, lawful bases, records, UI/notice language, "
-        "and sensitive/age-related considerations."
-    ),
-}
-
-def clause_instructions_for(clause: str) -> str:
-    """Return clause-specific guidance; case-insensitive match; fall back to generic."""
-    if clause in CLAUSE_PROMPTS:
-        return CLAUSE_PROMPTS[clause]
-    for k, v in CLAUSE_PROMPTS.items():
-        if k.lower() == clause.lower():
-            return v
-    return ("Extract specific policy details, steps, limits, definitions, and exceptions for this clause. "
-            "Use concise, actionable language grounded in the provided context.")
-
-# ===================== AWS / Models =====================
-# AWS (for local testing only — prefer IAM roles in prod)
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "YOUR_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "YOUR_SECRET_ACCESS_KEY")
-
-# Models
-EMBED_MODEL = "amazon.titan-embed-text-v2:0"
-LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+# ... (imports and existing code stay the same) ...
 
 # Retrieval / generation
 K_PER_CLIENT = 6
 MAX_TOKENS   = 700
 TEMPERATURE  = 0.2
+MAX_CONTEXT_CHARS = 8000   # prevent oversized prompts
+USE_MMR = False            # set True to diversify retrieval
 
 # Valid statuses
 VALID_STATUSES = {"yes", "no", "partial"}
 
-# ===================== Prompt (JSON classification) =====================
-PROMPT_CLASSIFY = ChatPromptTemplate.from_messages([
+# ===== New: Answer prompt (generate brief answer grounded in context) =====
+PROMPT_ANSWER = ChatPromptTemplate.from_messages([
     ("system",
      "You are a precise, client-scoped contract assistant. Use ONLY the Provided Context.\n"
-     "Task: Decide if the SPECIFIC sub-clause exists or is satisfied in the client's documents.\n"
-     "Return SINGLE-LINE JSON ONLY: {\"status\":\"Yes|No|Partial\"}.\n"
-     "- 'Yes'     = clear, specific evidence the sub-clause is present/affirmed.\n"
-     "- 'No'      = clear, specific evidence it is absent/contradicted or not found.\n"
-     "- 'Partial' = some evidence but incomplete/ambiguous/conditional.\n"
-     "Do not fabricate. No citations. No extra text. JSON only.\n\n"
-     "Clause-specific guidance:\n{clause_instructions}"
-    ),
+     "Write a concise answer that directly addresses the sub-clause for this client.\n"
+     "Prefer bullet points and concrete details; no citations; no speculation.\n\n"
+     "Clause-specific guidance:\n{clause_instructions}"),
     ("human",
      "Client: {client_id}\n"
      "Clause: {clause}\n"
      "Sub-Clause: {subclause}\n\n"
      "Provided Context (from client PDFs):\n{context}\n\n"
-     "Classify status now. Output JSON only.")
+     "Write the best possible answer now.")
 ])
 
-# ===================== Helpers (from prior script and reused) =====================
-def list_clients_from_faiss(root: Path) -> List[str]:
-    if not root.exists():
-        return []
-    out = []
-    for p in root.iterdir():
-        if p.is_dir() and not p.name.startswith(".") and (p / "index.faiss").exists() and (p / "index.pkl").exists():
-            out.append(p.name)
-    return sorted(out)
+# ... CLAUSE_PROMPTS and clause_instructions_for(...) remain as added earlier ...
 
-def load_vs_for_client(client_id: str, session: Session) -> Optional[FAISS]:
-    path = FAISS_INDEX_DIR / client_id
-    if not (path / "index.faiss").exists():
-        return None
-    emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=session.client("bedrock-runtime"))
-    # NOTE: requires trusted indices; prefer rebuilding without dangerous deserialization in prod.
-    return FAISS.load_local(str(path), emb, allow_dangerous_deserialization=True)
+def _nl_query(clause: str, subclause: str) -> str:
+    # Friendlier to retrieval than "A + B"
+    return f"Policy details for clause '{clause}' focusing on: {subclause}. Extract exact relevant language."
 
-def format_docs(docs) -> str:
-    # Compact but traceable
-    return "\n\n".join(
-        f"(client: {d.metadata.get('client_id')}, policy: {d.metadata.get('policy_id')}, page: {d.metadata.get('page','?')})\n{d.page_content}"
-        for d in docs
-    )
+def _trim(s: str, limit: int = MAX_CONTEXT_CHARS) -> str:
+    if s and len(s) > limit:
+        return s[:limit] + "\n...\n[context trimmed]"
+    return s or ""
 
 def retrieve_context_for(session: Session, client_id: str, clause: str, subclause: str) -> str:
     vs = load_vs_for_client(client_id, session)
     if not vs:
         return ""
-    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": K_PER_CLIENT})
-    query = f"{clause} + {subclause}"  # <- clause + sub-clause
+    search_type = "mmr" if USE_MMR else "similarity"
+    retriever = vs.as_retriever(search_type=search_type, search_kwargs={"k": K_PER_CLIENT})
+    query = _nl_query(clause, subclause)
     docs = retriever.get_relevant_documents(query)
     # strict client guard
     docs = [d for d in docs if str(d.metadata.get("client_id", "")).strip().lower() == client_id.strip().lower()]
     if not docs:
         return ""
-    return format_docs(docs)
+    return _trim(format_docs(docs))
 
 def classify_status(session: Session, client_id: str, clause: str, subclause: str, context: str) -> str:
     """Return 'Yes' / 'No' / 'Partial'."""
@@ -176,10 +64,8 @@ def classify_status(session: Session, client_id: str, clause: str, subclause: st
             "clause": clause,
             "subclause": subclause,
             "context": (context or "(no matching context found)"),
-            "clause_instructions": clause_instructions_for(clause),  # <-- newly used
-        }).strip()
-        # strip accidental fences/backticks
-        raw = raw.strip().strip("`")
+            "clause_instructions": clause_instructions_for(clause),
+        }).strip().strip("`")
         m = re.search(r'"status"\s*:\s*"(?P<v>yes|no|partial)"', raw, flags=re.I)
         if m:
             v = m.group("v").strip().lower()
@@ -187,10 +73,32 @@ def classify_status(session: Session, client_id: str, clause: str, subclause: st
                 return v.capitalize()
     except Exception:
         pass
-    # Fallback policy:
-    # - If no context at all was retrieved -> "No" (not found).
-    # - If parse failed but we had some context -> "Partial" (ambiguous).
     return "No" if not context else "Partial"
+
+# ===== New: generate an answer string for the table =====
+def generate_answer(session: Session, client_id: str, clause: str, subclause: str, context: str) -> str:
+    if not context:
+        return ""  # nothing to ground on
+    llm = ChatBedrock(
+        client=session.client("bedrock-runtime"),
+        model_id=LLM_MODEL,
+        model_kwargs={"temperature": float(TEMPERATURE), "max_tokens": int(MAX_TOKENS)},
+    )
+    chain = PROMPT_ANSWER | llm | StrOutputParser()
+    try:
+        return chain.invoke({
+            "client_id": client_id,
+            "clause": clause,
+            "subclause": subclause,
+            "context": context,
+            "clause_instructions": clause_instructions_for(clause),
+        }).strip()
+    except Exception:
+        return ""
+
+def _first_evidence_lines(context: str, n_chars: int = 400) -> str:
+    # short evidence preview for traceability
+    return context[:n_chars] if context else ""
 
 def build_matrix(session: Session) -> pd.DataFrame:
     clients = list_clients_from_faiss(FAISS_INDEX_DIR)
@@ -201,31 +109,34 @@ def build_matrix(session: Session) -> pd.DataFrame:
     for client_id in clients:
         print(f"=== {client_id} ===")
         for clause, subclauses in CLAUSES.items():
-            # de-dup and keep order
             seen = set()
             ordered_subs = [s for s in subclauses if not (s in seen or seen.add(s))]
             for subclause in ordered_subs:
                 print(f"  - {clause} :: {subclause} ...", end="", flush=True)
                 context = retrieve_context_for(session, client_id, clause, subclause)
                 status  = classify_status(session, client_id, clause, subclause, context)
+                content = generate_answer(session, client_id, clause, subclause, context) if context else ""
+                evidence = _first_evidence_lines(context)
                 rows.append({
-                    "Client Name":   client_id,
-                    "Clauses":       clause,
-                    "Sub Clauses":   subclause,
-                    "Clause Status": status,   # Yes / No / Partial
+                    "Client Name":       client_id,
+                    "Clauses":           clause,
+                    "Sub Clauses":       subclause,
+                    "Clause Status":     status,      # Yes / No / Partial
+                    "Content":           content,     # <-- NEW
+                    "Evidence Snippets": evidence,    # <-- NEW (optional but useful)
                 })
                 print(f" {status}.")
-    return pd.DataFrame(rows, columns=["Client Name", "Clauses", "Sub Clauses", "Clause Status"])
+    return pd.DataFrame(
+        rows,
+        columns=["Client Name","Clauses","Sub Clauses","Clause Status","Content","Evidence Snippets"]
+    )
 
-# ===================== Main =====================
 def main():
-    # AWS session
     session = Session(
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
         region_name=AWS_REGION,
     )
-
     df = build_matrix(session)
     OUTPUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
     df.to_excel(OUTPUT_XLSX, index=False)
