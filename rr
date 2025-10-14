@@ -1,9 +1,10 @@
-# ======================= EXCEL RAG CHANNEL (single XLSX, client-agnostic) ==========================
+# ======================= EXCEL RAG CHANNEL (RAG over complete sheet; no client link) ==========================
 import pandas as pd
 from datetime import datetime
 
-# Point directly to ONE .xlsx workbook (no clients, no filtering)
-EXCEL_FILE = Path(os.getenv("LOCAL_EXCEL_PATH", "data/workbook.xlsx")).resolve()
+# Use your local workbook directly (adjust path if it's under a subfolder)
+EXCEL_FILE = Path("client_clauses.xlsx").resolve()  # <-- changed from env default
+
 EXCEL_INDEX_DIR = Path(os.getenv("LOCAL_EXCEL_INDEX_DIR", "excel_faiss")).resolve()
 EXCEL_INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -17,41 +18,26 @@ _EXCEL = {
 _EXCEL_HISTORY: Dict[str, List[Dict[str, Any]]] = {}   # session_id -> [{"role": "...", "text": "...", "time": iso}]
 
 def _load_excel_into_frames() -> Dict[str, pd.DataFrame]:
-    """
-    Load ALL sheets from a SINGLE XLSX workbook into dataframes.
-    No client logic. No filter. Just the file.
-    """
     if not EXCEL_FILE.exists():
         raise HTTPException(404, f"Excel file not found at {EXCEL_FILE}")
-    # Force engine to openpyxl for .xlsx; read everything as string so the LLM sees consistent text
+    # Reliable .xlsx read (no client filtering anywhere)
     frames = pd.read_excel(EXCEL_FILE, sheet_name=None, engine="openpyxl", dtype=str)
     norm: Dict[str, pd.DataFrame] = {}
     for sh, df in (frames or {}).items():
-        df = df.copy()
-        # Replace NaN with empty strings to avoid 'nan' showing up in context
-        df = df.fillna("")
-        # Normalize column names to strings
+        df = df.copy().fillna("")                     # avoid 'nan' text in context
         df.columns = [str(c) for c in df.columns]
         norm[str(sh)] = df
     return norm
 
 def _df_rows_to_text(df: pd.DataFrame, sheet: str, start: int, end: int) -> str:
-    """
-    Convert a block of rows into a compact, searchable text chunk
-    annotated with the sheet and row range (1-based inclusive).
-    """
     lines = [f"[sheet: {sheet}] rows {start+1}-{end}"]
-    cols = list(df.columns)
     for i in range(start, end):
         row = df.iloc[i]
-        kv = ", ".join(f"{col}={repr(row[col])}" for col in cols)
+        kv = ", ".join(f"{col}={repr(row[col])}" for col in df.columns)
         lines.append(f"r{i+1}: {kv}")
     return "\n".join(lines)
 
 def _build_excel_faiss() -> None:
-    """
-    Build (or rebuild) a FAISS index over ALL sheets of the single XLSX.
-    """
     df_by_sheet = _load_excel_into_frames()
     sheets = list(df_by_sheet.keys())
     rows = {s: int(len(df_by_sheet[s])) for s in sheets}
@@ -61,7 +47,7 @@ def _build_excel_faiss() -> None:
 
     texts: List[str] = []
     chunk_meta: List[Dict[str, Any]] = []
-    CHUNK_SIZE = 40  # rows per chunk
+    CHUNK_SIZE = 40  # rows per chunk (RAG over complete sheets)
     for sh in sheets:
         df = df_by_sheet[sh]
         n = len(df)
@@ -85,45 +71,26 @@ def _build_excel_faiss() -> None:
     _EXCEL["last_loaded_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 def _ensure_excel_loaded():
-    """
-    Keep index + frames ready. If the index is missing or stale, rebuild.
-    Zero client filtering anywhere.
-    """
+    if _EXCEL.get("vs") is not None and _EXCEL.get("df_by_sheet"):
+        return
     # try to load saved index
-    if _EXCEL.get("vs") is None:
-        try:
-            emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
-            _EXCEL["vs"] = FAISS.load_local(str(EXCEL_INDEX_DIR), emb, allow_dangerous_deserialization=True)
-        except Exception:
-            _EXCEL["vs"] = None
-
-    # (re)load frames every time we boot or refresh so we reflect disk state
     try:
-        _EXCEL["df_by_sheet"] = _load_excel_into_frames()
-        sheets = list(_EXCEL["df_by_sheet"].keys())
-        _EXCEL["meta"].update({
-            "sheets": sheets,
-            "rows": {s: int(len(_EXCEL["df_by_sheet"][s])) for s in sheets},
-            "mtime": datetime.fromtimestamp(EXCEL_FILE.stat().st_mtime).isoformat(timespec="seconds"),
-            "path": str(EXCEL_FILE),
-        })
+        emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
+        _EXCEL["vs"] = FAISS.load_local(str(EXCEL_INDEX_DIR), emb, allow_dangerous_deserialization=True)
     except Exception:
-        _EXCEL["df_by_sheet"] = {}
-
+        _EXCEL["vs"] = None
+    # if we don't have dataframes or vs, rebuild
     if _EXCEL["vs"] is None or not _EXCEL.get("df_by_sheet"):
         _build_excel_faiss()
 
 def _excel_answer(question: str, k: int = 6, session_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Retrieve RAG over the XLSX (all sheets), produce context previews, and LLM answer.
-    """
     _ensure_excel_loaded()
     vs = _EXCEL["vs"]
     retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": k})
     docs = retriever.get_relevant_documents(question)
 
     previews: List[str] = []
-    # chunk_meta aligns with texts creation order
+    # chunk_meta aligns with texts creation order; zip by index
     for idx, d in enumerate(docs):
         if idx >= len(_EXCEL["chunk_meta"]):
             break
@@ -134,7 +101,6 @@ def _excel_answer(question: str, k: int = 6, session_id: Optional[str] = None) -
         df = _EXCEL["df_by_sheet"].get(sh)
         if df is None:
             continue
-        # Show at most ~8 rows for readability
         df_slice = df.iloc[max(0, s):min(e, s+8)]
         preview = df_slice.to_string(index=False)
         previews.append(f"(sheet: {sh}, rows {s+1}-{min(e, s+8)})\n{preview}")
@@ -181,7 +147,7 @@ def _excel_answer(question: str, k: int = 6, session_id: Optional[str] = None) -
 
     return {"answer": answer, "sources": srcs, "history": _EXCEL_HISTORY.get(session_id or "", [])}
 
-# ======= MODELS (Excel) — unchanged =======
+# ======= MODELS (Excel) =======
 class ExcelChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = None
@@ -193,7 +159,7 @@ class ExcelChatResponse(BaseModel):
     history: List[Dict[str, Any]]
     meta: Dict[str, Any]
 
-# ======= ROUTES (Excel) — unchanged =======
+# ======= ROUTES (Excel) =======
 @app.get("/excel/metadata")
 def excel_metadata():
     _ensure_excel_loaded()
@@ -219,7 +185,7 @@ def excel_chat(payload: ExcelChatRequest):
 
 @app.post("/excel/refresh")
 def excel_refresh():
-    """Re-read the XLSX and rebuild FAISS. Hook this to your UI 'Refresh' button."""
+    """Re-read the Excel and rebuild FAISS. Hook this to your UI 'Refresh' button."""
     _build_excel_faiss()
     return {"status": "ok", "message": "Excel reloaded and indexed.", "meta": _EXCEL["meta"]}
 
