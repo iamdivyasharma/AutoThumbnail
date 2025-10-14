@@ -1,134 +1,146 @@
-# ======================= CSV RAG CHANNEL (client-agnostic) ==========================
+# ======================= EXCEL RAG CHANNEL (single XLSX, client-agnostic) ==========================
 import pandas as pd
 from datetime import datetime
 
-CSV_SINGLE_FILE = os.getenv("LOCAL_CSV_PATH", "").strip() or None
-CSV_DIR = Path(os.getenv("LOCAL_CSV_DIR", "data/csvs")).resolve()
-CSV_DIR.mkdir(parents=True, exist_ok=True)
-CSV_INDEX_DIR = Path(os.getenv("CSV_FAISS_INDEX_DIR", "csv_faiss")).resolve()
-CSV_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+# Point directly to ONE .xlsx workbook (no clients, no filtering)
+EXCEL_FILE = Path(os.getenv("LOCAL_EXCEL_PATH", "data/workbook.xlsx")).resolve()
+EXCEL_INDEX_DIR = Path(os.getenv("LOCAL_EXCEL_INDEX_DIR", "excel_faiss")).resolve()
+EXCEL_INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
-_CSV = {
-    "frames": {},          # {filename: DataFrame}
-    "meta": {},            # {"files": [...], "rows": {...}, "mtime": {...}, "paths": {...}}
-    "vs": None,            # FAISS vectorstore for CSV chunks
-    "chunk_meta": [],      # [{file, start_row, end_row}]
+_EXCEL = {
+    "df_by_sheet": {},     # {sheet_name: DataFrame}
+    "meta": {},            # {"sheets": [...], "rows": {...}, "mtime": "...", "path": "..."}
+    "vs": None,            # FAISS vectorstore for Excel chunks
+    "chunk_meta": [],      # [{sheet, start_row, end_row}]
     "last_loaded_at": None,
 }
-_CSV_HISTORY: Dict[str, List[Dict[str, Any]]] = {}   # session_id -> [{"role": "...", "text": "...", "time": iso}]
+_EXCEL_HISTORY: Dict[str, List[Dict[str, Any]]] = {}   # session_id -> [{"role": "...", "text": "...", "time": iso}]
 
-def _csv_list_sources() -> List[Path]:
-    if CSV_SINGLE_FILE:
-        p = Path(CSV_SINGLE_FILE).resolve()
-        if not p.exists():
-            raise HTTPException(404, f"CSV file not found at {p}")
-        return [p]
-    files = [p for p in CSV_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".csv"]
-    if not files:
-        raise HTTPException(404, f"No CSV files found in {CSV_DIR}")
-    return sorted(files, key=lambda x: x.name)
-
-def _load_csv_frames() -> Dict[str, pd.DataFrame]:
-    frames: Dict[str, pd.DataFrame] = {}
-    for p in _csv_list_sources():
-        try:
-            df = pd.read_csv(p, dtype=str, keep_default_na=False, low_memory=False)
-        except Exception as e:
-            raise HTTPException(400, f"Failed reading CSV {p.name}: {e}")
-        # normalize columns to strings
+def _load_excel_into_frames() -> Dict[str, pd.DataFrame]:
+    """
+    Load ALL sheets from a SINGLE XLSX workbook into dataframes.
+    No client logic. No filter. Just the file.
+    """
+    if not EXCEL_FILE.exists():
+        raise HTTPException(404, f"Excel file not found at {EXCEL_FILE}")
+    # Force engine to openpyxl for .xlsx; read everything as string so the LLM sees consistent text
+    frames = pd.read_excel(EXCEL_FILE, sheet_name=None, engine="openpyxl", dtype=str)
+    norm: Dict[str, pd.DataFrame] = {}
+    for sh, df in (frames or {}).items():
+        df = df.copy()
+        # Replace NaN with empty strings to avoid 'nan' showing up in context
+        df = df.fillna("")
+        # Normalize column names to strings
         df.columns = [str(c) for c in df.columns]
-        frames[p.name] = df
-    return frames
+        norm[str(sh)] = df
+    return norm
 
-def _df_rows_to_text_csv(df: pd.DataFrame, file: str, start: int, end: int) -> str:
-    lines = [f"[file: {file}] rows {start+1}-{end}"]
+def _df_rows_to_text(df: pd.DataFrame, sheet: str, start: int, end: int) -> str:
+    """
+    Convert a block of rows into a compact, searchable text chunk
+    annotated with the sheet and row range (1-based inclusive).
+    """
+    lines = [f"[sheet: {sheet}] rows {start+1}-{end}"]
     cols = list(df.columns)
     for i in range(start, end):
         row = df.iloc[i]
-        kv = ", ".join(f"{c}={repr(row[c])}" for c in cols)
+        kv = ", ".join(f"{col}={repr(row[col])}" for col in cols)
         lines.append(f"r{i+1}: {kv}")
     return "\n".join(lines)
 
-def _build_csv_faiss() -> None:
-    frames = _load_csv_frames()
-    files = list(frames.keys())
-    rows = {fname: int(len(frames[fname])) for fname in files}
-    mtime = {}
-    paths = {}
-    for p in _csv_list_sources():
-        mtime[p.name] = datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds")
-        paths[p.name] = str(p)
+def _build_excel_faiss() -> None:
+    """
+    Build (or rebuild) a FAISS index over ALL sheets of the single XLSX.
+    """
+    df_by_sheet = _load_excel_into_frames()
+    sheets = list(df_by_sheet.keys())
+    rows = {s: int(len(df_by_sheet[s])) for s in sheets}
+    mtime = datetime.fromtimestamp(EXCEL_FILE.stat().st_mtime).isoformat(timespec="seconds")
 
     emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
 
-    texts = []
-    chunk_meta = []
+    texts: List[str] = []
+    chunk_meta: List[Dict[str, Any]] = []
     CHUNK_SIZE = 40  # rows per chunk
-    for fname in files:
-        df = frames[fname]
+    for sh in sheets:
+        df = df_by_sheet[sh]
         n = len(df)
         if n == 0:
             continue
         for start in range(0, n, CHUNK_SIZE):
             end = min(start + CHUNK_SIZE, n)
-            text = _df_rows_to_text_csv(df, fname, start, end)
-            texts.append(text)
-            chunk_meta.append({"file": fname, "start_row": start+1, "end_row": end})
+            texts.append(_df_rows_to_text(df, sh, start, end))
+            chunk_meta.append({"sheet": sh, "start_row": start+1, "end_row": end})
 
     if not texts:
-        raise HTTPException(400, "No CSV rows to index.")
+        raise HTTPException(400, "Excel workbook has no rows to index.")
 
     vs = FAISS.from_texts(texts=texts, embedding=emb)
-    vs.save_local(str(CSV_INDEX_DIR))
+    vs.save_local(str(EXCEL_INDEX_DIR))
 
-    _CSV["frames"] = frames
-    _CSV["meta"] = {"files": files, "rows": rows, "mtime": mtime, "paths": paths}
-    _CSV["vs"] = vs
-    _CSV["chunk_meta"] = chunk_meta
-    _CSV["last_loaded_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    _EXCEL["df_by_sheet"] = df_by_sheet
+    _EXCEL["meta"] = {"sheets": sheets, "rows": rows, "mtime": mtime, "path": str(EXCEL_FILE)}
+    _EXCEL["vs"] = vs
+    _EXCEL["chunk_meta"] = chunk_meta
+    _EXCEL["last_loaded_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-def _ensure_csv_loaded():
-    if _CSV.get("vs") is not None and _CSV.get("frames"):
-        return
+def _ensure_excel_loaded():
+    """
+    Keep index + frames ready. If the index is missing or stale, rebuild.
+    Zero client filtering anywhere.
+    """
     # try to load saved index
-    try:
-        emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
-        _CSV["vs"] = FAISS.load_local(str(CSV_INDEX_DIR), emb, allow_dangerous_deserialization=True)
-    except Exception:
-        _CSV["vs"] = None
-    # we always want dataframes loaded freshly to reflect disk state
-    try:
-        _CSV["frames"] = _load_csv_frames()
-    except Exception:
-        _CSV["frames"] = {}
-    # if we have no vs or no frames, rebuild
-    if _CSV["vs"] is None or not _CSV.get("frames"):
-        _build_csv_faiss()
+    if _EXCEL.get("vs") is None:
+        try:
+            emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
+            _EXCEL["vs"] = FAISS.load_local(str(EXCEL_INDEX_DIR), emb, allow_dangerous_deserialization=True)
+        except Exception:
+            _EXCEL["vs"] = None
 
-def _csv_answer(question: str, k: int = 6, session_id: Optional[str] = None) -> Dict[str, Any]:
-    _ensure_csv_loaded()
-    vs = _CSV["vs"]
+    # (re)load frames every time we boot or refresh so we reflect disk state
+    try:
+        _EXCEL["df_by_sheet"] = _load_excel_into_frames()
+        sheets = list(_EXCEL["df_by_sheet"].keys())
+        _EXCEL["meta"].update({
+            "sheets": sheets,
+            "rows": {s: int(len(_EXCEL["df_by_sheet"][s])) for s in sheets},
+            "mtime": datetime.fromtimestamp(EXCEL_FILE.stat().st_mtime).isoformat(timespec="seconds"),
+            "path": str(EXCEL_FILE),
+        })
+    except Exception:
+        _EXCEL["df_by_sheet"] = {}
+
+    if _EXCEL["vs"] is None or not _EXCEL.get("df_by_sheet"):
+        _build_excel_faiss()
+
+def _excel_answer(question: str, k: int = 6, session_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Retrieve RAG over the XLSX (all sheets), produce context previews, and LLM answer.
+    """
+    _ensure_excel_loaded()
+    vs = _EXCEL["vs"]
     retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": k})
     docs = retriever.get_relevant_documents(question)
 
-    previews = []
-    # Note: chunk_meta aligns with creation order of texts
+    previews: List[str] = []
+    # chunk_meta aligns with texts creation order
     for idx, d in enumerate(docs):
-        if idx >= len(_CSV["chunk_meta"]):
+        if idx >= len(_EXCEL["chunk_meta"]):
             break
-        meta = _CSV["chunk_meta"][idx]
-        fname = meta.get("file")
+        meta = _EXCEL["chunk_meta"][idx]
+        sh = meta.get("sheet")
         s = int(meta.get("start_row", 1)) - 1
         e = int(meta.get("end_row", s+1))
-        df = _CSV["frames"].get(fname)
+        df = _EXCEL["df_by_sheet"].get(sh)
         if df is None:
             continue
+        # Show at most ~8 rows for readability
         df_slice = df.iloc[max(0, s):min(e, s+8)]
         preview = df_slice.to_string(index=False)
-        previews.append(f"(file: {fname}, rows {s+1}-{min(e, s+8)})\n{preview}")
+        previews.append(f"(sheet: {sh}, rows {s+1}-{min(e, s+8)})\n{preview}")
 
     context = "\n\n---\n\n".join(previews) if previews else "(no preview)"
-    history = _CSV_HISTORY.get(session_id or "", [])[-6:] if session_id else []
+    history = _EXCEL_HISTORY.get(session_id or "", [])[-6:] if session_id else []
 
     llm = ChatBedrockConverse(
         model_id=LLM_MODEL,
@@ -137,84 +149,85 @@ def _csv_answer(question: str, k: int = 6, session_id: Optional[str] = None) -> 
         max_tokens=900
     )
 
-    csv_prompt = ChatPromptTemplate.from_messages([
+    excel_prompt = ChatPromptTemplate.from_messages([
         ("system",
-         "You are a precise data analyst. Answer ONLY using the Provided Context from the CSV files. "
-         "Cite specific files/rows if possible. If the needed data isn't in the context, say you don't know."),
+         "You are a precise data analyst. Answer ONLY using the Provided Context from the Excel sheets. "
+         "Be specific with rows/columns where possible. If the data needed isn't in the context, say you don't know."),
         *[("human" if t["role"]=="user" else "assistant", t["text"]) for t in history],
         ("human", "Question: {question}\n\nProvided Context:\n{context}\n\nAnswer now with specifics.")
     ])
-    chain = csv_prompt | llm | StrOutputParser()
+    chain = excel_prompt | llm | StrOutputParser()
     answer = chain.invoke({"question": question, "context": context})
 
     if session_id:
-        sess = _CSV_HISTORY.setdefault(session_id, [])
+        sess = _EXCEL_HISTORY.setdefault(session_id, [])
         now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
         sess.append({"role": "user", "text": question, "time": now})
         sess.append({"role": "assistant", "text": answer, "time": now})
         if len(sess) > 40:
-            _CSV_HISTORY[session_id] = sess[-40:]
+            _EXCEL_HISTORY[session_id] = sess[-40:]
 
-    srcs = []
+    srcs: List[Dict[str, Any]] = []
     for idx, d in enumerate(docs):
-        if idx >= len(_CSV["chunk_meta"]):
+        if idx >= len(_EXCEL["chunk_meta"]):
             break
-        meta = _CSV["chunk_meta"][idx]
+        meta = _EXCEL["chunk_meta"][idx]
         srcs.append({
-            "file": meta.get("file"),
+            "sheet": meta.get("sheet"),
             "start_row": meta.get("start_row"),
             "end_row": meta.get("end_row"),
             "snippet": d.page_content[:300]
         })
 
-    return {"answer": answer, "sources": srcs, "history": _CSV_HISTORY.get(session_id or "", [])}
+    return {"answer": answer, "sources": srcs, "history": _EXCEL_HISTORY.get(session_id or "", [])}
 
-# ======= MODELS (CSV) =======
-class CsvChatRequest(BaseModel):
+# ======= MODELS (Excel) — unchanged =======
+class ExcelChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = None
     k: Optional[int] = 6
 
-class CsvChatResponse(BaseModel):
+class ExcelChatResponse(BaseModel):
     answer: str
     sources: List[Dict[str, Any]]
     history: List[Dict[str, Any]]
     meta: Dict[str, Any]
 
-# ======= ROUTES (CSV) =======
-@app.get("/csv/metadata")
-def csv_metadata():
-    _ensure_csv_loaded()
+# ======= ROUTES (Excel) — unchanged =======
+@app.get("/excel/metadata")
+def excel_metadata():
+    _ensure_excel_loaded()
     return {
-        "files": _CSV["meta"].get("files", []),
-        "rows": _CSV["meta"].get("rows", {}),
-        "mtime": _CSV["meta"].get("mtime", {}),
-        "paths": _CSV["meta"].get("paths", {}),
-        "last_loaded_at": _CSV.get("last_loaded_at"),
+        "path": _EXCEL["meta"].get("path"),
+        "mtime": _EXCEL["meta"].get("mtime"),
+        "sheets": _EXCEL["meta"].get("sheets"),
+        "rows": _EXCEL["meta"].get("rows"),
+        "last_loaded_at": _EXCEL.get("last_loaded_at"),
     }
 
-@app.post("/csv/chat", response_model=CsvChatResponse)
-def csv_chat(payload: CsvChatRequest):
+@app.post("/excel/chat", response_model=ExcelChatResponse)
+def excel_chat(payload: ExcelChatRequest):
     if not payload.question or not payload.question.strip():
         raise HTTPException(400, "Missing question.")
-    res = _csv_answer(payload.question.strip(), k=int(payload.k or 6), session_id=payload.session_id)
+    res = _excel_answer(payload.question.strip(), k=int(payload.k or 6), session_id=payload.session_id)
     meta = {
-        "files": _CSV["meta"].get("files", []),
-        "rows": _CSV["meta"].get("rows", {}),
+        "path": _EXCEL["meta"].get("path"),
+        "mtime": _EXCEL["meta"].get("mtime"),
+        "sheets": _EXCEL["meta"].get("sheets"),
     }
-    return CsvChatResponse(answer=res["answer"], sources=res["sources"], history=res["history"], meta=meta)
+    return ExcelChatResponse(answer=res["answer"], sources=res["sources"], history=res["history"], meta=meta)
 
-@app.post("/csv/refresh")
-def csv_refresh():
-    """Re-read CSV files and rebuild FAISS."""
-    _build_csv_faiss()
-    return {"status": "ok", "message": "CSV reloaded and indexed.", "meta": _CSV["meta"]}
+@app.post("/excel/refresh")
+def excel_refresh():
+    """Re-read the XLSX and rebuild FAISS. Hook this to your UI 'Refresh' button."""
+    _build_excel_faiss()
+    return {"status": "ok", "message": "Excel reloaded and indexed.", "meta": _EXCEL["meta"]}
 
-@app.get("/csv/history/{session_id}")
-def get_csv_history(session_id: str):
-    return {"session_id": session_id, "history": _CSV_HISTORY.get(session_id, [])}
+@app.get("/excel/history/{session_id}")
+def get_excel_history(session_id: str):
+    return {"session_id": session_id, "history": _EXCEL_HISTORY.get(session_id, [])}
 
-@app.delete("/csv/history/{session_id}")
-def clear_csv_history(session_id: str):
-    _CSV_HISTORY.pop(session_id, None)
+@app.delete("/excel/history/{session_id}")
+def clear_excel_history(session_id: str):
+    _EXCEL_HISTORY.pop(session_id, None)
     return {"status": "ok", "session_id": session_id, "cleared": True}
