@@ -1,68 +1,220 @@
-# ===== Cross-client helpers (paste below generate_llm_answer and above build_matrix) =====
+# ======================= CSV RAG CHANNEL (client-agnostic) ==========================
+import pandas as pd
+from datetime import datetime
 
-def answer_for_client(session: Session, client_id: str, clause: str, subclause: Optional[str]) -> Dict[str, str]:
-    """Retrieve + LLM answer for one client; returns a row dict."""
-    # reuse your existing retrieval and LLM
-    context = retrieve_context_for(session, client_id, clause, subclause or "")
-    status  = classify_status(session, client_id, clause, subclause or "", context)
-    content = generate_llm_answer(session, client_id, clause, subclause or "", context)
-    return {
-        "Client Name":   client_id,
-        "Clause":        clause,
-        "Sub Clause":    subclause or "",
-        "Clause Status": status,
-        "Content":       content,
-    }
+CSV_SINGLE_FILE = os.getenv("LOCAL_CSV_PATH", "").strip() or None
+CSV_DIR = Path(os.getenv("LOCAL_CSV_DIR", "data/csvs")).resolve()
+CSV_DIR.mkdir(parents=True, exist_ok=True)
+CSV_INDEX_DIR = Path(os.getenv("CSV_FAISS_INDEX_DIR", "csv_faiss")).resolve()
+CSV_INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
-def answer_for_all_clients(session: Session, clause: str, subclause: Optional[str] = None) -> pd.DataFrame:
-    """Iterate over ALL FAISS clients and return a table of LLM answers per client."""
-    clients = list_clients_from_faiss(FAISS_INDEX_DIR)
-    if not clients:
-        raise SystemExit(f"No clients found under {FAISS_INDEX_DIR}")
-    rows: List[Dict[str, Any]] = []
-    for client_id in clients:
-        print(f"=== {client_id} ===")
-        rows.append(answer_for_client(session, client_id, clause, subclause))
-    return pd.DataFrame(rows, columns=["Client Name", "Clause", "Sub Clause", "Clause Status", "Content"])
+_CSV = {
+    "frames": {},          # {filename: DataFrame}
+    "meta": {},            # {"files": [...], "rows": {...}, "mtime": {...}, "paths": {...}}
+    "vs": None,            # FAISS vectorstore for CSV chunks
+    "chunk_meta": [],      # [{file, start_row, end_row}]
+    "last_loaded_at": None,
+}
+_CSV_HISTORY: Dict[str, List[Dict[str, Any]]] = {}   # session_id -> [{"role": "...", "text": "...", "time": iso}]
 
+def _csv_list_sources() -> List[Path]:
+    if CSV_SINGLE_FILE:
+        p = Path(CSV_SINGLE_FILE).resolve()
+        if not p.exists():
+            raise HTTPException(404, f"CSV file not found at {p}")
+        return [p]
+    files = [p for p in CSV_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".csv"]
+    if not files:
+        raise HTTPException(404, f"No CSV files found in {CSV_DIR}")
+    return sorted(files, key=lambda x: x.name)
 
+def _load_csv_frames() -> Dict[str, pd.DataFrame]:
+    frames: Dict[str, pd.DataFrame] = {}
+    for p in _csv_list_sources():
+        try:
+            df = pd.read_csv(p, dtype=str, keep_default_na=False, low_memory=False)
+        except Exception as e:
+            raise HTTPException(400, f"Failed reading CSV {p.name}: {e}")
+        # normalize columns to strings
+        df.columns = [str(c) for c in df.columns]
+        frames[p.name] = df
+    return frames
 
-# ===================== Main =====================
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="RAG clause exporter")
-    parser.add_argument("--mode", choices=["matrix", "ask-all"], default="matrix",
-                        help="'matrix' builds the per-client×clause×subclause workbook; 'ask-all' asks one clause/subclause across all clients.")
-    parser.add_argument("--clause", type=str, default="", help="Clause to ask in 'ask-all' mode (e.g., 'Technology').")
-    parser.add_argument("--subclause", type=str, default="", help="Optional subclause to ask in 'ask-all' mode.")
-    parser.add_argument("--out", type=str, default="", help="Optional output XLSX path; uses defaults if omitted.")
-    args = parser.parse_args()
+def _df_rows_to_text_csv(df: pd.DataFrame, file: str, start: int, end: int) -> str:
+    lines = [f"[file: {file}] rows {start+1}-{end}"]
+    cols = list(df.columns)
+    for i in range(start, end):
+        row = df.iloc[i]
+        kv = ", ".join(f"{c}={repr(row[c])}" for c in cols)
+        lines.append(f"r{i+1}: {kv}")
+    return "\n".join(lines)
 
-    # AWS session
-    session = Session(
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        region_name=AWS_REGION,
+def _build_csv_faiss() -> None:
+    frames = _load_csv_frames()
+    files = list(frames.keys())
+    rows = {fname: int(len(frames[fname])) for fname in files}
+    mtime = {}
+    paths = {}
+    for p in _csv_list_sources():
+        mtime[p.name] = datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds")
+        paths[p.name] = str(p)
+
+    emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
+
+    texts = []
+    chunk_meta = []
+    CHUNK_SIZE = 40  # rows per chunk
+    for fname in files:
+        df = frames[fname]
+        n = len(df)
+        if n == 0:
+            continue
+        for start in range(0, n, CHUNK_SIZE):
+            end = min(start + CHUNK_SIZE, n)
+            text = _df_rows_to_text_csv(df, fname, start, end)
+            texts.append(text)
+            chunk_meta.append({"file": fname, "start_row": start+1, "end_row": end})
+
+    if not texts:
+        raise HTTPException(400, "No CSV rows to index.")
+
+    vs = FAISS.from_texts(texts=texts, embedding=emb)
+    vs.save_local(str(CSV_INDEX_DIR))
+
+    _CSV["frames"] = frames
+    _CSV["meta"] = {"files": files, "rows": rows, "mtime": mtime, "paths": paths}
+    _CSV["vs"] = vs
+    _CSV["chunk_meta"] = chunk_meta
+    _CSV["last_loaded_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+def _ensure_csv_loaded():
+    if _CSV.get("vs") is not None and _CSV.get("frames"):
+        return
+    # try to load saved index
+    try:
+        emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
+        _CSV["vs"] = FAISS.load_local(str(CSV_INDEX_DIR), emb, allow_dangerous_deserialization=True)
+    except Exception:
+        _CSV["vs"] = None
+    # we always want dataframes loaded freshly to reflect disk state
+    try:
+        _CSV["frames"] = _load_csv_frames()
+    except Exception:
+        _CSV["frames"] = {}
+    # if we have no vs or no frames, rebuild
+    if _CSV["vs"] is None or not _CSV.get("frames"):
+        _build_csv_faiss()
+
+def _csv_answer(question: str, k: int = 6, session_id: Optional[str] = None) -> Dict[str, Any]:
+    _ensure_csv_loaded()
+    vs = _CSV["vs"]
+    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": k})
+    docs = retriever.get_relevant_documents(question)
+
+    previews = []
+    # Note: chunk_meta aligns with creation order of texts
+    for idx, d in enumerate(docs):
+        if idx >= len(_CSV["chunk_meta"]):
+            break
+        meta = _CSV["chunk_meta"][idx]
+        fname = meta.get("file")
+        s = int(meta.get("start_row", 1)) - 1
+        e = int(meta.get("end_row", s+1))
+        df = _CSV["frames"].get(fname)
+        if df is None:
+            continue
+        df_slice = df.iloc[max(0, s):min(e, s+8)]
+        preview = df_slice.to_string(index=False)
+        previews.append(f"(file: {fname}, rows {s+1}-{min(e, s+8)})\n{preview}")
+
+    context = "\n\n---\n\n".join(previews) if previews else "(no preview)"
+    history = _CSV_HISTORY.get(session_id or "", [])[-6:] if session_id else []
+
+    llm = ChatBedrockConverse(
+        model_id=LLM_MODEL,
+        client=SESSION.client("bedrock-runtime"),
+        temperature=0.15,
+        max_tokens=900
     )
 
-    if args.mode == "matrix":
-        df = build_matrix(session)
-        out = Path(args.out or OUTPUT_XLSX)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        df.to_excel(out, index=False)
-        print(f"\nSaved: {out}")
-        return
+    csv_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a precise data analyst. Answer ONLY using the Provided Context from the CSV files. "
+         "Cite specific files/rows if possible. If the needed data isn't in the context, say you don't know."),
+        *[("human" if t["role"]=="user" else "assistant", t["text"]) for t in history],
+        ("human", "Question: {question}\n\nProvided Context:\n{context}\n\nAnswer now with specifics.")
+    ])
+    chain = csv_prompt | llm | StrOutputParser()
+    answer = chain.invoke({"question": question, "context": context})
 
-    # mode == "ask-all"
-    if not args.clause.strip():
-        raise SystemExit("In --mode ask-all you must provide --clause '...'.")
-    df = answer_for_all_clients(session, args.clause.strip(), args.subclause.strip() or None)
-    out = Path(args.out or f"./all_clients_{args.clause.strip().lower().replace(' ', '_')}.xlsx").resolve()
-    out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_excel(out, index=False)
-    print(f"\nSaved cross-client answers: {out}")
+    if session_id:
+        sess = _CSV_HISTORY.setdefault(session_id, [])
+        now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        sess.append({"role": "user", "text": question, "time": now})
+        sess.append({"role": "assistant", "text": answer, "time": now})
+        if len(sess) > 40:
+            _CSV_HISTORY[session_id] = sess[-40:]
 
-if __name__ == "__main__":
-    main()
+    srcs = []
+    for idx, d in enumerate(docs):
+        if idx >= len(_CSV["chunk_meta"]):
+            break
+        meta = _CSV["chunk_meta"][idx]
+        srcs.append({
+            "file": meta.get("file"),
+            "start_row": meta.get("start_row"),
+            "end_row": meta.get("end_row"),
+            "snippet": d.page_content[:300]
+        })
 
+    return {"answer": answer, "sources": srcs, "history": _CSV_HISTORY.get(session_id or "", [])}
 
+# ======= MODELS (CSV) =======
+class CsvChatRequest(BaseModel):
+    question: str
+    session_id: Optional[str] = None
+    k: Optional[int] = 6
+
+class CsvChatResponse(BaseModel):
+    answer: str
+    sources: List[Dict[str, Any]]
+    history: List[Dict[str, Any]]
+    meta: Dict[str, Any]
+
+# ======= ROUTES (CSV) =======
+@app.get("/csv/metadata")
+def csv_metadata():
+    _ensure_csv_loaded()
+    return {
+        "files": _CSV["meta"].get("files", []),
+        "rows": _CSV["meta"].get("rows", {}),
+        "mtime": _CSV["meta"].get("mtime", {}),
+        "paths": _CSV["meta"].get("paths", {}),
+        "last_loaded_at": _CSV.get("last_loaded_at"),
+    }
+
+@app.post("/csv/chat", response_model=CsvChatResponse)
+def csv_chat(payload: CsvChatRequest):
+    if not payload.question or not payload.question.strip():
+        raise HTTPException(400, "Missing question.")
+    res = _csv_answer(payload.question.strip(), k=int(payload.k or 6), session_id=payload.session_id)
+    meta = {
+        "files": _CSV["meta"].get("files", []),
+        "rows": _CSV["meta"].get("rows", {}),
+    }
+    return CsvChatResponse(answer=res["answer"], sources=res["sources"], history=res["history"], meta=meta)
+
+@app.post("/csv/refresh")
+def csv_refresh():
+    """Re-read CSV files and rebuild FAISS."""
+    _build_csv_faiss()
+    return {"status": "ok", "message": "CSV reloaded and indexed.", "meta": _CSV["meta"]}
+
+@app.get("/csv/history/{session_id}")
+def get_csv_history(session_id: str):
+    return {"session_id": session_id, "history": _CSV_HISTORY.get(session_id, [])}
+
+@app.delete("/csv/history/{session_id}")
+def clear_csv_history(session_id: str):
+    _CSV_HISTORY.pop(session_id, None)
+    return {"status": "ok", "session_id": session_id, "cleared": True}
