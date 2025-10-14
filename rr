@@ -1,0 +1,113 @@
+# ===== Add these helpers to your script =====
+
+def _exact_query(clause: str, subclause: Optional[str]) -> str:
+    if subclause and subclause.strip():
+        return f"what are the content related to {clause} and {subclause}"
+    return f"what are the content related to {clause}"
+
+def retrieve_context_single(session: Session, client_id: str, clause: str, subclause: Optional[str]) -> str:
+    vs = load_vs_for_client(client_id, session)
+    if not vs:
+        print(f"[WARN] No index for client {client_id}")
+        return ""
+    search_type = "mmr" if USE_MMR else "similarity"
+    retriever = vs.as_retriever(search_type=search_type, search_kwargs={"k": K_PER_CLIENT})
+    q = _exact_query(clause, subclause or "")
+    docs = retriever.get_relevant_documents(q) or []
+
+    # Prefer strict client match, but allow fallback if metadata is missing
+    strict = [d for d in docs if str(d.metadata.get("client_id", "")).strip().lower() == client_id.strip().lower()]
+    final_docs = strict if strict else docs
+
+    print(f"[DEBUG] ALL-CLIENTS | {client_id} :: {clause} :: {subclause or ''} "
+          f"-> pre={len(docs)}, post_strict={len(strict)}, used={len(final_docs)}")
+
+    if not final_docs:
+        return ""
+    return _trim(format_docs(final_docs))  # keep your existing _trim/format_docs
+
+def generate_llm_answer_single(session: Session, client_id: str, clause: str, subclause: Optional[str], context: str) -> str:
+    llm = ChatBedrock(
+        client=session.client("bedrock-runtime"),
+        model_id=LLM_MODEL,
+        model_kwargs={"temperature": float(TEMPERATURE), "max_tokens": int(MAX_TOKENS)},
+    )
+    # Reuse your existing PROMPT_ANSWER (no clause prompts)
+    chain = PROMPT_ANSWER | llm | StrOutputParser()
+    try:
+        out = (chain.invoke({
+            "client_id": client_id,
+            "clause": clause,
+            "subclause": subclause or "",
+            "context": (context or "(no matching context found)"),
+        }) or "").strip()
+        return out if out else "I don't know based on the available context."
+    except Exception as e:
+        print(f"[ERROR] generate_llm_answer_single: {client_id} / {clause} / {subclause}: {e}")
+        return "I don't know based on the available context."
+
+def classify_status_single(session: Session, client_id: str, clause: str, subclause: Optional[str], context: str) -> str:
+    # Reuse your existing classify function; shown inline for clarity
+    llm = ChatBedrock(
+        client=session.client("bedrock-runtime"),
+        model_id=LLM_MODEL,
+        model_kwargs={"temperature": float(TEMPERATURE), "max_tokens": int(MAX_TOKENS)},
+    )
+    chain = PROMPT_CLASSIFY | llm | StrOutputParser()
+    try:
+        raw = chain.invoke({
+            "client_id": client_id,
+            "clause": clause,
+            "subclause": subclause or "",
+            "context": (context or "(no matching context found)"),
+        }).strip().strip("`")
+        m = re.search(r'\"status\"\s*:\s*\"(?P<v>yes|no|partial)\"', raw, flags=re.I)
+        if m:
+            return m.group("v").strip().capitalize()
+    except Exception as e:
+        print(f"[ERROR] classify_status_single: {client_id} / {clause} / {subclause}: {e}")
+    return "No" if not context else "Partial"
+
+def answer_for_client(session: Session, client_id: str, clause: str, subclause: Optional[str]) -> Dict[str, str]:
+    """Retrieve + LLM answer for one client; returns row dict."""
+    context = retrieve_context_single(session, client_id, clause, subclause)
+    status  = classify_status_single(session, client_id, clause, subclause, context)
+    content = generate_llm_answer_single(session, client_id, clause, subclause, context)
+    return {
+        "Client Name": client_id,
+        "Clause": clause,
+        "Sub Clause": subclause or "",
+        "Clause Status": status,
+        "Content": content,
+    }
+
+def answer_for_all_clients(session: Session, clause: str, subclause: Optional[str] = None) -> pd.DataFrame:
+    """Iterate over ALL FAISS clients and return a table of LLM answers per client."""
+    clients = list_clients_from_faiss(FAISS_INDEX_DIR)
+    if not clients:
+        raise SystemExit(f"No clients found under {FAISS_INDEX_DIR}")
+    rows = []
+    for c in clients:
+        print(f"=== {c} ===")
+        rows.append(answer_for_client(session, c, clause, subclause))
+    df = pd.DataFrame(rows, columns=["Client Name", "Clause", "Sub Clause", "Clause Status", "Content"])
+    return df
+
+# ===== Example: run one cross-client question =====
+if __name__ == "__main__":
+    session = Session(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
+    )
+
+    # EXAMPLE: “tell me about the technology clause for all clients”
+    # Map that phrasing to clause/subclause as you want:
+    CLAUSE_NAME = "Technology"       # <-- set what your data actually uses
+    SUBCLAUSE   = ""                 # or a specific subclause string
+
+    df = answer_for_all_clients(session, CLAUSE_NAME, SUBCLAUSE or None)
+    out = Path("./all_clients_technology.xlsx").resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(out, index=False)
+    print(f"\nSaved cross-client answers: {out}")
