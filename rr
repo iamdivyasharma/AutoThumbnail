@@ -1,111 +1,14 @@
-# ======================= EXCEL RAG CHANNEL (RAG over complete sheet; no client link) ==========================
-import pandas as pd
-from datetime import datetime
-
-# Use your local workbook directly (adjust path if it's under a subfolder)
-EXCEL_FILE = Path("client_clauses.xlsx").resolve()  # <-- changed from env default
-
-EXCEL_INDEX_DIR = Path(os.getenv("LOCAL_EXCEL_INDEX_DIR", "excel_faiss")).resolve()
-EXCEL_INDEX_DIR.mkdir(parents=True, exist_ok=True)
-
-_EXCEL = {
-    "df_by_sheet": {},     # {sheet_name: DataFrame}
-    "meta": {},            # {"sheets": [...], "rows": {...}, "mtime": "...", "path": "..."}
-    "vs": None,            # FAISS vectorstore for Excel chunks
-    "chunk_meta": [],      # [{sheet, start_row, end_row}]
-    "last_loaded_at": None,
-}
-_EXCEL_HISTORY: Dict[str, List[Dict[str, Any]]] = {}   # session_id -> [{"role": "...", "text": "...", "time": iso}]
-
-def _load_excel_into_frames() -> Dict[str, pd.DataFrame]:
-    if not EXCEL_FILE.exists():
-        raise HTTPException(404, f"Excel file not found at {EXCEL_FILE}")
-    # Reliable .xlsx read (no client filtering anywhere)
-    frames = pd.read_excel(EXCEL_FILE, sheet_name=None, engine="openpyxl", dtype=str)
-    norm: Dict[str, pd.DataFrame] = {}
-    for sh, df in (frames or {}).items():
-        df = df.copy().fillna("")                     # avoid 'nan' text in context
-        df.columns = [str(c) for c in df.columns]
-        norm[str(sh)] = df
-    return norm
-
-def _df_rows_to_text(df: pd.DataFrame, sheet: str, start: int, end: int) -> str:
-    lines = [f"[sheet: {sheet}] rows {start+1}-{end}"]
-    for i in range(start, end):
-        row = df.iloc[i]
-        kv = ", ".join(f"{col}={repr(row[col])}" for col in df.columns)
-        lines.append(f"r{i+1}: {kv}")
-    return "\n".join(lines)
-
-def _build_excel_faiss() -> None:
-    df_by_sheet = _load_excel_into_frames()
-    sheets = list(df_by_sheet.keys())
-    rows = {s: int(len(df_by_sheet[s])) for s in sheets}
-    mtime = datetime.fromtimestamp(EXCEL_FILE.stat().st_mtime).isoformat(timespec="seconds")
-
-    emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
-
-    texts: List[str] = []
-    chunk_meta: List[Dict[str, Any]] = []
-    CHUNK_SIZE = 40  # rows per chunk (RAG over complete sheets)
-    for sh in sheets:
-        df = df_by_sheet[sh]
-        n = len(df)
-        if n == 0:
-            continue
-        for start in range(0, n, CHUNK_SIZE):
-            end = min(start + CHUNK_SIZE, n)
-            texts.append(_df_rows_to_text(df, sh, start, end))
-            chunk_meta.append({"sheet": sh, "start_row": start+1, "end_row": end})
-
-    if not texts:
-        raise HTTPException(400, "Excel workbook has no rows to index.")
-
-    vs = FAISS.from_texts(texts=texts, embedding=emb)
-    vs.save_local(str(EXCEL_INDEX_DIR))
-
-    _EXCEL["df_by_sheet"] = df_by_sheet
-    _EXCEL["meta"] = {"sheets": sheets, "rows": rows, "mtime": mtime, "path": str(EXCEL_FILE)}
-    _EXCEL["vs"] = vs
-    _EXCEL["chunk_meta"] = chunk_meta
-    _EXCEL["last_loaded_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-def _ensure_excel_loaded():
-    if _EXCEL.get("vs") is not None and _EXCEL.get("df_by_sheet"):
-        return
-    # try to load saved index
-    try:
-        emb = BedrockEmbeddings(model_id=EMBED_MODEL, client=SESSION.client("bedrock-runtime"))
-        _EXCEL["vs"] = FAISS.load_local(str(EXCEL_INDEX_DIR), emb, allow_dangerous_deserialization=True)
-    except Exception:
-        _EXCEL["vs"] = None
-    # if we don't have dataframes or vs, rebuild
-    if _EXCEL["vs"] is None or not _EXCEL.get("df_by_sheet"):
-        _build_excel_faiss()
-
 def _excel_answer(question: str, k: int = 6, session_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Retrieve RAG over the XLSX (all sheets), no previews, just use FAISS chunks.
+    """
     _ensure_excel_loaded()
     vs = _EXCEL["vs"]
     retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": k})
     docs = retriever.get_relevant_documents(question)
 
-    previews: List[str] = []
-    # chunk_meta aligns with texts creation order; zip by index
-    for idx, d in enumerate(docs):
-        if idx >= len(_EXCEL["chunk_meta"]):
-            break
-        meta = _EXCEL["chunk_meta"][idx]
-        sh = meta.get("sheet")
-        s = int(meta.get("start_row", 1)) - 1
-        e = int(meta.get("end_row", s+1))
-        df = _EXCEL["df_by_sheet"].get(sh)
-        if df is None:
-            continue
-        df_slice = df.iloc[max(0, s):min(e, s+8)]
-        preview = df_slice.to_string(index=False)
-        previews.append(f"(sheet: {sh}, rows {s+1}-{min(e, s+8)})\n{preview}")
-
-    context = "\n\n---\n\n".join(previews) if previews else "(no preview)"
+    # Build context directly from retrieved docs (no df.to_string previews)
+    context = "\n\n---\n\n".join([d.page_content for d in docs]) if docs else "(no context)"
     history = _EXCEL_HISTORY.get(session_id or "", [])[-6:] if session_id else []
 
     llm = ChatBedrockConverse(
@@ -125,6 +28,7 @@ def _excel_answer(question: str, k: int = 6, session_id: Optional[str] = None) -
     chain = excel_prompt | llm | StrOutputParser()
     answer = chain.invoke({"question": question, "context": context})
 
+    # Maintain conversation history
     if session_id:
         sess = _EXCEL_HISTORY.setdefault(session_id, [])
         now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -133,6 +37,7 @@ def _excel_answer(question: str, k: int = 6, session_id: Optional[str] = None) -
         if len(sess) > 40:
             _EXCEL_HISTORY[session_id] = sess[-40:]
 
+    # Sources metadata (no previews)
     srcs: List[Dict[str, Any]] = []
     for idx, d in enumerate(docs):
         if idx >= len(_EXCEL["chunk_meta"]):
@@ -146,54 +51,3 @@ def _excel_answer(question: str, k: int = 6, session_id: Optional[str] = None) -
         })
 
     return {"answer": answer, "sources": srcs, "history": _EXCEL_HISTORY.get(session_id or "", [])}
-
-# ======= MODELS (Excel) =======
-class ExcelChatRequest(BaseModel):
-    question: str
-    session_id: Optional[str] = None
-    k: Optional[int] = 6
-
-class ExcelChatResponse(BaseModel):
-    answer: str
-    sources: List[Dict[str, Any]]
-    history: List[Dict[str, Any]]
-    meta: Dict[str, Any]
-
-# ======= ROUTES (Excel) =======
-@app.get("/excel/metadata")
-def excel_metadata():
-    _ensure_excel_loaded()
-    return {
-        "path": _EXCEL["meta"].get("path"),
-        "mtime": _EXCEL["meta"].get("mtime"),
-        "sheets": _EXCEL["meta"].get("sheets"),
-        "rows": _EXCEL["meta"].get("rows"),
-        "last_loaded_at": _EXCEL.get("last_loaded_at"),
-    }
-
-@app.post("/excel/chat", response_model=ExcelChatResponse)
-def excel_chat(payload: ExcelChatRequest):
-    if not payload.question or not payload.question.strip():
-        raise HTTPException(400, "Missing question.")
-    res = _excel_answer(payload.question.strip(), k=int(payload.k or 6), session_id=payload.session_id)
-    meta = {
-        "path": _EXCEL["meta"].get("path"),
-        "mtime": _EXCEL["meta"].get("mtime"),
-        "sheets": _EXCEL["meta"].get("sheets"),
-    }
-    return ExcelChatResponse(answer=res["answer"], sources=res["sources"], history=res["history"], meta=meta)
-
-@app.post("/excel/refresh")
-def excel_refresh():
-    """Re-read the Excel and rebuild FAISS. Hook this to your UI 'Refresh' button."""
-    _build_excel_faiss()
-    return {"status": "ok", "message": "Excel reloaded and indexed.", "meta": _EXCEL["meta"]}
-
-@app.get("/excel/history/{session_id}")
-def get_excel_history(session_id: str):
-    return {"session_id": session_id, "history": _EXCEL_HISTORY.get(session_id, [])}
-
-@app.delete("/excel/history/{session_id}")
-def clear_excel_history(session_id: str):
-    _EXCEL_HISTORY.pop(session_id, None)
-    return {"status": "ok", "session_id": session_id, "cleared": True}
