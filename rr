@@ -1,41 +1,22 @@
-import re
 import pandas as pd
 
 INPUT = "client_clause_matrix.xlsx"
-OUTPUT = "ahaooob_clause_subclause_content.xlsx"
-
-MAX_CHARS_PER_CLIENT = 220
-
-def shorten_nicely(text: str, n: int) -> str:
-    s = re.sub(r"\s+", " ", (text or "").strip())
-    if len(s) <= n: 
-        return s
-    cut = s[:n]
-    # prefer to end on a boundary if it’s not too early
-    for sep in [". ", "; ", " – ", " - ", ", "]:
-        i = cut.rfind(sep)
-        if i >= max(40, int(n*0.5)):
-            return cut[:i+1].rstrip() + "…"
-    i = cut.rfind(" ")
-    return (cut[:i].rstrip() if i > 0 else cut).rstrip() + "…"
+OUTPUT = "ahaooob_clients_only.xlsx"
 
 df = pd.read_excel(INPUT)
 
-def club(group: pd.DataFrame) -> str:
-    parts, seen = [], set()
-    for _, r in group.sort_values(["Client Name"]).iterrows():
-        c = (r.get("Content") or "").strip()
-        if not c: 
-            continue
-        bullet = f"- {r['Client Name']}: {shorten_nicely(c, MAX_CHARS_PER_CLIENT)}"
-        if bullet not in seen:
-            parts.append(bullet); seen.add(bullet)
-    return "\n".join(parts)
+def club_clients(group: pd.DataFrame) -> str:
+    names = (group["Client Name"]
+             .dropna()
+             .astype(str)
+             .str.strip()
+             .unique())
+    return ", ".join(sorted(names, key=str.lower))
 
 out = (
     df.groupby(["Clauses","Sub Clauses"], as_index=False)
-      .apply(club)
-      .rename(columns={None: "Content"})[["Clauses","Sub Clauses","Content"]]
+      .apply(lambda g: club_clients(g))
+      .rename(columns={None: "Clients"})[["Clauses","Sub Clauses","Clients"]]
 )
 
 out.to_excel(OUTPUT, index=False)
