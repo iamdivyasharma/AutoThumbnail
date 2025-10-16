@@ -1,12 +1,17 @@
+#!/usr/bin/env python3
 import pandas as pd
 
-INPUT = "client_clause_matrix.xlsx"
-OUTPUT = "ahaooob_clients_only.xlsx"
+INPUT  = "client_clause_matrix.xlsx"
+OUTPUT = "ahaooob_clients_yes_by_clause.xlsx"
 
 df = pd.read_excel(INPUT)
 
-def club_clients(group: pd.DataFrame) -> str:
-    names = (group["Client Name"]
+# keep only "Yes" rows (case/space safe)
+yes_df = df[df["Clause Status"].astype(str).str.strip().str.lower() == "yes"]
+
+# group clause-wise and list unique client names (comma-separated)
+def clients_for_clause(g: pd.DataFrame) -> str:
+    names = (g["Client Name"]
              .dropna()
              .astype(str)
              .str.strip()
@@ -14,9 +19,10 @@ def club_clients(group: pd.DataFrame) -> str:
     return ", ".join(sorted(names, key=str.lower))
 
 out = (
-    df.groupby(["Clauses","Sub Clauses"], as_index=False)
-      .apply(lambda g: club_clients(g))
-      .rename(columns={None: "Clients"})[["Clauses","Sub Clauses","Clients"]]
+    yes_df.groupby("Clauses", as_index=False)
+          .apply(clients_for_clause)
+          .rename(columns={None: "Clients (Clause Status = Yes)"})
+          [["Clauses", "Clients (Clause Status = Yes)"]]
 )
 
 out.to_excel(OUTPUT, index=False)
