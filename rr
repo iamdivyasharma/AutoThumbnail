@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+import os, re, hashlib, time, concurrent.futures as cf
+import pandas as pd
+from pathlib import Path
+from boto3 import Session
+from langchain_aws import ChatBedrockConverse
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+INPUT  = "client_clause_matrix.xlsx"
+OUTPUT = "ahaooob_clause_subclause_content.xlsx"
+
+# ---- Bedrock settings (make it cheap/fast) ----
+REGION     = os.getenv("AWS_REGION", "us-east-1")
+LLM_MODEL  = os.getenv("LLM_MODEL", "anthropic.claude-3-5-haiku-20241022-v1:0")  # smaller/faster than Sonnet
+TEMP       = 0.1
+MAX_TOKENS = 160  # keep small
+
+MAX_WORKERS = int(os.getenv("SUMMARY_MAX_WORKERS", "6"))  # parallelism
+MAX_RETRIES = 3
+RETRY_SLEEP = 1.2
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Summarize to 1 sentence (<= 200 chars). Keep concrete facts. No line breaks."),
+    ("human",  "Clause: {clause}\nSub-Clause: {sub}\n\nText:\n{content}\n\n1-sentence summary:")
+])
+PARSER = StrOutputParser()
+
+def _shorten(s: str, lim: int = 200) -> str:
+    s = re.sub(r"\s+", " ", (s or "").strip())
+    if len(s) <= lim: return s
+    cut = s[:lim]
+    i = max(cut.rfind(". "), cut.rfind("; "), cut.rfind(", "), cut.rfind(" "))
+    return (cut[:i].rstrip() if i > 40 else cut.rstrip()) + "…"
+
+def main():
+    if not Path(INPUT).exists():
+        raise SystemExit(f"Missing input: {INPUT}")
+    df = pd.read_excel(INPUT)
+
+    need = {"Client Name","Clauses","Sub Clauses","Content"}
+    miss = need - set(df.columns)
+    if miss:
+        raise SystemExit(f"Missing columns: {sorted(miss)}")
+
+    session = Session(region_name=REGION)
+    llm = ChatBedrockConverse(
+        model_id=LLM_MODEL,
+        client=session.client("bedrock-runtime"),
+        temperature=float(TEMP),
+        max_tokens=int(MAX_TOKENS),
+    )
+
+    chain = PROMPT | llm | PARSER
+
+    # ---- build dedupe map on content ----
+    df["__content"] = df["Content"].fillna("").astype(str).str.strip()
+    df["__key"] = df["__content"].apply(lambda t: hashlib.sha256(t.encode("utf-8")).hexdigest() if t else "")
+
+    unique_texts = {k: v for k, v in df.set_index("__key")["__content"].items() if k}  # key -> content
+    results = {}  # key -> summary
+
+    def work(item):
+        key, text = item
+        if not text:
+            return key, ""
+        for attempt in range(1, MAX_RETRIES+1):
+            try:
+                # We don’t need per-row clause/subclause for the model to compress well,
+                # but passing the first occurrence helps a bit:
+                return key, _shorten((chain.invoke({"clause":"", "sub":"", "content": text}) or "").strip(), 200)
+            except Exception:
+                if attempt == MAX_RETRIES:
+                    return key, _shorten(text, 200)  # fallback to trimmed
+                time.sleep(RETRY_SLEEP * attempt)
+
+    # ---- parallel summarize unique contents ----
+    if unique_texts:
+        with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            for k, s in ex.map(work, unique_texts.items()):
+                results[k] = s
+
+    # attach summaries back
+    df["Content_Short"] = df.apply(
+        lambda r: results.get(r["__key"], "") if r["__key"] else "",
+        axis=1
+    )
+
+    # group and club
+    def club(group: pd.DataFrame) -> str:
+        bullets, seen = [], set()
+        for _, r in group.sort_values(["Client Name"]).iterrows():
+            s = (r.get("Content_Short") or "").strip()
+            if not s: continue
+            b = f"- {r['Client Name']}: {s}"
+            if b in seen: continue
+            seen.add(b); bullets.append(b)
+        return "\n".join(bullets)
+
+    out = (
+        df.groupby(["Clauses","Sub Clauses"], as_index=False)
+          .apply(club)
+          .rename(columns={None: "Content"})[["Clauses","Sub Clauses","Content"]]
+    )
+
+    out.to_excel(OUTPUT, index=False)
+    print(f"Saved: {OUTPUT}")
+
+if __name__ == "__main__":
+    main()
