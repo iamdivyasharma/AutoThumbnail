@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+
+# Jupyter cell for batch-calling the /ask RAG endpoint (PDF RAG)
+# and saving Question / Answer / Source Links into an Excel file.
+
+import os
+import requests
+import pandas as pd
+
+# ====== CONFIG ======
+BACKEND_BASE_URL = "http://localhost:8000"   # where app3.py (FastAPI) is running
+ASK_ENDPOINT = f"{BACKEND_BASE_URL}/ask"
+
+# If you want to force specific clients, set this list; else keep as None for auto-detect
+FORCED_CLIENT_IDS = None   # e.g. ["client_a", "client_b"]
+
+# Put all your questions here
+QUESTIONS = [
+    "What is the grace period for premium payment for client ABC?",
+    "What are the eligibility criteria for accidental death benefit for client ABC?",
+    "What is the surrender value calculation method for policy XYZ?",
+]
+
+# ====== BATCH CALL LOOP ======
+rows = []
+
+for q in QUESTIONS:
+    print(f"→ Asking: {q!r}")
+
+    payload = {"question": q}
+    if FORCED_CLIENT_IDS:
+        payload["client_ids"] = FORCED_CLIENT_IDS
+
+    # Call your /ask endpoint
+    resp = requests.post(ASK_ENDPOINT, json=payload)
+    resp.raise_for_status()
+    data = resp.json()
+
+    answer = data.get("answer", "")
+    used_clients = data.get("used_clients", [])
+    sources = data.get("sources", [])
+
+    # Build HTTP links to the local PDFs exposed by app3.py
+    # app3.py serves local PDFs at /local-pdfs/<filename.pdf>
+    link_list = []
+    for s in sources:
+        source_file = s.get("source_file")
+        page = s.get("page")
+        if not source_file:
+            continue
+        filename = os.path.basename(source_file)
+        url = f"{BACKEND_BASE_URL}/local-pdfs/{filename}"
+        if page:
+            url = f"{url}#page={page}"
+        link_list.append(url)
+
+    source_links_str = "; ".join(link_list) if link_list else ""
+
+    rows.append({
+        "question": q,
+        "answer": answer,
+        "used_clients": ", ".join(used_clients),
+        "source_links": source_links_str,
+    })
+
+# ====== SAVE TO EXCEL ======
+df = pd.DataFrame(rows, columns=["question", "answer", "used_clients", "source_links"])
+output_file = "rag_pdf_batch_results.xlsx"
+df.to_excel(output_file, index=False)
+
+print(f"\n✅ Saved results to {output_file}")
+df.head()
