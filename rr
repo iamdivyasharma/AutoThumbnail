@@ -1,0 +1,308 @@
+# streamlit.py
+
+import os
+from io import BytesIO
+
+import pandas as pd
+import streamlit as st
+
+from app import (
+    load_dashboard_df,
+    update_llm_insights_for_filtered_df,
+    UPDATED_LLM_COL,
+)
+
+st.set_page_config(page_title="Excel RAG Chatbot", layout="wide")
+
+# ---------- Logo + Client config ----------
+LOGO_PATH = "logo.jpg"  # put your JPG logo here (same folder as this file)
+
+# 👉 EXACT header from Excel (2nd column after the first is dropped)
+CLIENT_COL = "client name"
+
+
+# ---------- Utilities ----------
+
+@st.cache_data
+def get_dashboard_df() -> pd.DataFrame:
+    """
+    Load the Excel dashboard once and cache it for Streamlit.
+    """
+    return load_dashboard_df()
+
+
+@st.cache_data
+def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "dashboard") -> bytes:
+    """
+    Convert a DataFrame to an in-memory Excel file for download.
+    """
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    output.seek(0)
+    return output.read()
+
+
+# ---------- Init session state ----------
+
+if "df_full" not in st.session_state:
+    st.session_state.df_full = get_dashboard_df()
+    st.session_state.df_filtered = st.session_state.df_full.copy()
+    st.session_state.df_updated_filtered = None
+    # our own state variables (different from widget keys)
+    st.session_state.filter_col = None
+    st.session_state.filter_values = []
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+df_full = st.session_state.df_full
+
+# ---------- HEADER with LOGO ----------
+
+header_cols = st.columns([1, 5])
+
+with header_cols[0]:
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, use_container_width=True)
+    else:
+        st.write(" ")  # empty space if logo is missing
+
+with header_cols[1]:
+    st.title("📊 RAG-based Excel Chatbot")
+    st.caption("Conversational updates to your dashboard with Bedrock + FAISS + Excel")
+
+st.markdown(
+    """
+This app uses a **RAG pipeline** in `app.py` (Bedrock + FAISS) over an Excel sheet.
+
+Flow:
+
+1. **Select a client** using the **client name** column.  
+2. **Filter** that client's data by any column (e.g. **Lanyon ID** or **City**).  
+3. Tell the bot what changes you want in the **LLM insight** column.  
+4. It will create a new column **`Updated LLM insight`** row-wise for the **filtered data**.  
+5. Review and **download only the filtered rows** with the new column.
+"""
+)
+
+# ---------- 1) Select client (client name) ----------
+
+st.subheader("1️⃣ Select client (client name)")
+
+if CLIENT_COL not in df_full.columns:
+    st.error(f"Client column '{CLIENT_COL}' not found in the DataFrame. Using all rows.")
+    df_base = df_full.copy()
+    selected_client = "All clients"
+else:
+    client_values = (
+        df_full[CLIENT_COL]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    client_values = sorted(client_values)
+
+    selected_client = st.selectbox(
+        "Select **client name** to work on:",
+        options=["All clients"] + client_values,
+        index=0,
+        key="client_name_widget",
+    )
+
+    if selected_client == "All clients":
+        df_base = df_full.copy()
+    else:
+        df_base = df_full[df_full[CLIENT_COL].astype(str) == selected_client].copy()
+
+if selected_client == "All clients":
+    st.info(
+        "Currently showing **all clients**. Use the dropdown above to focus on a single client."
+    )
+else:
+    st.info(
+        f"All further filtering and RAG updates will be applied only to rows for "
+        f"**client name = {selected_client}**."
+    )
+
+st.write("### Data for current client selection")
+st.dataframe(df_base, use_container_width=True)
+
+# ---------- 2) Filter the data (within selected client) ----------
+
+st.subheader("2️⃣ Filter the data (within the selected client, e.g. by Lanyon ID or City)")
+
+cols = list(df_base.columns)
+if not cols:
+    st.error("The DataFrame has no columns – please check your Excel file.")
+else:
+    # Prefer Lanyon ID or City if available
+    default_index = 0
+    if "Lanyon ID" in cols:
+        default_index = cols.index("Lanyon ID")
+    elif "City" in cols:
+        default_index = cols.index("City")
+
+    # IMPORTANT: widget key != our own state key
+    filter_col_widget = st.selectbox(
+        "Choose a column to filter on (for example **Lanyon ID** or **City**):",
+        options=cols,
+        index=default_index,
+        key="filter_col_widget",
+    )
+
+    if filter_col_widget:
+        possible_values = (
+            df_base[filter_col_widget]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        possible_values = sorted(possible_values)
+    else:
+        possible_values = []
+
+    filter_values_widget = st.multiselect(
+        f"Select one or more values from **{filter_col_widget}** "
+        "to keep in the filtered DataFrame:",
+        options=possible_values,
+        key="filter_values_widget",
+    )
+
+    # Use widget values as current filter
+    filter_col = filter_col_widget
+    filter_values = filter_values_widget
+
+    # Apply filter on df_base (which is already restricted by client name)
+    if filter_values:
+        df_filtered = df_base[df_base[filter_col].astype(str).isin(filter_values)].copy()
+    else:
+        df_filtered = df_base.copy()
+
+    # Store in our own session_state keys (different names from widget keys)
+    st.session_state.df_filtered = df_filtered
+    st.session_state.filter_col = filter_col
+    st.session_state.filter_values = filter_values
+
+    st.write("### Filtered DataFrame (within selected client)")
+    st.dataframe(df_filtered, use_container_width=True)
+
+    st.info(
+        "Okay – have a look at the filtered DataFrame above.\n\n"
+        f"Now tell me in the chat what changes you want to make in the "
+        f"**'{UPDATED_LLM_COL}'** / **'LLM insight'** column (and which rows, "
+        "by Lanyon ID / City / other identifiers)."
+    )
+
+# ---------- 3) Chat with the RAG bot (row-wise updates) ----------
+
+st.subheader("3️⃣ Chat with the RAG bot about the filtered data")
+
+# Existing chat history
+for role, content in st.session_state.chat_history:
+    with st.chat_message(role):
+        st.markdown(content)
+
+user_msg = st.chat_input(
+    f"Describe the changes you want in the '{UPDATED_LLM_COL}' column, "
+    "or ask a question about the filtered data..."
+)
+
+if user_msg:
+    # Show user message
+    st.session_state.chat_history.append(("user", user_msg))
+    with st.chat_message("user"):
+        st.markdown(user_msg)
+
+    df_filtered = st.session_state.df_filtered
+    filter_col = st.session_state.filter_col
+    filter_values = st.session_state.filter_values
+
+    with st.chat_message("assistant"):
+        if df_filtered.empty:
+            msg = (
+                "Your filtered DataFrame currently has **0 rows**. "
+                "Please adjust the client selection and/or filters above and try again."
+            )
+            st.markdown(msg)
+            st.session_state.chat_history.append(("assistant", msg))
+        else:
+            with st.spinner(
+                "Running RAG row-wise over the filtered DataFrame to update "
+                f"'{UPDATED_LLM_COL}'..."
+            ):
+                try:
+                    updated_df = update_llm_insights_for_filtered_df(
+                        df_filtered=df_filtered,
+                        user_instruction=user_msg,
+                        filter_col=filter_col,
+                        filter_values=filter_values,
+                    )
+                    st.session_state.df_updated_filtered = updated_df
+                    n_rows = len(updated_df)
+
+                    reply = (
+                        f"I've generated **{UPDATED_LLM_COL}** values for "
+                        f"**{n_rows} row(s)** in the current filtered DataFrame.\n\n"
+                        "Scroll down to review the updated table. You can then either:\n"
+                        "1. Ask for **more changes** (adjust client / filters or give another instruction), or\n"
+                        "2. Choose **end and download file** to export the filtered rows "
+                        f"with the new **'{UPDATED_LLM_COL}'** column."
+                    )
+                except Exception as e:
+                    reply = f"Error while calling the RAG backend: `{e}`"
+
+            st.markdown(reply)
+            st.session_state.chat_history.append(("assistant", reply))
+
+# ---------- 4) Review updated DF + confirm / more changes / download ----------
+
+if st.session_state.get("df_updated_filtered") is not None:
+    st.subheader("4️⃣ Review and finish")
+
+    updated_df = st.session_state.df_updated_filtered
+
+    st.write(
+        f"#### Filtered DataFrame with new **'{UPDATED_LLM_COL}'** column (row-wise RAG output)"
+    )
+    st.dataframe(updated_df, use_container_width=True)
+
+    next_action = st.radio(
+        "Are you fine with these updates, or do you need more changes?",
+        options=[
+            "I need more changes (go back to client / filters / give another instruction)",
+            "End this and download the updated filtered file",
+        ],
+        index=0,
+        key="next_action_after_update",
+    )
+
+    if next_action.startswith("I need more"):
+        st.info(
+            "No problem. You can change the **client** in step **1** or the **filters** "
+            "in step **2** above, then type a new instruction in the chat in step **3**. "
+            "The app will regenerate the "
+            f"**'{UPDATED_LLM_COL}'** column for the new filtered DataFrame."
+        )
+    else:
+        st.success(
+            "Great! Click the button below to download the updated file containing "
+            "only the **filtered rows** (for the current client selection) plus the new "
+            f"**'{UPDATED_LLM_COL}'** column."
+        )
+
+        excel_bytes_updated = df_to_excel_bytes(
+            updated_df, sheet_name="filtered_with_updated_llm"
+        )
+
+        st.download_button(
+            label="⬇️ Download updated filtered Excel",
+            data=excel_bytes_updated,
+            file_name="dashboard_filtered_updated_llm_insight.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+        )
