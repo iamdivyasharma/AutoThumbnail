@@ -1,0 +1,36 @@
+import os
+from pathlib import Path
+import pandas as pd
+
+# ========= CONFIGURE THESE =========
+input_file = "all_clients.xlsx"   # your main Excel file
+sheet_name = 0                    # 0 = first sheet, or use sheet name as string
+client_column = "client name"     # column that contains client names
+output_folder = "client_excels"   # folder where separate files will be saved
+# ===================================
+
+# Create output folder if it doesn't exist
+os.makedirs(output_folder, exist_ok=True)
+
+# Read the Excel file
+df = pd.read_excel(input_file, sheet_name=sheet_name)
+
+# Check if the column exists
+if client_column not in df.columns:
+    raise ValueError(f"Column '{client_column}' not found. Available columns: {list(df.columns)}")
+
+# Group by client and save each group as its own Excel file
+for client, group in df.groupby(client_column):
+    # Make a safe file name from the client name
+    safe_name = "".join(
+        "_" if c in r'\/:*?"<>|' else c
+        for c in str(client)
+    ).strip()
+
+    if not safe_name:
+        safe_name = "Unknown_Client"
+
+    output_path = Path(output_folder) / f"{safe_name}.xlsx"
+    group.to_excel(output_path, index=False)
+
+print(f"Done! Separate Excel files created in folder: {output_folder}")
