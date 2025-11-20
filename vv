@@ -1,0 +1,102 @@
+# ---------- 4) Interact with the filtered data (tabs) ----------
+
+st.subheader("4️⃣ Interact with the filtered data")
+
+tab_chat, tab_update = st.tabs(["💬 Q&A Chat", "✍️ Update LLM insights"])
+
+# --- TAB 1: Q&A Chat (no changes) ---
+with tab_chat:
+    st.markdown(
+        "Use this chat to **ask questions** about the current filtered data. "
+        "This will **NOT** change the Excel file."
+    )
+
+    # Existing Q&A chat history
+    for role, content in st.session_state.qa_history:
+        with st.chat_message(role):
+            st.markdown(content)
+
+    qa_msg = st.chat_input(
+        "Ask a question about the filtered data (no changes will be made)...",
+        key="qa_input",
+    )
+
+    if qa_msg:
+        st.session_state.qa_history.append(("user", qa_msg))
+        with st.chat_message("user"):
+            st.markdown(qa_msg)
+
+        df_filtered = st.session_state.df_filtered
+
+        with st.chat_message("assistant"):
+            if df_filtered is None or df_filtered.empty:
+                answer = (
+                    "Your filtered DataFrame currently has **0 rows**. "
+                    "Please adjust the filters above and try again."
+                )
+            else:
+                with st.spinner(
+                    "Running RAG over the filtered data to answer your question..."
+                ):
+                    try:
+                        answer = run_rag_query(
+                            query=qa_msg,
+                            df=df_filtered,      # only this client's filtered rows
+                            extra_instruction=None,
+                        )
+                    except Exception as e:
+                        answer = f"Error while calling the RAG backend: `{e}`"
+
+            st.markdown(answer)
+            st.session_state.qa_history.append(("assistant", answer))
+
+# --- TAB 2: Update LLM insights ---
+with tab_update:
+    st.markdown(
+        f"""
+Use this tab when you want to **modify the LLM insight** column for the filtered rows.
+
+Describe how **'{UPDATED_LLM_COL}'** (or the original **'LLM insight'** column)
+should be updated for these rows.
+"""
+    )
+
+    update_instruction = st.text_area(
+        f"Describe how the '{UPDATED_LLM_COL}' column should be updated for the filtered rows:",
+        key="update_instruction",
+        height=150,
+    )
+
+    if st.button("🚀 Generate new LLM insights for filtered rows", key="btn_update_llm"):
+        df_filtered = st.session_state.df_filtered
+        filter_col = st.session_state.filter_col
+        filter_values = st.session_state.filter_values
+
+        if df_filtered is None or df_filtered.empty:
+            st.warning(
+                "Your filtered DataFrame currently has **0 rows**. "
+                "Please adjust filters above and try again."
+            )
+        elif not update_instruction.strip():
+            st.warning("Please enter instructions for how to update the LLM insights.")
+        else:
+            with st.spinner(
+                "Running RAG row-wise over the filtered DataFrame to update "
+                f"'{UPDATED_LLM_COL}'..."
+            ):
+                try:
+                    updated_df = update_llm_insights_for_filtered_df(
+                        df_filtered=df_filtered,
+                        user_instruction=update_instruction,
+                        filter_col=filter_col,
+                        filter_values=filter_values,
+                    )
+                    st.session_state.df_updated_filtered = updated_df
+                    n_rows = len(updated_df)
+
+                    st.success(
+                        f"Generated new **{UPDATED_LLM_COL}** values for "
+                        f"**{n_rows} row(s)** in the current filtered DataFrame."
+                    )
+                except Exception as e:
+                    st.error(f"Error while calling the RAG backend: `{e}`")
