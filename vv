@@ -1,0 +1,48 @@
+# ---------- 6) Review updated DF + download ----------
+
+if st.session_state.get("df_updated_filtered") is not None:
+    st.subheader("6️⃣ Review and finish")
+
+    updated_df = st.session_state.df_updated_filtered
+
+    st.write(
+        f"#### Filtered DataFrame with new **'{UPDATED_LLM_COL}'** column (row-wise RAG output)"
+    )
+    st.dataframe(updated_df, use_container_width=True)
+
+    next_action = st.radio(
+        "Are you fine with these updates, or do you need more changes?",
+        options=[
+            "I need more changes (change filters / instructions and rerun)",
+            "End this and download the updated filtered file",
+        ],
+        index=0,
+        key="next_action_after_update",
+    )
+
+    if next_action.startswith("I need more"):
+        st.info(
+            "No problem. You can change the filters in step **3** or the "
+            "**update instruction** in step **5**, then rerun the update. "
+            f"The app will regenerate the **'{UPDATED_LLM_COL}'** column for the new filtered DataFrame."
+        )
+    else:
+        st.success(
+            "Great! Click the button below to download the updated file containing "
+            "only the **filtered rows** for this client plus the new "
+            f"**'{UPDATED_LLM_COL}'** column."
+        )
+
+        excel_bytes_updated = df_to_excel_bytes(
+            updated_df, sheet_name=f"{selected_client}_filtered_with_updated_llm"
+        )
+
+        st.download_button(
+            label="⬇️ Download updated filtered Excel",
+            data=excel_bytes_updated,
+            file_name=f"{selected_client}_filtered_updated_llm_insight.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+        )
