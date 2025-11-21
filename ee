@@ -1,0 +1,50 @@
+def make_chunks_for_docx(doc_path: Path, category: str, client_id: str) -> Iterable[Document]:
+    """
+    Extract text from DOCX using python-docx, then chunk.
+    This avoids NLTK / unstructured dependencies.
+
+    Note: this only supports .docx. Old .doc files should ideally
+    be converted to .docx before indexing.
+    """
+    if not _HAS_PYTHON_DOCX:
+        print(f"[WARN] python-docx not available; skipping {doc_path}")
+        return
+
+    if doc_path.suffix.lower() != ".docx":
+        print(f"[WARN] Skipping non-DOCX file in DOCX handler: {doc_path}")
+        return
+
+    policy_id = doc_path.name
+    print(f"[DEBUG] Starting DOCX extraction (python-docx) for {doc_path}")
+
+    try:
+        doc = DocxDocument(str(doc_path))
+    except Exception as e:
+        print(f"[WARN] Failed to open DOCX {doc_path} with python-docx: {e}")
+        return
+
+    # Collect all paragraph texts
+    texts = []
+    for para in doc.paragraphs:
+        t = (para.text or "").strip()
+        if t:
+            texts.append(t)
+
+    full_text = "\n".join(texts).strip()
+    if not full_text:
+        print(f"[DEBUG] No text found in DOCX {doc_path}")
+        return
+
+    chunks = chunk_text(full_text)  # [(start, end, chunk_text), ...]
+    print(f"[DEBUG] Generated {len(chunks)} chunks for DOCX {doc_path}")
+
+    for logical_page, (_, _, chunk) in enumerate(chunks, start=1):
+        meta = {
+            "category": category,
+            "client_id": client_id,
+            "policy_id": policy_id,
+            "page": logical_page,  # logical chunk index
+            "source_file": str(doc_path.resolve()),
+            "extracted_by": "python-docx",
+        }
+        yield Document(page_content=chunk, metadata=meta)
