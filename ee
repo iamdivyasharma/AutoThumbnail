@@ -161,4 +161,40 @@ def process_all_metadata(source_root: Path, dest_root: Path):
         main_name, sub_name = split_account_name(account_name)
         print(f"[DEBUG] Split account into main='{main_name}', sub='{sub_name}'")
 
-        main_folde_
+        main_folder = sanitize_folder_name(main_name) if main_name else "UNKNOWN_ACCOUNT"
+        dest_folder = dest_root / main_folder
+
+        if sub_name:
+            sub_folder = sanitize_folder_name(sub_name)
+            dest_folder = dest_folder / sub_folder
+
+        dest_folder.mkdir(parents=True, exist_ok=True)
+
+        # Keep the original file name (deal1.docx, deal2.pdf, etc.)
+        dest_file = dest_folder / orig_file.name
+
+        # If that file already exists, add suffix _1, _2, ...
+        if dest_file.exists():
+            base = dest_file.stem
+            ext = dest_file.suffix
+            counter = 1
+            print("[DEBUG] Destination file exists, adding numeric suffix...")
+            while dest_file.exists():
+                dest_file = dest_folder / f"{base}_{counter}{ext}"
+                counter += 1
+
+        try:
+            shutil.copy2(orig_file, dest_file)
+            total_processed += 1
+            print(f"[OK] Copied {orig_file} -> {dest_file}")
+        except Exception as e:
+            print(f"[ERROR] Copy failed {orig_file} -> {dest_file}: {e}")
+
+    print("\n========== SUMMARY ==========")
+    print(f"Total metadata files seen:    {total_meta}")
+    print(f"Total files processed/copied: {total_processed}")
+    print("================================")
+
+
+if __name__ == "__main__":
+    process_all_metadata(SOURCE_ROOT, DEST_ROOT)
