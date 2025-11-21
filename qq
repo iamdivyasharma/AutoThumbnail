@@ -1,0 +1,169 @@
+import json
+import os
+import shutil
+import re
+from pathlib import Path
+
+# ==== CONFIGURE THESE TWO PATHS ====
+SOURCE_ROOT = Path(r"/path/to/root_with_FOLDERNAMES")  # contains multiple FOLDERNAME directories
+DEST_ROOT = Path(r"/path/to/output_root")             # where Accountname folders will be created
+# ===================================
+
+
+def parse_metadata_file(meta_path: Path) -> dict:
+    """
+    Try to parse metadata as JSON first.
+    If that fails, fall back to simple key=value lines.
+    """
+    text = meta_path.read_text(encoding="utf-8", errors="ignore").strip()
+
+    # Try JSON
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: key=value lines
+    data = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, value = line.split("=", 1)
+            data[key.strip()] = value.strip()
+    return data
+
+
+def get_meta_value(data: dict, *possible_keys, default=None):
+    """
+    Look up a metadata value in a case-insensitive way,
+    trying several possible keys.
+    """
+    lowered = {k.lower(): v for k, v in data.items()}
+    for key in possible_keys:
+        if key is None:
+            continue
+        v = lowered.get(key.lower())
+        if v is not None:
+            return v
+    return default
+
+
+def sanitize_for_path(value: str) -> str:
+    """
+    Replace spaces with underscores and remove characters
+    that are not safe for filenames.
+    """
+    if value is None:
+        return ""
+    value = value.strip()
+    value = re.sub(r"\s+", "_", value)  # spaces -> underscores
+    # Remove characters that are problematic in paths
+    value = re.sub(r'[<>:"/\\|?*]', "_", value)
+    return value
+
+
+def process_all_metadata(source_root: Path, dest_root: Path):
+    dest_root.mkdir(parents=True, exist_ok=True)
+
+    # Find all *.pdf.metadata and *.docx.metadata
+    for meta_path in source_root.rglob("*.metadata"):
+        # Original file is the same path without the .metadata suffix
+        orig_file = meta_path.with_suffix("")  # removes only ".metadata"
+
+        if not orig_file.is_file():
+            print(f"[WARN] Original file not found for metadata: {meta_path}")
+            continue
+
+        if orig_file.suffix.lower() not in [".pdf", ".docx"]:
+            # we only care about pdf/docx
+            continue
+
+        try:
+            data = parse_metadata_file(meta_path)
+        except Exception as e:
+            print(f"[ERROR] Could not parse metadata {meta_path}: {e}")
+            continue
+
+        # Extract metadata fields (with some flexibility on key names)
+        account_name = get_meta_value(
+            data,
+            "Accountname", "AccountName", "account_name", "account"
+        )
+        group = get_meta_value(
+            data,
+            "group", "Group"
+        )
+        linkedentityid = get_meta_value(
+            data,
+            "linkedentityid", "linked_entity_id", "LinkedEntityId"
+        )
+        doc_id = get_meta_value(
+            data,
+            "id", "Id", "ID"
+        )
+        agreement_latestfilename = get_meta_value(
+            data,
+            "agreement_latestfile name",
+            "agreement_latestfile_name",
+            "agreement_latestfilename",
+            "agreement_latestfile",
+            "Agreement_LatestFile_Name"
+        )
+        fileextension = get_meta_value(
+            data,
+            "fileextension", "file_extension", "FileExtension"
+        )
+
+        # If any critical fields missing, fall back where possible
+        if not fileextension:
+            fileextension = orig_file.suffix.lstrip(".")  # pdf or docx
+
+        if not agreement_latestfilename:
+            # fallback to original file name (without extension)
+            agreement_latestfilename = orig_file.stem
+
+        if not account_name:
+            print(f"[WARN] No Accountname in metadata {meta_path}, skipping.")
+            continue
+
+        # Sanitize values for path
+        account_name_s = sanitize_for_path(account_name)
+        group_s = sanitize_for_path(group or "UNKNOWN_GROUP")
+        linkedentityid_s = sanitize_for_path(linkedentityid or "UNKNOWN_LINKEDID")
+        doc_id_s = sanitize_for_path(doc_id or "UNKNOWN_ID")
+        agreement_s = sanitize_for_path(agreement_latestfilename)
+        fileextension_s = sanitize_for_path(fileextension).lstrip(".")
+
+        # Build final filename: GROUP_LINKEDid_ID_Agreement_latestfilename.fileextension
+        final_filename = f"{group_s}_{linkedentityid_s}_{doc_id_s}_{agreement_s}.{fileextension_s}"
+
+        # Destination folder: named by Accountname
+        dest_folder = dest_root / account_name_s
+        dest_folder.mkdir(parents=True, exist_ok=True)
+
+        dest_file = dest_folder / final_filename
+
+        # Avoid overwriting without warning
+        if dest_file.exists():
+            # Optionally add a numeric suffix
+            base = dest_file.stem
+            ext = dest_file.suffix
+            counter = 1
+            while dest_file.exists():
+                dest_file = dest_folder / f"{base}_{counter}{ext}"
+                counter += 1
+
+        # Copy original pdf/docx
+        try:
+            shutil.copy2(orig_file, dest_file)
+            print(f"[OK] {orig_file} -> {dest_file}")
+        except Exception as e:
+            print(f"[ERROR] Copy failed {orig_file} -> {dest_file}: {e}")
+
+
+if __name__ == "__main__":
+    process_all_metadata(SOURCE_ROOT, DEST_ROOT)
