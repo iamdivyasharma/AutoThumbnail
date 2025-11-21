@@ -1,0 +1,227 @@
+import json
+import shutil
+import re
+from pathlib import Path
+
+# === CONFIGURE THIS ===
+# Set this to the main root that contains all your FOLDERNAME folders.
+# ✅ VERY IMPORTANT: make sure this path is correct.
+SOURCE_ROOT = Path(r"/path/to/root")  # e.g. r"R:\Data\Root"
+# Output directory where new Accountname folders will be created:
+DEST_ROOT = SOURCE_ROOT.parent / "output_finance_renamed"
+# ======================
+
+
+def parse_metadata_file(meta_path: Path) -> dict:
+    """
+    Parse metadata as JSON (primary), with a fallback to key=value lines.
+    """
+    text = meta_path.read_text(encoding="utf-8", errors="ignore").strip()
+
+    # Try JSON first (most likely in your case)
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        print(f"[DEBUG] {meta_path} is not valid JSON, trying key=value format")
+
+    # Fallback: key=value lines
+    data = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, value = line.split("=", 1)
+            data[key.strip()] = value.strip()
+    return data
+
+
+def get_meta_value(data: dict, *possible_keys, default=None):
+    """
+    Look up a metadata value in a case-insensitive way,
+    trying several possible keys.
+    """
+    lowered = {k.lower(): v for k, v in data.items()}
+    for key in possible_keys:
+        if key is None:
+            continue
+        v = lowered.get(key.lower())
+        if v is not None:
+            return v
+    return default
+
+
+def sanitize_for_path(value: str) -> str:
+    """
+    Replace spaces with underscores and remove characters
+    that are not safe for filenames.
+    """
+    if value is None:
+        return ""
+    value = value.strip()
+    # spaces -> underscores
+    value = re.sub(r"\s+", "_", value)
+    # Remove characters that are problematic in paths
+    value = re.sub(r'[<>:"/\\|?*]', "_", value)
+    return value
+
+
+def process_all_metadata(source_root: Path, dest_root: Path):
+    print(f"[INFO] SOURCE_ROOT = {source_root}")
+    print(f"[INFO] DEST_ROOT   = {dest_root}")
+
+    dest_root.mkdir(parents=True, exist_ok=True)
+
+    total_meta_found = 0
+    total_under_finance = 0
+    total_pattern_match = 0
+    total_orig_exists = 0
+    total_processed = 0
+
+    # Walk all *.metadata.json files under the root
+    print("[INFO] Scanning for *.metadata.json files...")
+    for meta_path in source_root.rglob("*.metadata.json"):
+        total_meta_found += 1
+        print(f"\n[DEBUG] Found metadata candidate: {meta_path}")
+
+        # ✅ Only keep metadata files under a "finance" folder (any level)
+        parts_lower = [p.lower() for p in meta_path.parts]
+        if "finance" not in parts_lower:
+            print("[DEBUG] Skipping: path does not contain 'finance'")
+            continue
+
+        total_under_finance += 1
+
+        name_lower = meta_path.name.lower()
+
+        # ✅ Only keep docx.metadata.json and pdf.metadata.json
+        if not (
+            name_lower.endswith("pdf.metadata.json")
+            or name_lower.endswith("docx.metadata.json")
+        ):
+            print("[DEBUG] Skipping: filename does not end with pdf.metadata.json or docx.metadata.json")
+            continue
+
+        total_pattern_match += 1
+
+        # Original file:
+        # "file.pdf.metadata.json" -> "file.pdf"
+        # "file.docx.metadata.json" -> "file.docx"
+        # (strip two suffixes: .json then .metadata)
+        orig_file = meta_path.with_suffix("")  # remove ".json" -> *.metadata
+        orig_file = orig_file.with_suffix("")  # remove ".metadata" -> *.pdf / *.docx
+
+        print(f"[DEBUG] Expected original file: {orig_file}")
+
+        if not orig_file.is_file():
+            print(f"[WARN] Original file not found for metadata: {meta_path}")
+            continue
+
+        if orig_file.suffix.lower() not in [".pdf", ".docx"]:
+            print(f"[DEBUG] Skipping: original file is not .pdf or .docx (found {orig_file.suffix})")
+            continue
+
+        total_orig_exists += 1
+
+        try:
+            data = parse_metadata_file(meta_path)
+        except Exception as e:
+            print(f"[ERROR] Could not parse metadata {meta_path}: {e}")
+            continue
+
+        # Extract metadata fields (flexible key names)
+        account_name = get_meta_value(
+            data, "Accountname", "AccountName", "account_name", "account"
+        )
+        group = get_meta_value(data, "group", "Group")
+        linkedentityid = get_meta_value(
+            data, "linkedentityid", "linked_entity_id", "LinkedEntityId"
+        )
+        doc_id = get_meta_value(data, "id", "Id", "ID")
+        agreement_latestfilename = get_meta_value(
+            data,
+            "agreement_latestfile name",
+            "agreement_latestfile_name",
+            "agreement_latestfilename",
+            "agreement_latestfile",
+            "Agreement_LatestFile_Name",
+        )
+        fileextension = get_meta_value(
+            data, "fileextension", "file_extension", "FileExtension"
+        )
+
+        print(f"[DEBUG] Metadata extracted from {meta_path}:")
+        print(f"        Accountname            = {account_name}")
+        print(f"        group                  = {group}")
+        print(f"        linkedentityid         = {linkedentityid}")
+        print(f"        id                     = {doc_id}")
+        print(f"        agreement_latestfile   = {agreement_latestfilename}")
+        print(f"        fileextension          = {fileextension}")
+
+        # Fallbacks
+        if not fileextension:
+            fileextension = orig_file.suffix.lstrip(".")  # pdf / docx
+            print(f"[DEBUG] fileextension missing in metadata, using from original file: {fileextension}")
+
+        if not agreement_latestfilename:
+            agreement_latestfilename = orig_file.stem
+            print(f"[DEBUG] agreement_latestfilename missing, using original stem: {agreement_latestfilename}")
+
+        if not account_name:
+            print(f"[WARN] No Accountname in metadata {meta_path}, skipping this file.")
+            continue
+
+        # Sanitize for safe paths (and replace spaces with underscores)
+        account_name_s = sanitize_for_path(account_name)
+        group_s = sanitize_for_path(group or "UNKNOWN_GROUP")
+        linkedentityid_s = sanitize_for_path(linkedentityid or "UNKNOWN_LINKEDID")
+        doc_id_s = sanitize_for_path(doc_id or "UNKNOWN_ID")
+        agreement_s = sanitize_for_path(agreement_latestfilename)
+        fileextension_s = sanitize_for_path(fileextension).lstrip(".")
+
+        # Build new filename:
+        # GROUP_LINKEDid_ID_Agreement_latestfilename.fileextension
+        final_filename = (
+            f"{group_s}_{linkedentityid_s}_{doc_id_s}_{agreement_s}.{fileextension_s}"
+        )
+
+        print(f"[DEBUG] New file name will be: {final_filename}")
+        print(f"[DEBUG] Account folder will be: {account_name_s}")
+
+        # New folder by Accountname
+        dest_folder = dest_root / account_name_s
+        dest_folder.mkdir(parents=True, exist_ok=True)
+
+        dest_file = dest_folder / final_filename
+
+        # Avoid overwrite by adding numeric suffix if needed
+        if dest_file.exists():
+            base = dest_file.stem
+            ext = dest_file.suffix
+            counter = 1
+            print(f"[DEBUG] Destination file already exists, adding numeric suffix")
+            while dest_file.exists():
+                dest_file = dest_folder / f"{base}_{counter}{ext}"
+                counter += 1
+
+        # Copy original pdf/docx into new structure
+        try:
+            shutil.copy2(orig_file, dest_file)
+            total_processed += 1
+            print(f"[OK] {orig_file} -> {dest_file}")
+        except Exception as e:
+            print(f"[ERROR] Copy failed {orig_file} -> {dest_file}: {e}")
+
+    print("\n========== SUMMARY ==========")
+    print(f"Total *.metadata.json found:            {total_meta_found}")
+    print(f"Total under 'finance':                 {total_under_finance}")
+    print(f"Total matching pdf/docx.metadata.json: {total_pattern_match}")
+    print(f"Total with existing original file:     {total_orig_exists}")
+    print(f"Total successfully processed/copied:   {total_processed}")
+    print("================================")
+
+
+if __name__ == "__main__":
+    process_all_metadata(SOURCE_ROOT, DEST_ROOT)
