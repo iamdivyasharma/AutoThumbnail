@@ -1,14 +1,77 @@
+def textract_by_pages(
+    s3_uri: str,
+    client=None,
+    textract_features: Optional[List[str]] = None,
+    region_name: Optional[str] = None,
+) -> List[Tuple[int, str]]:
+    """
+    Use AmazonTextractPDFLoader on an S3 URI and return a list:
+        [(page_num, page_text), ...]
+
+    s3_uri example: "s3://my-bucket/path/to/file.pdf"
+    """
+    try:
+        loader = AmazonTextractPDFLoader(
+            file_path=s3_uri,          # S3 URI
+            client=client,             # usually your TEXTRACT_CLIENT
+            textract_features=textract_features,
+            region_name=region_name,   # optional; often not needed if client is passed
+        )
+        docs = loader.load()          # List[Document]
+    except Exception as e:
+        print(f"[WARN] textract_by_pages loader failed for {s3_uri}: {e}")
+        return []
+
+    page_texts: List[Tuple[int, str]] = []
+
+    for d in docs:
+        if d is None:
+            continue
+        text = clean_text(getattr(d, "page_content", "") or "")
+        if not text:
+            continue
+
+        meta = getattr(d, "metadata", {}) or {}
+        # loader usually sets 'page' in metadata
+        page = meta.get("page") or meta.get("Page") or 1
+        try:
+            page_num = int(page)
+        except Exception:
+            page_num = 1
+
+        page_texts.append((page_num, text))
+
+    # sort by page number just in case
+    page_texts.sort(key=lambda x: x[0])
+    return page_texts
+
+
+
 def make_chunks_for_pdf(pdf_path: Path, category: str, client_id: str) -> Iterable[Document]:
     policy_id = pdf_path.name
     scanned = is_scanned_pdf(pdf_path)
 
-    # ===== SCANNED PDF → your S3 Textract path (WORKING) =====
+    # ===== SCANNED PDF → loader-based textract_by_pages(S3 URI) =====
     if scanned:
-        page_texts = textract_pdf_to_page_texts_s3(pdf_path)
-        if not page_texts:
-            print(f"[WARN] No Textract text for scanned PDF {pdf_path}; skipping.")
+        s3_key = local_path_to_s3_key(pdf_path)
+        if not s3_key:
+            print(f"[WARN] Path {pdf_path} cannot be mapped to S3; skipping Textract.")
             return
 
+        s3_uri = f"s3://{S3_DOC_BUCKET}/{s3_key}"
+        print(f"[TEXTRACT] Using textract_by_pages loader on {s3_uri}")
+
+        page_texts = textract_by_pages(
+            s3_uri,
+            client=TEXTRACT_CLIENT,
+            # textract_features=["TABLES", "FORMS", "LAYOUT"],  # optional, if you want
+            region_name=REGION,
+        )
+        if not page_texts:
+            print(f"[WARN] textract_by_pages returned no text for {pdf_path}")
+            return
+
+        # same logic as before: concatenate, track page ranges, then chunk
         concatenated = ""
         page_ranges: List[Tuple[int, int, int]] = []  # (start_char, end_char, page_num)
         cursor = 0
@@ -34,13 +97,13 @@ def make_chunks_for_pdf(pdf_path: Path, category: str, client_id: str) -> Iterab
                 "page_start": pages[0],
                 "page_end": pages[-1],
                 "source_file": str(pdf_path.resolve()),
-                "extracted_by": "textract_s3",  # keep this marker
+                "extracted_by": "textract_loader_s3",
             }
             yield Document(page_content=chunk, metadata=meta)
 
         return
 
-    # ===== NON-SCANNED PDF → PyMuPDF as before =====
+    # ===== NON-SCANNED PDF → existing PyMuPDF path (unchanged) =====
     try:
         with fitz.open(str(pdf_path)) as doc:
             for pnum in range(doc.page_count):
