@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""
+build_clients_yaml.py
+
+Scan FAISS_INDEX_DIR for all client index folders (legal + finance, with subfolders)
+and build / update configs/clients.yaml with entries per client id.
+
+Each key in YAML will look like:
+  "legal/clienta"
+  "finance/clientx/us"
+
+Each entry contains:
+  client_name     - parsed from the path or manifest
+  country         - parsed from the path for finance (e.g. "us")
+  k               - default 4 (you can edit)
+  temperature     - default 0.2 (you can edit)
+  max_tokens      - default 256 (you can edit)
+  chunk_overlap   - default 150 (matches indexer CHUNK_OVERLAP, you can edit)
+  aliases         - list of strings to help client detection; PLEASE EDIT these
+
+If configs/clients.yaml already exists, this script will:
+  - keep existing entries as-is
+  - add ONLY new client ids that are not present yet
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+
+import yaml
+
+# ⚠️ EDIT THESE to match your setup (same as in app3.py)
+FAISS_INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve()
+CONFIGS_PATH    = Path("/ABS/PATH/TO/configs/clients.yaml").resolve()
+
+# Defaults for new clients
+DEFAULT_K             = 4
+DEFAULT_TEMPERATURE   = 0.20
+DEFAULT_MAX_TOKENS    = 256
+DEFAULT_CHUNK_OVERLAP = 150
+
+
+def _normalize_id(s: str) -> str:
+    """Normalize a client id / path to lowercase with forward slashes."""
+    return str(s or "").strip().lower().replace("\\", "/")
+
+
+def parse_client_scope_from_id(client_id: str) -> Dict[str, Optional[str]]:
+    """
+    client_id is something like:
+      - "legal/clienta"
+      - "finance/clientx/us"
+    Return dict: {category, client_name, country}
+    """
+    nid = _normalize_id(client_id)
+    parts = nid.split("/")
+    category = parts[0] if parts else None
+    client_name: Optional[str] = None
+    country: Optional[str] = None
+
+    if category in {"legal", "finance"}:
+        if len(parts) >= 2:
+            client_name = parts[1]
+        if category == "finance" and len(parts) >= 3:
+            country = parts[2]
+
+    return {"category": category, "client_name": client_name, "country": country}
+
+
+def find_client_ids() -> List[str]:
+    """
+    Walk FAISS_INDEX_DIR and return a list of normalized client ids
+    for any directory that contains both index.faiss and index.pkl.
+
+    Examples:
+      /faiss_indices/legal/clienta/           -> "legal/clienta"
+      /faiss_indices/finance/clientx/us/      -> "finance/clientx/us"
+    """
+    ids: List[str] = []
+    if not FAISS_INDEX_DIR.exists():
+        print(f"[WARN] FAISS_INDEX_DIR does not exist: {FAISS_INDEX_DIR}")
+        return ids
+
+    for dirpath, dirnames, filenames in os.walk(FAISS_INDEX_DIR):
+        filenames = set(filenames)
+        if "index.faiss" in filenames and "index.pkl" in filenames:
+            p = Path(dirpath)
+            rel = p.relative_to(FAISS_INDEX_DIR)  # e.g. legal/clienta, finance/clientx/us
+            cid = _normalize_id(rel.as_posix())
+            ids.append(cid)
+
+    ids = sorted(set(ids))
+    return ids
+
+
+def build_entry_for_id(client_id: str) -> Dict[str, Any]:
+    """
+    Create a default YAML entry for a given client id.
+
+    You are expected to later EDIT:
+      - client_name (if needed)
+      - country (if needed)
+      - aliases (add all variants that might appear in questions)
+      - k / temperature / max_tokens / chunk_overlap (if you want per-client tuning)
+    """
+    scope = parse_client_scope_from_id(client_id)
+    category    = scope["category"]
+    client_name = scope["client_name"] or ""
+    country     = scope["country"] or ""
+
+    # Some reasonable default aliases to get you started
+    aliases: List[str] = []
+    if client_name:
+        aliases.append(client_name)
+    if client_name and country:
+        aliases.append(f"{client_name} {country}")
+        aliases.append(f"{client_name} ({country})")
+    if category and client_name:
+        aliases.append(f"{client_name} {category}")
+
+    # Make aliases unique & clean
+    aliases = sorted({a.strip().lower() for a in aliases if a.strip()})
+
+    return {
+        "client_name": client_name,
+        "country": country,
+        "k": DEFAULT_K,
+        "temperature": DEFAULT_TEMPERATURE,
+        "max_tokens": DEFAULT_MAX_TOKENS,
+        "chunk_overlap": DEFAULT_CHUNK_OVERLAP,
+        "aliases": aliases,
+    }
+
+
+def main():
+    # Load any existing yaml
+    existing: Dict[str, Any] = {}
+    if CONFIGS_PATH.exists():
+        try:
+            existing_raw = yaml.safe_load(CONFIGS_PATH.read_text()) or {}
+            if isinstance(existing_raw, dict):
+                existing = existing_raw
+            else:
+                print(f"[WARN] Existing YAML is not a dict; ignoring: {CONFIGS_PATH}")
+        except Exception as e:
+            print(f"[WARN] Failed to read existing YAML {CONFIGS_PATH}: {e}")
+
+    client_ids = find_client_ids()
+    if not client_ids:
+        print(f"No FAISS index directories found under {FAISS_INDEX_DIR}")
+        return
+
+    print(f"Discovered {len(client_ids)} client ids from FAISS indices.")
+    new_entries = 0
+
+    # Merge: keep existing, add only missing clients
+    for cid in client_ids:
+        if cid in existing:
+            continue
+        existing[cid] = build_entry_for_id(cid)
+        new_entries += 1
+
+    CONFIGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with CONFIGS_PATH.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(existing, f, sort_keys=True, allow_unicode=True)
+
+    print(f"Wrote {CONFIGS_PATH}")
+    print(f"New entries added: {new_entries}")
+    if new_entries:
+        print("⚠️ Please open this YAML and EDIT aliases / params for each new client.")
+
+
+if __name__ == "__main__":
+    main()
