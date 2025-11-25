@@ -1,0 +1,344 @@
+
+from __future__ import annotations
+
+import os
+import json
+from pathlib import Path
+from typing import List, Dict, Any, Tuple, Optional
+
+from boto3 import Session
+from langchain_aws import BedrockEmbeddings, ChatBedrock
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# ===================== EDIT THESE =====================
+
+FAISS_INDEX_DIR     = Path("/ABS/PATH/TO/faiss_indices").resolve()     # root used by indexer
+FINANCE_INDEX_ROOT  = FAISS_INDEX_DIR / "finance"                      # finance-only indexes
+OUTPUT_JSONL        = Path("./finance_contract_analysis.jsonl").resolve()
+
+# Optional: set to a substring to restrict to one client (e.g. "ABB - SWITZZERLNA")
+TARGET_CLIENT_NAME  = "ABB - SWITZZERLNA"   # or "" / None to run for all finance clients
+
+# AWS (dev keys; prefer IAM roles in prod)
+AWS_REGION = "us-east-1"
+AWS_ACCESS_KEY_ID     = "YOUR_ACCESS_KEY_ID"
+AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
+
+# Models
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+
+# Retrieval / generation
+K_PER_CLIENT = 8        # how many chunks per client to use in analysis
+MAX_TOKENS   = 1800
+TEMPERATURE  = 0.15
+
+# ===================== JSON SCHEMA EXAMPLE =====================
+
+JSON_SCHEMA_EXAMPLE: Dict[str, Any] = {
+    "client_id": "string - finance client id, e.g. 'ABB - SWITZZERLNA/us'",
+    "documents_analyzed": [
+        {
+            "policy_id": "string - filename or policy identifier",
+            "pages_used": [12, 13, 14],
+            "important_notes": [
+                "short bullet about a critical point or nuance in this document"
+            ],
+            "key_clauses": [
+                {
+                    "name": "COLA",
+                    "summary": "short, plain-language summary of the COLA clause",
+                    "risk_level": "low | medium | high | unknown",
+                    "source_quote": "optional short quote or paraphrase",
+                }
+            ],
+        }
+    ],
+    "overall_summary": "2–5 sentence summary of main points across documents.",
+    "overall_risks": [
+        "short bullet describing a material risk",
+        "another risk ..."
+    ],
+    "open_questions_for_client": [
+        "clarifying question we would need the client to answer",
+        "another question ..."
+    ],
+}
+
+# ===================== CUSTOM ANALYSIS INSTRUCTIONS =====================
+
+CUSTOM_ANALYSIS_INSTRUCTIONS = """
+You are a contract analysis engine for FINANCE client documents.
+
+Your tasks:
+1) Read the Provided Context carefully. It contains excerpts from finance contracts and policies 
+   for a single client (e.g. ABB - SWITZZERLNA / US).
+2) Identify key clauses and points, with special attention to financial terms, COLA, and any 
+   obligations, exclusions, and risks.
+3) Summarize the contract content in a structured way, focusing on what an implementation / 
+   operations / compliance team needs to know.
+4) Populate the JSON fields with concise, factual content only. If there is not enough information 
+   for a field, use an empty list [] or null as appropriate.
+
+Output rules (VERY IMPORTANT, you MUST follow all of these):
+1) You MUST respond with ONE and ONLY ONE JSON object.
+2) The JSON MUST be syntactically valid (no trailing commas, no comments, no text outside the braces).
+3) Do NOT wrap the JSON in markdown code fences (no ```).
+4) The JSON MUST follow the schema shown below. Field names must match exactly. 
+   If you don’t know a value, use null or an empty list.
+"""
+
+# ===================== Prompt =====================
+
+PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        (
+            "{custom_instructions}\n\n"
+            "Here is the JSON schema you MUST follow (example, not real data):\n"
+            "{json_schema}\n"
+        ),
+    ),
+    (
+        "human",
+        (
+            "Client: {client_id}\n\n"
+            "Provided Context:\n{context}\n\n"
+            "Now produce a SINGLE valid JSON object following the schema above. "
+            "Remember: no explanation, no markdown, just the JSON."
+        ),
+    ),
+])
+
+# ===================== Helpers =====================
+
+def list_finance_clients(root: Path) -> List[str]:
+    """
+    Recursively scan FINANCE_INDEX_ROOT for all client index directories.
+
+    A directory is considered a client index if it contains:
+      - index.faiss
+      - index.pkl
+
+    Returns client_ids as relative paths under finance/, e.g.:
+      "clienta/us"
+      "ABB - SWITZZERLNA/us"
+    """
+    if not root.exists():
+        return []
+
+    clients: List[str] = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        filenames_set = set(filenames)
+        if "index.faiss" in filenames_set and "index.pkl" in filenames_set:
+            p = Path(dirpath)
+            rel = p.relative_to(root)           # relative to finance root
+            client_id = rel.as_posix()          # e.g. "ABB - SWITZZERLNA/us"
+            clients.append(client_id)
+
+    clients = sorted(set(clients))
+    return clients
+
+
+def load_vs_for_client(client_id: str, session: Session) -> FAISS:
+    """
+    Load FAISS for a given finance client_id (relative under FINANCE_INDEX_ROOT).
+
+    Example:
+      client_id = "ABB - SWITZZERLNA/us"
+      path      = FINANCE_INDEX_ROOT / "ABB - SWITZZERLNA/us"
+    """
+    emb = BedrockEmbeddings(
+        model_id=EMBED_MODEL,
+        client=session.client("bedrock-runtime"),
+    )
+    index_dir = FINANCE_INDEX_ROOT / client_id
+    return FAISS.load_local(str(index_dir), emb, allow_dangerous_deserialization=True)
+
+
+def format_docs(docs) -> str:
+    """
+    Format docs into a context string for the LLM.
+    """
+    parts = []
+    for d in docs:
+        m = d.metadata or {}
+        part = (
+            f"(client_id: {m.get('client_id')}, "
+            f"category: {m.get('category')}, "
+            f"policy: {m.get('policy_id')}, "
+            f"page: {m.get('page', m.get('page_start', '?'))})\n"
+            f"{d.page_content}"
+        )
+        parts.append(part)
+    return "\n\n".join(parts)
+
+
+def collect_sources(docs) -> List[Dict[str, Any]]:
+    """
+    Collect source info (policy_id, pages used, source_file) from retrieved docs.
+    """
+    seen = set()
+    out: List[Dict[str, Any]] = []
+
+    for d in docs:
+        m = d.metadata or {}
+        policy_id = m.get("policy_id") or Path(m.get("source_file", "")).name or "UNKNOWN_POLICY"
+        source_file = m.get("source_file", "")
+
+        page = m.get("page")
+        page_start = m.get("page_start")
+        page_end = m.get("page_end")
+
+        if page is not None:
+            page_str = str(page)
+        elif page_start is not None and page_end is not None:
+            page_str = f"{page_start}-{page_end}" if page_start != page_end else str(page_start)
+        elif page_start is not None:
+            page_str = str(page_start)
+        else:
+            page_str = "?"
+
+        key = (policy_id, page_str, source_file)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        out.append({
+            "policy_id": policy_id,
+            "pages": page_str,
+            "source_file": source_file,
+        })
+
+    return out
+
+
+def analyze_client_contracts(session: Session, client_id: str) -> Tuple[Optional[dict], List[Dict[str, Any]], str]:
+    """
+    For a given finance client_id (e.g. 'ABB - SWITZZERLNA/us'):
+
+    - Retrieve context from FAISS
+    - Call LLM with JSON-only prompt
+    - Return:
+        parsed_json (or None if parse failed),
+        sources_list,
+        raw_text (the raw model output for debugging)
+    """
+    vs = load_vs_for_client(client_id, session)
+    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": K_PER_CLIENT})
+
+    # Generic analysis query; you can customize this string
+    query = (
+        f"Comprehensive contract analysis for finance client '{client_id}', with focus on "
+        f"financial terms, COLA, obligations, exclusions, and risks."
+    )
+    docs = retriever.get_relevant_documents(query)
+
+    # Hard filter: keep only finance docs that match this client_id
+    cid_norm = client_id.strip().lower()
+    filtered_docs = []
+    for d in docs:
+        m = d.metadata or {}
+        meta_cid = str(m.get("client_id", "")).strip().lower()
+        meta_cat = str(m.get("category", "")).strip().lower()
+        if meta_cid == cid_norm and meta_cat == "finance":
+            filtered_docs.append(d)
+
+    if not filtered_docs:
+        print(f"[WARN] No matching context for client '{client_id}'.")
+        return None, [], ""
+
+    context = format_docs(filtered_docs)
+    sources = collect_sources(filtered_docs)
+
+    llm = ChatBedrock(
+        client=session.client("bedrock-runtime"),
+        model_id=LLM_MODEL,
+        model_kwargs={
+            "temperature": float(TEMPERATURE),
+            "max_tokens": int(MAX_TOKENS),
+        },
+    )
+
+    chain = PROMPT | llm | StrOutputParser()
+
+    json_schema_str = json.dumps(JSON_SCHEMA_EXAMPLE, indent=2, ensure_ascii=False)
+
+    raw_output = chain.invoke({
+        "custom_instructions": CUSTOM_ANALYSIS_INSTRUCTIONS,
+        "json_schema": json_schema_str,
+        "client_id": client_id,
+        "context": context,
+    })
+
+    # Try to parse the JSON. If it fails, we still save raw_output.
+    parsed: Optional[dict] = None
+    try:
+        parsed = json.loads(raw_output)
+    except Exception:
+        print(f"[WARN] JSON parsing failed for client '{client_id}'. Saving raw output as-is.")
+
+    return parsed, sources, raw_output
+
+# ===================== Main =====================
+
+def main():
+    # Discover finance clients
+    all_clients = list_finance_clients(FINANCE_INDEX_ROOT)
+    if not all_clients:
+        raise SystemExit(f"No finance clients found under {FINANCE_INDEX_ROOT}")
+
+    # Optional: filter to single client by name substring
+    if TARGET_CLIENT_NAME:
+        needle = TARGET_CLIENT_NAME.strip().lower()
+        clients = [c for c in all_clients if needle in c.lower()]
+        if not clients:
+            print("Finance clients found:")
+            for c in all_clients:
+                print(f"  - {c}")
+            raise SystemExit(
+                f"\nNo client id matched TARGET_CLIENT_NAME='{TARGET_CLIENT_NAME}'. "
+                f"Update TARGET_CLIENT_NAME or check your finance folder names."
+            )
+    else:
+        clients = all_clients
+
+    print("Running JSON analysis for finance client(s):")
+    for c in clients:
+        print(f"  - {c}")
+
+    # AWS session
+    session = Session(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
+    )
+
+    OUTPUT_JSONL.parent.mkdir(parents=True, exist_ok=True)
+
+    with OUTPUT_JSONL.open("w", encoding="utf-8") as f:
+        for client_id in clients:
+            print(f"\n=== Client: {client_id} ===")
+            parsed_json, sources, raw_output = analyze_client_contracts(session, client_id)
+
+            record: Dict[str, Any] = {
+                "client_id": client_id,
+                "sources": sources,
+            }
+
+            if parsed_json is not None:
+                record["raw_model_json"] = parsed_json
+            else:
+                # If parsing failed, keep raw text so you can inspect/fix prompt
+                record["raw_model_json"] = raw_output
+
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            print("  -> analysis written to JSONL.")
+
+    print(f"\nAll done. Results saved to {OUTPUT_JSONL}")
+
+if __name__ == "__main__":
+    main()
