@@ -1,0 +1,44 @@
+def main():
+    # Figure out root directory:
+    # - If user passes a non-flag argument (not starting with "-"), use that
+    # - Otherwise default to "ce"
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if args:
+        root = Path(args[0]).resolve()
+    else:
+        # 👇 change this default to whatever you want
+        root = Path("ce").resolve()
+
+    if not root.exists():
+        print(f"[ERROR] Root path does not exist: {root}")
+        sys.exit(1)
+
+    print(f"Scanning PDFs under: {root}")
+
+    all_pdfs = list(root.rglob("*.pdf"))
+    if not all_pdfs:
+        print("No PDF files found.")
+        return
+
+    simple_count = 0
+    scanned_count = 0
+
+    for pdf_path in sorted(all_pdfs):
+        scanned, total_chars = is_scanned_pdf(pdf_path)
+        if scanned:
+            status = "SCANNED"
+            scanned_count += 1
+        else:
+            status = "SIMPLE_TEXT"
+            simple_count += 1
+
+        print(f"[{status:12}] {pdf_path}  (sampled_chars={total_chars})")
+
+    total = simple_count + scanned_count
+
+    print("\n===== SUMMARY =====")
+    print(f"Root:                    {root}")
+    print(f"Total PDFs found:        {total}")
+    print(f"  Simple text PDFs:      {simple_count}")
+    print(f"  Scanned/needs OCR:     {scanned_count}")
+    print("====================")
