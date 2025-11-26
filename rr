@@ -1,37 +1,26 @@
 #!/usr/bin/env python3
 """
-rag_export_clauses.py  (FINANCE-only, COLA-focused)
+rag_finance_query.py
 
-Export RAG answers per FINANCE client & clause into an Excel file (.xlsx)
-using FAISS + ChatBedrock.
+Ask free-form questions against a single FINANCE client FAISS index and get:
 
-- Uses FINANCE indexes only: FAISS_INDEX_DIR / "finance"
-- Clauses are COLA-related and hardcoded below in CLAUSES.
-- Scans FINANCE_INDEX_ROOT recursively for all client indexes.
-- Each index directory that contains index.faiss + index.pkl is treated as a client.
-  Example client_ids (relative paths under finance/):
-    - "clienta/us"
-    - "clienta/denmark"
-    - "clientb/corporatefamily"
+- Answer (LLM, using RAG over finance/<client_id>)
+- Sources (policy_id + pages + source_file for all chunks used)
 
-- Writes Excel:
-    Client | Clause | Content | Sources
+Usage examples:
+  python rag_finance_query.py --client "clientA/us" --question "Is there a COLA clause?"
+  python rag_finance_query.py --client "ABB - SWITZZERLNA/us"
 
-Where:
-  - Content  = LLM answer based on retrieved context
-  - Sources  = newline-separated list of "policy ; pages ; source_file"
-
-Deps:
-  pip install -U pandas openpyxl "langchain-aws>=0.2.5" "langchain-community" "boto3>=1.34"
+If --question is omitted, the script will prompt you in the terminal.
 """
 
 from __future__ import annotations
 
 import os
+import argparse
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
-import pandas as pd
 from boto3 import Session
 from langchain_aws import BedrockEmbeddings, ChatBedrock
 from langchain_community.vectorstores import FAISS
@@ -39,14 +28,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 # ===================== EDIT THESE =====================
-FAISS_INDEX_DIR = Path("/ABS/PATH/TO/faiss_indices").resolve()    # root used by indexer
-FINANCE_INDEX_ROOT = FAISS_INDEX_DIR / "finance"                  # finance-only indexes
-
-OUTPUT_XLSX     = Path("./finance_cola_clauses.xlsx").resolve()   # output file
-
-# Optional: run only for a single finance client id (relative under finance/)
-# Example: "clientA/us" or "ABB - SWITZZERLNA/us"
-TARGET_CLIENT_ID = ""   # set to "" to run for all finance clients
+FAISS_INDEX_DIR    = Path("/ABS/PATH/TO/faiss_indices").resolve()   # root used by indexer
+FINANCE_INDEX_ROOT = FAISS_INDEX_DIR / "finance"                    # finance-only indexes
 
 # AWS (direct keys for dev; prefer IAM roles in prod)
 AWS_REGION = "us-east-1"
@@ -58,49 +41,22 @@ EMBED_MODEL = "amazon.titan-embed-text-v2:0"
 LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
 
 # Retrieval / generation
-K_PER_CLIENT = 4
-MAX_TOKENS   = 1200
+K_PER_CLIENT = 6
+MAX_TOKENS   = 1400
 TEMPERATURE  = 0.2
 
-# ===================== COLA CLAUSES =====================
-# Hardcoded COLA-related clauses (your new predefined set)
-CLAUSES = [
-    "Is there a COLA clause?",
-    "How does the COLA rule apply?",
-    "What is the COLA source data to be used?",
-    # You can add more COLA-related questions here, e.g.:
-    # "How frequently is COLA applied?",
-    # "Are there caps or floors on COLA adjustments?",
-]
-
-# Clause-wise prompt tuning (COLA-focused guidance)
-CLAUSE_PROMPTS: Dict[str, str] = {
-    "Is there a COLA clause?": (
-        "Identify whether a Cost-of-Living Adjustment (COLA) clause exists in the client's documentation. "
-        "If it does, quote or summarize the key language that establishes COLA, including references to index, "
-        "coverage (e.g., which benefits or premiums), and any conditions or triggers."
-    ),
-    "How does the COLA rule apply?": (
-        "Explain the mechanics of the COLA rule for this client: when and how COLA adjustments are calculated, "
-        "the formula or index used, timing/frequency (e.g., annual), any caps or floors, and any eligibility "
-        "or vesting conditions. Clarify which populations or products it applies to and note any exceptions."
-    ),
-    "What is the COLA source data to be used?": (
-        "Describe the specific source data required for COLA: which index or benchmark (e.g., CPI variant), "
-        "the jurisdiction or geography, the data publisher, reference period (e.g., month/year lag), and how "
-        "the data is pulled and validated. Include any fallback rules if the primary data is unavailable."
-    ),
-}
-
-# ===================== Prompt =====================
+# ===================== Prompt (generic, not COLA-only) =====================
 PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You are a precise, client-scoped contract assistant. Use ONLY the Provided Context. "
-     "Respond specifically for the client's policies. Be complete and specific to the COLA-related clause. "
-     "If the context is insufficient, say you don't know and list what is missing. No citations.\n\n"
-     "Clause-specific guidance:\n{clause_instructions}"),
+     "You are a precise, client-scoped contract assistant for FINANCE documents. "
+     "You must use ONLY the Provided Context, which comes from one client's policies/contracts. "
+     "Answer the user's question as completely and specifically as possible based on the context. "
+     "If the context is insufficient to answer something, say you don't know and what is missing. "
+     "Do not hallucinate. Do not add citations or bracket labels."),
     ("human",
-     "Client: {client_id}\nClause: {clause}\n\nProvided Context:\n{context}\n\n"
+     "Client: {client_id}\n"
+     "Question: {question}\n\n"
+     "Provided Context:\n{context}\n\n"
      "Write the best possible answer now.")
 ])
 
@@ -114,25 +70,22 @@ def list_finance_clients(root: Path) -> List[str]:
       - index.pkl
 
     Returns client_ids as relative paths under finance/, e.g.:
-      "clienta/us"
-      "clientb/denmark"
-      "clientc/corporatefamily"
+      "clientA/us"
+      "ABB - SWITZZERLNA/us"
     """
     if not root.exists():
         return []
 
     clients: List[str] = []
-
     for dirpath, dirnames, filenames in os.walk(root):
         filenames_set = set(filenames)
         if "index.faiss" in filenames_set and "index.pkl" in filenames_set:
             p = Path(dirpath)
-            rel = p.relative_to(root)           # relative to finance root
-            client_id = rel.as_posix()          # e.g. "clienta/us"
+            rel = p.relative_to(root)
+            client_id = rel.as_posix()
             clients.append(client_id)
 
-    clients = sorted(set(clients))
-    return clients
+    return sorted(set(clients))
 
 
 def load_vs_for_client(client_id: str, session: Session) -> FAISS:
@@ -140,8 +93,8 @@ def load_vs_for_client(client_id: str, session: Session) -> FAISS:
     Load FAISS for a given finance client_id (relative under FINANCE_INDEX_ROOT).
 
     Example:
-      client_id = "clienta/us"
-      path      = FINANCE_INDEX_ROOT / "clienta/us"
+      client_id = "clientA/us"
+      -> uses FINANCE_INDEX_ROOT / "clientA/us"
     """
     emb = BedrockEmbeddings(
         model_id=EMBED_MODEL,
@@ -152,36 +105,45 @@ def load_vs_for_client(client_id: str, session: Session) -> FAISS:
 
 
 def format_docs(docs) -> str:
-    return "\n\n".join(
-        f"(client_id: {d.metadata.get('client_id')}, "
-        f"category: {d.metadata.get('category')}, "
-        f"policy: {d.metadata.get('policy_id')}, "
-        f"page: {d.metadata.get('page', d.metadata.get('page_start', '?'))})\n"
-        f"{d.page_content}"
-        for d in docs
-    )
-
-
-def build_sources_summary(docs) -> str:
     """
-    Build a human-readable summary of all sources used for this clause.
-
-    One line per source:
-      policy: <policy_id> ; pages: X or X-Y ; source: <source_file path>
+    Turn retrieved LangChain Documents into a text block for the LLM.
     """
+    parts = []
+    for d in docs:
+        m = d.metadata or {}
+        part = (
+            f"(client_id: {m.get('client_id')}, "
+            f"category: {m.get('category')}, "
+            f"policy: {m.get('policy_id')}, "
+            f"page: {m.get('page', m.get('page_start', '?'))})\n"
+            f"{d.page_content}"
+        )
+        parts.append(part)
+    return "\n\n".join(parts)
+
+
+def build_sources_summary(docs) -> List[Dict[str, Any]]:
+    """
+    Turn retrieved docs into a structured list of sources:
+      [
+        {"policy_id": "...", "pages": "10-12", "source_file": "..."},
+        ...
+      ]
+    """
+    from pathlib import Path as _P
+
     seen = set()
-    lines = []
+    out: List[Dict[str, Any]] = []
 
     for d in docs:
         m = d.metadata or {}
-        policy_id = m.get("policy_id") or Path(m.get("source_file", "")).name or "UNKNOWN_POLICY"
+        policy_id = m.get("policy_id") or _P(m.get("source_file", "")).name or "UNKNOWN_POLICY"
         source_file = m.get("source_file", "")
 
         page = m.get("page")
         page_start = m.get("page_start")
         page_end = m.get("page_end")
 
-        # derive page string
         if page is not None:
             page_str = str(page)
         elif page_start is not None and page_end is not None:
@@ -196,59 +158,46 @@ def build_sources_summary(docs) -> str:
             continue
         seen.add(key)
 
-        line = f"policy: {policy_id} ; pages: {page_str} ; source: {source_file}"
-        lines.append(line)
+        out.append({
+            "policy_id": policy_id,
+            "pages": page_str,
+            "source_file": source_file,
+        })
 
-    return "\n".join(lines)
-
-
-def clause_instructions_for(clause: str) -> str:
-    # exact or case-insensitive match; otherwise generic COLA guidance
-    if clause in CLAUSE_PROMPTS:
-        return CLAUSE_PROMPTS[clause]
-    for k, v in CLAUSE_PROMPTS.items():
-        if k.lower() == clause.lower():
-            return v
-    return (
-        "Extract specific policy details, steps, definitions, formulas, inputs, limits, and exceptions "
-        "for this COLA-related question. Use concise, actionable language grounded in the provided context."
-    )
+    return out
 
 
-def answer_for_clause(session: Session, client_id: str, clause: str) -> Tuple[str, str]:
+def ask_one_question(session: Session, client_id: str, question: str) -> Tuple[str, List[Dict[str, Any]]]:
     """
-    For a given finance client_id (e.g. 'clienta/us') and a COLA clause question,
-    retrieve relevant chunks and generate:
-      - content (LLM answer)
-      - sources_summary (policy + pages + source_file)
+    RAG for a SINGLE question and SINGLE finance client_id.
+
+    Returns:
+      answer_text, sources_list
     """
-    # 1) Retrieve from finance FAISS index
     vs = load_vs_for_client(client_id, session)
     retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": K_PER_CLIENT})
 
-    query = (
-        f"For client '{client_id}', extract all content related to the COLA topic: '{clause}'. "
-        f"Include any details on COLA existence, rules, formulas, indexes, source data, and exceptions."
-    )
-    docs = retriever.get_relevant_documents(query)
+    docs = retriever.get_relevant_documents(question)
+    if not docs:
+        return f"(No matching content found for client '{client_id}' and this question.)", []
 
-    # Hard filter: keep only finance docs that match this client_id in metadata
+    # Hard filter by metadata (but fall back to all if filter empties it)
     cid_norm = client_id.strip().lower()
     filtered_docs = []
     for d in docs:
-        meta_cid = str(d.metadata.get("client_id", "")).strip().lower()
-        meta_cat = str(d.metadata.get("category", "")).strip().lower()
+        m = d.metadata or {}
+        meta_cid = str(m.get("client_id", "")).strip().lower()
+        meta_cat = str(m.get("category", "")).strip().lower()
         if meta_cid == cid_norm and meta_cat == "finance":
             filtered_docs.append(d)
 
     if not filtered_docs:
-        msg = f"(No matching context found in finance index for client '{client_id}' and clause '{clause}'.)"
-        return msg, ""
+        # fallback to everything FAISS returned
+        filtered_docs = docs
 
     context = format_docs(filtered_docs)
-    sources_summary = build_sources_summary(filtered_docs)
+    sources = build_sources_summary(filtered_docs)
 
-    # 2) LLM: ChatBedrock (classic)
     llm = ChatBedrock(
         client=session.client("bedrock-runtime"),
         model_id=LLM_MODEL,
@@ -262,39 +211,47 @@ def answer_for_clause(session: Session, client_id: str, clause: str) -> Tuple[st
     try:
         answer = chain.invoke({
             "client_id": client_id,
-            "clause": clause,
+            "question": question,
             "context": context,
-            "clause_instructions": clause_instructions_for(clause),
         })
-        return answer, sources_summary
     except Exception as e:
-        err = f"(LLM error for {client_id} / '{clause}': {type(e).__name__}: {e})"
-        return err, sources_summary
+        answer = f"(LLM error for client '{client_id}': {type(e).__name__}: {e})"
 
-# ===================== Main =====================
+    return answer, sources
+
+# ===================== CLI / main =====================
 def main():
-    # Discover ONLY finance clients automatically
+    parser = argparse.ArgumentParser(description="Ask free-form questions over a finance client FAISS index.")
+    parser.add_argument(
+        "--client",
+        required=True,
+        help="Finance client_id (relative under 'finance/'), e.g. 'clientA/us' or 'ABB - SWITZZERLNA/us'",
+    )
+    parser.add_argument(
+        "--question",
+        help="Question to ask. If omitted, you will be prompted interactively.",
+    )
+    args = parser.parse_args()
+
+    client_id = args.client.strip()
+    question = (args.question or "").strip()
+
+    # Validate client id
     all_clients = list_finance_clients(FINANCE_INDEX_ROOT)
-    if not all_clients:
-        raise SystemExit(f"No finance clients found under {FINANCE_INDEX_ROOT}")
+    if client_id not in all_clients:
+        print("Known finance client_ids:")
+        for c in all_clients:
+            print("  -", c)
+        raise SystemExit(
+            f"\nClient '{client_id}' not found. Make sure there is a folder "
+            f"{(FINANCE_INDEX_ROOT / client_id)} with index.faiss and index.pkl."
+        )
 
-    print(f"Found {len(all_clients)} finance client index(es):")
-    for c in all_clients:
-        print(f"  - {c}")
-
-    # Optional: restrict to a single client id
-    if TARGET_CLIENT_ID:
-        clients = [c for c in all_clients if c == TARGET_CLIENT_ID]
-        if not clients:
-            raise SystemExit(
-                f"\nTARGET_CLIENT_ID='{TARGET_CLIENT_ID}' not found.\n"
-                f"Make sure there is a folder: {FINANCE_INDEX_ROOT / TARGET_CLIENT_ID} "
-                f"with index.faiss and index.pkl."
-            )
-        print(f"\nRunning ONLY for client: {TARGET_CLIENT_ID}")
-    else:
-        clients = all_clients
-        print("\nRunning for ALL finance clients.")
+    if not question:
+        # ask user in the terminal
+        question = input(f"Enter your question for client '{client_id}': ").strip()
+        if not question:
+            raise SystemExit("No question provided.")
 
     # AWS session
     session = Session(
@@ -303,24 +260,21 @@ def main():
         region_name=AWS_REGION,
     )
 
-    rows: List[Dict[str, Any]] = []
-    for client_id in clients:
-        print(f"\n=== Client: {client_id} ===")
-        for clause in CLAUSES:
-            print(f"  - Clause: {clause} ...", end="", flush=True)
-            content, sources = answer_for_clause(session, client_id, clause)
-            rows.append({
-                "Client": client_id,
-                "Clause": clause,
-                "Content": content,
-                "Sources": sources,   # 👈 NEW COLUMN
-            })
-            print(" done.")
+    print(f"\n=== Asking client: {client_id} ===")
+    print(f"Q: {question}\n")
 
-    df = pd.DataFrame(rows, columns=["Client", "Clause", "Content", "Sources"])
-    OUTPUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
-    df.to_excel(OUTPUT_XLSX, index=False)
-    print(f"\nSaved: {OUTPUT_XLSX}")
+    answer, sources = ask_one_question(session, client_id, question)
+
+    print("=== ANSWER ===")
+    print(answer)
+    print("\n=== SOURCES ===")
+    if not sources:
+        print("(no sources)")
+    else:
+        for s in sources:
+            print(
+                f"- policy: {s['policy_id']} ; pages: {s['pages']} ; source: {s['source_file']}"
+            )
 
 if __name__ == "__main__":
     main()
