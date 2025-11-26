@@ -1,66 +1,79 @@
 #!/usr/bin/env python3
 """
-rag_finance_query.py
+rag_finance_queries_export.py  (FINANCE-only, query-based, NO LLM)
 
-Ask free-form questions against a single FINANCE client FAISS index and get:
+Export *raw* RAG chunks per FINANCE client & query into an Excel file (.xlsx)
+using FAISS (with Bedrock embeddings for query vectorization).
 
-- Answer (LLM, using RAG over finance/<client_id>)
-- Sources (policy_id + pages + source_file for all chunks used)
+- Uses FINANCE indexes only: FAISS_INDEX_DIR / "finance"
+- QUERIES is a list of free-form questions you define.
+- Scans FINANCE_INDEX_ROOT recursively for all client indexes,
+  OR you can restrict to a single TARGET_CLIENT_ID.
 
-Usage examples:
-  python rag_finance_query.py --client "clientA/us" --question "Is there a COLA clause?"
-  python rag_finance_query.py --client "ABB - SWITZZERLNA/us"
+Each FAISS index directory that contains index.faiss + index.pkl is treated as a client.
+Example client_ids (relative paths under finance/):
+  - "clientA/us"
+  - "ABB - SWITZZERLNA/us"
+  - "clientB/corporatefamily"
 
-If --question is omitted, the script will prompt you in the terminal.
+Writes Excel with columns:
+    Client | Query | ExtractedContent | Sources
+
+Where:
+  ExtractedContent = concatenation of relevant page chunks for that query
+  Sources         = newline-separated list of
+                    "policy: <policy_id> ; pages: <page or range> ; source: <source_file path>"
+
+Deps:
+  pip install -U pandas openpyxl "langchain-aws>=0.2.5" "langchain-community" "boto3>=1.34"
 """
 
 from __future__ import annotations
 
 import os
-import argparse
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
+import pandas as pd
 from boto3 import Session
-from langchain_aws import BedrockEmbeddings, ChatBedrock
+from langchain_aws import BedrockEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 
 # ===================== EDIT THESE =====================
+
 FAISS_INDEX_DIR    = Path("/ABS/PATH/TO/faiss_indices").resolve()   # root used by indexer
 FINANCE_INDEX_ROOT = FAISS_INDEX_DIR / "finance"                    # finance-only indexes
 
-# AWS (direct keys for dev; prefer IAM roles in prod)
+OUTPUT_XLSX        = Path("./finance_queries_export.xlsx").resolve()
+
+# Optional: run only for a single finance client id (relative under finance/)
+# Example: "clientA/us" or "ABB - SWITZZERLNA/us"
+TARGET_CLIENT_ID = ""   # set to "" to run for ALL finance clients
+
+# 👉 Put ALL your queries here:
+QUERIES: List[str] = [
+    # EXAMPLES — replace with your real questions:
+    "Is there a COLA clause?",
+    "How does the COLA rule apply?",
+    "What is the COLA source data to be used?",
+    # add any other free-form queries you want:
+    # "How are retirees treated under this plan?",
+    # "What are the eligibility criteria for this benefit?",
+]
+
+# AWS (for embeddings; FAISS query embedding uses Bedrock)
 AWS_REGION = "us-east-1"
 AWS_ACCESS_KEY_ID     = "YOUR_ACCESS_KEY_ID"
 AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
 
-# Models
+# Embedding model
 EMBED_MODEL = "amazon.titan-embed-text-v2:0"
-LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
 
-# Retrieval / generation
-K_PER_CLIENT = 6
-MAX_TOKENS   = 1400
-TEMPERATURE  = 0.2
-
-# ===================== Prompt (generic, not COLA-only) =====================
-PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a precise, client-scoped contract assistant for FINANCE documents. "
-     "You must use ONLY the Provided Context, which comes from one client's policies/contracts. "
-     "Answer the user's question as completely and specifically as possible based on the context. "
-     "If the context is insufficient to answer something, say you don't know and what is missing. "
-     "Do not hallucinate. Do not add citations or bracket labels."),
-    ("human",
-     "Client: {client_id}\n"
-     "Question: {question}\n\n"
-     "Provided Context:\n{context}\n\n"
-     "Write the best possible answer now.")
-])
+# Retrieval
+K_PER_CLIENT = 8   # how many chunks to pull per query
 
 # ===================== Helpers =====================
+
 def list_finance_clients(root: Path) -> List[str]:
     """
     Recursively scan FINANCE_INDEX_ROOT for all client index directories.
@@ -77,12 +90,13 @@ def list_finance_clients(root: Path) -> List[str]:
         return []
 
     clients: List[str] = []
+
     for dirpath, dirnames, filenames in os.walk(root):
         filenames_set = set(filenames)
         if "index.faiss" in filenames_set and "index.pkl" in filenames_set:
             p = Path(dirpath)
-            rel = p.relative_to(root)
-            client_id = rel.as_posix()
+            rel = p.relative_to(root)     # relative to finance root
+            client_id = rel.as_posix()    # e.g. "clientA/us"
             clients.append(client_id)
 
     return sorted(set(clients))
@@ -94,7 +108,7 @@ def load_vs_for_client(client_id: str, session: Session) -> FAISS:
 
     Example:
       client_id = "clientA/us"
-      -> uses FINANCE_INDEX_ROOT / "clientA/us"
+      path      = FINANCE_INDEX_ROOT / "clientA/us"
     """
     emb = BedrockEmbeddings(
         model_id=EMBED_MODEL,
@@ -104,46 +118,26 @@ def load_vs_for_client(client_id: str, session: Session) -> FAISS:
     return FAISS.load_local(str(index_dir), emb, allow_dangerous_deserialization=True)
 
 
-def format_docs(docs) -> str:
+def build_sources_summary(docs) -> str:
     """
-    Turn retrieved LangChain Documents into a text block for the LLM.
-    """
-    parts = []
-    for d in docs:
-        m = d.metadata or {}
-        part = (
-            f"(client_id: {m.get('client_id')}, "
-            f"category: {m.get('category')}, "
-            f"policy: {m.get('policy_id')}, "
-            f"page: {m.get('page', m.get('page_start', '?'))})\n"
-            f"{d.page_content}"
-        )
-        parts.append(part)
-    return "\n\n".join(parts)
+    Build a human-readable summary of all sources used for this query:
 
-
-def build_sources_summary(docs) -> List[Dict[str, Any]]:
+    One line per source:
+      policy: <policy_id> ; pages: X or X-Y ; source: <source_file path>
     """
-    Turn retrieved docs into a structured list of sources:
-      [
-        {"policy_id": "...", "pages": "10-12", "source_file": "..."},
-        ...
-      ]
-    """
-    from pathlib import Path as _P
-
     seen = set()
-    out: List[Dict[str, Any]] = []
+    lines: List[str] = []
 
     for d in docs:
         m = d.metadata or {}
-        policy_id = m.get("policy_id") or _P(m.get("source_file", "")).name or "UNKNOWN_POLICY"
+        policy_id = m.get("policy_id") or Path(m.get("source_file", "")).name or "UNKNOWN_POLICY"
         source_file = m.get("source_file", "")
 
         page = m.get("page")
         page_start = m.get("page_start")
         page_end = m.get("page_end")
 
+        # derive page string
         if page is not None:
             page_str = str(page)
         elif page_start is not None and page_end is not None:
@@ -158,123 +152,149 @@ def build_sources_summary(docs) -> List[Dict[str, Any]]:
             continue
         seen.add(key)
 
-        out.append({
-            "policy_id": policy_id,
-            "pages": page_str,
-            "source_file": source_file,
-        })
+        line = f"policy: {policy_id} ; pages: {page_str} ; source: {source_file}"
+        lines.append(line)
 
-    return out
+    return "\n".join(lines)
 
 
-def ask_one_question(session: Session, client_id: str, question: str) -> Tuple[str, List[Dict[str, Any]]]:
+def build_extracted_content(docs) -> str:
     """
-    RAG for a SINGLE question and SINGLE finance client_id.
+    Concatenate the raw page_content from all relevant docs into one big
+    string, with simple headers per source for readability.
 
-    Returns:
-      answer_text, sources_list
+    Example:
+      === policy: FILE.pdf | page(s): 10 ===
+      <chunk text>
+
+      === policy: OTHER.pdf | page(s): 3-4 ===
+      <chunk text>
+    """
+    parts: List[str] = []
+
+    for d in docs:
+        m = d.metadata or {}
+        policy_id = m.get("policy_id") or Path(m.get("source_file", "")).name or "UNKNOWN_POLICY"
+        page = m.get("page")
+        page_start = m.get("page_start")
+        page_end = m.get("page_end")
+
+        if page is not None:
+            page_str = str(page)
+        elif page_start is not None and page_end is not None:
+            page_str = f"{page_start}-{page_end}" if page_start != page_end else str(page_start)
+        elif page_start is not None:
+            page_str = str(page_start)
+        else:
+            page_str = "?"
+
+        header = f"=== policy: {policy_id} | page(s): {page_str} ==="
+        body = d.page_content or ""
+        parts.append(f"{header}\n{body}")
+
+    return "\n\n".join(parts)
+
+
+def extract_for_query(session: Session, client_id: str, query: str) -> Tuple[str, str]:
+    """
+    For a given finance client_id (e.g. 'clientA/us') and a free-form query,
+    retrieve relevant chunks and return:
+      - ExtractedContent: concatenated raw texts from those chunks
+      - Sources: newline-separated file+page+source info
     """
     vs = load_vs_for_client(client_id, session)
     retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": K_PER_CLIENT})
 
-    docs = retriever.get_relevant_documents(question)
-    if not docs:
-        return f"(No matching content found for client '{client_id}' and this question.)", []
+    docs = retriever.get_relevant_documents(query)
+    print(f"[DEBUG] Retrieved {len(docs)} docs for client='{client_id}', query='{query}'")
 
-    # Hard filter by metadata (but fall back to all if filter empties it)
+    if not docs:
+        msg = f"(No documents returned from FAISS for client '{client_id}' and query '{query}'.)"
+        print("[WARN]", msg)
+        return msg, ""
+
+    # Hard filter: keep only finance docs that match this client_id in metadata
     cid_norm = client_id.strip().lower()
     filtered_docs = []
     for d in docs:
         m = d.metadata or {}
         meta_cid = str(m.get("client_id", "")).strip().lower()
         meta_cat = str(m.get("category", "")).strip().lower()
+        print(f"[DEBUG] doc meta: client_id='{meta_cid}', category='{meta_cat}', policy='{m.get('policy_id')}'")
         if meta_cid == cid_norm and meta_cat == "finance":
             filtered_docs.append(d)
 
     if not filtered_docs:
-        # fallback to everything FAISS returned
+        # Fallback: metadata mismatch or category not set as expected.
+        # Use ALL retrieved docs so ExtractedContent is NOT empty.
+        print(f"[WARN] No filtered docs matched client_id='{cid_norm}' and category='finance'. "
+              f"Using all {len(docs)} retrieved docs instead.")
         filtered_docs = docs
 
-    context = format_docs(filtered_docs)
-    sources = build_sources_summary(filtered_docs)
+    extracted_content = build_extracted_content(filtered_docs)
+    sources_summary   = build_sources_summary(filtered_docs)
 
-    llm = ChatBedrock(
-        client=session.client("bedrock-runtime"),
-        model_id=LLM_MODEL,
-        model_kwargs={
-            "temperature": float(TEMPERATURE),
-            "max_tokens": int(MAX_TOKENS),
-        },
-    )
-    chain = PROMPT | llm | StrOutputParser()
+    if not extracted_content.strip():
+        print(f"[WARN] ExtractedContent is empty for client='{client_id}', query='{query}' "
+              f"even though {len(filtered_docs)} docs were selected.")
 
-    try:
-        answer = chain.invoke({
-            "client_id": client_id,
-            "question": question,
-            "context": context,
-        })
-    except Exception as e:
-        answer = f"(LLM error for client '{client_id}': {type(e).__name__}: {e})"
+    return extracted_content, sources_summary
 
-    return answer, sources
+# ===================== Main =====================
 
-# ===================== CLI / main =====================
 def main():
-    parser = argparse.ArgumentParser(description="Ask free-form questions over a finance client FAISS index.")
-    parser.add_argument(
-        "--client",
-        required=True,
-        help="Finance client_id (relative under 'finance/'), e.g. 'clientA/us' or 'ABB - SWITZZERLNA/us'",
-    )
-    parser.add_argument(
-        "--question",
-        help="Question to ask. If omitted, you will be prompted interactively.",
-    )
-    args = parser.parse_args()
+    # Basic sanity: must have queries
+    if not QUERIES:
+        raise SystemExit("QUERIES list is empty. Please define at least one query string in QUERIES.")
 
-    client_id = args.client.strip()
-    question = (args.question or "").strip()
-
-    # Validate client id
+    # Discover ONLY finance clients automatically
     all_clients = list_finance_clients(FINANCE_INDEX_ROOT)
-    if client_id not in all_clients:
-        print("Known finance client_ids:")
-        for c in all_clients:
-            print("  -", c)
-        raise SystemExit(
-            f"\nClient '{client_id}' not found. Make sure there is a folder "
-            f"{(FINANCE_INDEX_ROOT / client_id)} with index.faiss and index.pkl."
-        )
+    if not all_clients:
+        raise SystemExit(f"No finance clients found under {FINANCE_INDEX_ROOT}")
 
-    if not question:
-        # ask user in the terminal
-        question = input(f"Enter your question for client '{client_id}': ").strip()
-        if not question:
-            raise SystemExit("No question provided.")
+    print("All finance client index(es) found:")
+    for c in all_clients:
+        print(f"  - {c}")
 
-    # AWS session
+    # Optional: restrict to a single client id
+    if TARGET_CLIENT_ID:
+        clients = [c for c in all_clients if c == TARGET_CLIENT_ID]
+        if not clients:
+            raise SystemExit(
+                f"\nTARGET_CLIENT_ID='{TARGET_CLIENT_ID}' not found.\n"
+                f"Make sure there is a folder: {FINANCE_INDEX_ROOT / TARGET_CLIENT_ID} "
+                f"with index.faiss and index.pkl."
+            )
+        print(f"\nRunning ONLY for client: {TARGET_CLIENT_ID}")
+    else:
+        clients = all_clients
+        print("\nRunning for ALL finance clients.")
+
+    # AWS session (for embeddings, not LLM)
     session = Session(
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
         region_name=AWS_REGION,
     )
 
-    print(f"\n=== Asking client: {client_id} ===")
-    print(f"Q: {question}\n")
+    rows: List[Dict[str, Any]] = []
+    for client_id in clients:
+        print(f"\n=== Client: {client_id} ===")
+        for query in QUERIES:
+            print(f"  - Query: {query} ...", end="", flush=True)
+            extracted_content, sources = extract_for_query(session, client_id, query)
+            rows.append({
+                "Client": client_id,
+                "Query": query,
+                "ExtractedContent": extracted_content,
+                "Sources": sources,
+            })
+            print(" done.")
 
-    answer, sources = ask_one_question(session, client_id, question)
-
-    print("=== ANSWER ===")
-    print(answer)
-    print("\n=== SOURCES ===")
-    if not sources:
-        print("(no sources)")
-    else:
-        for s in sources:
-            print(
-                f"- policy: {s['policy_id']} ; pages: {s['pages']} ; source: {s['source_file']}"
-            )
+    df = pd.DataFrame(rows, columns=["Client", "Query", "ExtractedContent", "Sources"])
+    OUTPUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(OUTPUT_XLSX, index=False)
+    print(f"\nSaved: {OUTPUT_XLSX}")
 
 if __name__ == "__main__":
     main()
