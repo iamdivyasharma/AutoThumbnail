@@ -1,0 +1,57 @@
+from typing import Tuple  # make sure this is imported at the top
+
+def extract_for_clause(session: Session, client_id: str, clause: str) -> Tuple[str, str]:
+    """
+    For a given finance client_id (e.g. 'clienta/us') and a COLA clause question,
+    retrieve relevant chunks and return:
+      - ExtractedContent: concatenated raw texts from those chunks
+      - Sources: newline-separated file+page+source info
+
+    This version is more robust:
+      - If strict metadata filters find nothing, it falls back to ALL retrieved docs.
+    """
+    vs = load_vs_for_client(client_id, session)
+    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": K_PER_CLIENT})
+
+    # Query focused on COLA, but the retriever will still return SOMETHING
+    query = (
+        f"For client '{client_id}', extract all contract/policy content relevant to the COLA topic: '{clause}'. "
+        f"Include any sections that discuss existence of COLA, how COLA applies, or COLA source data."
+    )
+    docs = retriever.get_relevant_documents(query)
+    print(f"[DEBUG] Retrieved {len(docs)} docs for client='{client_id}', clause='{clause}'")
+
+    if not docs:
+        # Truly nothing came back from FAISS – likely index empty or wrong path
+        msg = f"(No documents returned from FAISS for client '{client_id}' and clause '{clause}'.)"
+        print("[WARN]", msg)
+        return msg, ""
+
+    # Hard filter: try to keep only finance docs that match this client_id in metadata
+    cid_norm = client_id.strip().lower()
+    filtered_docs = []
+    for d in docs:
+        m = d.metadata or {}
+        meta_cid = str(m.get("client_id", "")).strip().lower()
+        meta_cat = str(m.get("category", "")).strip().lower()
+        # debug one sample to see what's in metadata
+        print(f"[DEBUG] doc meta: client_id='{meta_cid}', category='{meta_cat}', policy='{m.get('policy_id')}'")
+        if meta_cid == cid_norm and meta_cat == "finance":
+            filtered_docs.append(d)
+
+    if not filtered_docs:
+        # Fallback: metadata mismatch or category not set as expected.
+        # Use ALL retrieved docs so ExtractedContent is NOT empty.
+        print(f"[WARN] No filtered docs matched client_id='{cid_norm}' and category='finance'. "
+              f"Using all {len(docs)} retrieved docs instead.")
+        filtered_docs = docs
+
+    extracted_content = build_extracted_content(filtered_docs)
+    sources_summary   = build_sources_summary(filtered_docs)
+
+    if not extracted_content.strip():
+        # As a last safety net, let you see that we had docs but empty text
+        print(f"[WARN] ExtractedContent is empty for client='{client_id}', clause='{clause}' "
+              f"even though {len(filtered_docs)} docs were selected.")
+
+    return extracted_content, sources_summary
