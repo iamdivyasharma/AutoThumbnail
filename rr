@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-rag_finance_queries_wide_excel.py  (FINANCE-only, query-based, WITH LLM, wide format)
+rag_finance_queries_wide_excel.py
+FINANCE-only, query-based, NO LLM, wide Excel format.
 
 For each FINANCE client FAISS index and each free-form query, export:
 
   Client | <Query1> | <Query2> | ... | <QueryN>
 
-Where each query column cell contains a JSON string:
+Each query column cell contains a JSON string:
 
   {
-    "content_extracted": "<LLM answer>",
+    "content_extracted": "<raw text from matching chunks>",
     "sourcelinks": "<newline-separated sources>"
   }
 
@@ -22,7 +23,6 @@ Example row (1 client, 3 queries):
 
   Client = "ABB - SWITZZERLNA/us"
   "Is there a COLA clause?" = '{"content_extracted": "...", "sourcelinks": "..."}'
-  ...
 
 Deps:
   pip install -U pandas openpyxl "langchain-aws>=0.2.5" "langchain-community" "boto3>=1.34"
@@ -37,10 +37,8 @@ from typing import List, Dict, Any, Tuple
 
 import pandas as pd
 from boto3 import Session
-from langchain_aws import BedrockEmbeddings, ChatBedrock
+from langchain_aws import BedrockEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 
 # ===================== EDIT THESE =====================
 
@@ -53,66 +51,65 @@ OUTPUT_XLSX        = Path("./finance_queries_wide.xlsx").resolve()
 # Example: "clientA/us" or "ABB - SWITZZERLNA/us"
 TARGET_CLIENT_ID = "ABB - SWITZZERLNA/us"   # set "" to run for ALL finance clients
 
-# 👉 Put ALL your queries here (each will become a column in Excel):
+# 👉 ALL your queries here (each becomes a column in Excel):
 QUERIES: List[str] = [
     "Is there a COLA clause?",
     "How does the COLA rule apply?",
     "What is the COLA source data to be used?",
-    # add more:
+    # add more ad-hoc queries:
     # "How are retirees treated under this plan?",
     # "What are the eligibility criteria for this benefit?",
 ]
 
-# AWS (dev-only; prefer IAM roles in prod)
+# AWS (for embeddings; FAISS query embedding uses Bedrock)
 AWS_REGION = "us-east-1"
 AWS_ACCESS_KEY_ID     = "YOUR_ACCESS_KEY_ID"
 AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
 
-# Models
+# Embedding model
 EMBED_MODEL = "amazon.titan-embed-text-v2:0"
-LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
 
-# Retrieval / generation
-K_PER_CLIENT = 4
-MAX_TOKENS   = 1200
-TEMPERATURE  = 0.2
-
-# ===================== Prompt (generic) =====================
-PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a precise, client-scoped contract assistant for FINANCE documents. "
-     "Use ONLY the Provided Context, which comes from one client's policies/contracts. "
-     "Answer the question as completely and specifically as possible based on that context. "
-     "If the context is insufficient to answer something, say you don't know and what is missing. "
-     "Do not hallucinate. Do not add citations or bracket labels."),
-    ("human",
-     "Client: {client_id}\n"
-     "Question: {query}\n\n"
-     "Provided Context:\n{context}\n\n"
-     "Write the best possible answer now.")
-])
+# Retrieval
+K_PER_CLIENT = 8   # how many chunks to pull per query
 
 # ===================== Helpers =====================
 
 def list_finance_clients(root: Path) -> List[str]:
-    """Find all finance client index directories under FINANCE_INDEX_ROOT."""
+    """
+    Recursively scan FINANCE_INDEX_ROOT for all client index directories.
+
+    A directory is considered a client index if it contains:
+      - index.faiss
+      - index.pkl
+
+    Returns client_ids as relative paths under finance/, e.g.:
+      "clientA/us"
+      "ABB - SWITZZERLNA/us"
+    """
     if not root.exists():
         return []
 
     clients: List[str] = []
+
     for dirpath, dirnames, filenames in os.walk(root):
         filenames_set = set(filenames)
         if "index.faiss" in filenames_set and "index.pkl" in filenames_set:
             p = Path(dirpath)
-            rel = p.relative_to(root)         # relative to finance root
-            client_id = rel.as_posix()        # e.g. "clientA/us"
+            rel = p.relative_to(root)     # relative to finance root
+            client_id = rel.as_posix()    # e.g. "clientA/us"
             clients.append(client_id)
 
     return sorted(set(clients))
 
 
 def load_vs_for_client(client_id: str, session: Session) -> FAISS:
-    """Load FAISS index for a finance client_id (relative under FINANCE_INDEX_ROOT)."""
+    """
+    Load FAISS for a given finance client_id (relative under FINANCE_INDEX_ROOT).
+
+    Example:
+      client_id = "clientA/us"
+      path      = FINANCE_INDEX_ROOT / "clientA/us"
+    """
     emb = BedrockEmbeddings(
         model_id=EMBED_MODEL,
         client=session.client("bedrock-runtime"),
@@ -121,25 +118,13 @@ def load_vs_for_client(client_id: str, session: Session) -> FAISS:
     return FAISS.load_local(str(index_dir), emb, allow_dangerous_deserialization=True)
 
 
-def format_docs(docs) -> str:
-    """Turn retrieved Documents into a text block for the LLM (previous working pattern)."""
-    return "\n\n".join(
-        f"(client_id: {d.metadata.get('client_id')}, "
-        f"category: {d.metadata.get('category')}, "
-        f"policy: {d.metadata.get('policy_id')}, "
-        f"page: {d.metadata.get('page', d.metadata.get('page_start', '?'))})\n"
-        f"{d.page_content}"
-        for d in docs
-    )
-
-
 def build_sources_summary(docs) -> str:
     """
     Build a human-readable summary of sources:
       policy: <policy_id> ; pages: X or X-Y ; source: <source_file path>
     """
     seen = set()
-    lines = []
+    lines: List[str] = []
 
     for d in docs:
         m = d.metadata or {}
@@ -150,6 +135,7 @@ def build_sources_summary(docs) -> str:
         page_start = m.get("page_start")
         page_end = m.get("page_end")
 
+        # derive page string
         if page is not None:
             page_str = str(page)
         elif page_start is not None and page_end is not None:
@@ -170,54 +156,85 @@ def build_sources_summary(docs) -> str:
     return "\n".join(lines)
 
 
-def answer_for_query(session: Session, client_id: str, query: str) -> Tuple[str, str]:
+def build_extracted_content(docs) -> str:
+    """
+    Concatenate the raw page_content from docs into one big string,
+    with simple headers per chunk.
+    """
+    parts: List[str] = []
+
+    for d in docs:
+        m = d.metadata or {}
+        policy_id = m.get("policy_id") or Path(m.get("source_file", "")).name or "UNKNOWN_POLICY"
+
+        page = m.get("page")
+        page_start = m.get("page_start")
+        page_end = m.get("page_end")
+
+        if page is not None:
+            page_str = str(page)
+        elif page_start is not None and page_end is not None:
+            page_str = f"{page_start}-{page_end}" if page_start != page_end else str(page_start)
+        elif page_start is not None:
+            page_str = str(page_start)
+        else:
+            page_str = "?"
+
+        header = f"=== policy: {policy_id} | page(s): {page_str} ==="
+        body = d.page_content or ""
+        parts.append(f"{header}\n{body}")
+
+    return "\n\n".join(parts)
+
+
+def extract_for_query(session: Session, client_id: str, query: str) -> Tuple[str, str]:
     """
     For a given finance client_id (e.g. 'clientA/us') and query,
-    retrieve relevant chunks and generate:
-      - content_extracted (LLM answer)
-      - sources_summary (policy + pages + source_file)
+    retrieve relevant chunks and return:
+      - content_extracted (raw concatenated text from chunks)
+      - sourcelinks (newline-separated file+page+source info)
+
+    IMPORTANT:
+    - Tries to filter by metadata (client_id + category == 'finance'),
+      but if that results in zero docs, we FALL BACK to all retrieved docs
+      so content_extracted is not empty just because of metadata mismatch.
     """
     vs = load_vs_for_client(client_id, session)
     retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": K_PER_CLIENT})
 
     docs = retriever.get_relevant_documents(query)
+    print(f"[DEBUG] Retrieved {len(docs)} docs for client='{client_id}', query='{query}'")
 
+    if not docs:
+        msg = f"(No documents returned from FAISS for client '{client_id}' and query '{query}'.)"
+        print("[WARN]", msg)
+        return msg, ""
+
+    # Try metadata-based filter, but don't let it kill everything
     cid_norm = client_id.strip().lower()
     filtered_docs = []
     for d in docs:
         m = d.metadata or {}
         meta_cid = str(m.get("client_id", "")).strip().lower()
         meta_cat = str(m.get("category", "")).strip().lower()
+        print(f"[DEBUG] doc meta: client_id='{meta_cid}', category='{meta_cat}', policy='{m.get('policy_id')}'")
         if meta_cid == cid_norm and meta_cat == "finance":
             filtered_docs.append(d)
 
     if not filtered_docs:
-        msg = f"(No matching context found in finance index for client '{client_id}' and query '{query}'.)"
-        return msg, ""
+        # Fallback: use all docs to ensure we don't lose content
+        print(f"[WARN] No docs passed metadata filter for client='{client_id}'. "
+              f"Using all {len(docs)} retrieved docs.")
+        filtered_docs = docs
 
-    context = format_docs(filtered_docs)
-    sources_summary = build_sources_summary(filtered_docs)
+    content_extracted = build_extracted_content(filtered_docs)
+    sourcelinks       = build_sources_summary(filtered_docs)
 
-    llm = ChatBedrock(
-        client=session.client("bedrock-runtime"),
-        model_id=LLM_MODEL,
-        model_kwargs={
-            "temperature": float(TEMPERATURE),
-            "max_tokens": int(MAX_TOKENS),
-        },
-    )
-    chain = PROMPT | llm | StrOutputParser()
+    if not content_extracted.strip():
+        print(f"[WARN] content_extracted is empty for client='{client_id}', query='{query}' "
+              f"even though {len(filtered_docs)} docs were selected.")
 
-    try:
-        answer = chain.invoke({
-            "client_id": client_id,
-            "query": query,
-            "context": context,
-        })
-        return answer, sources_summary
-    except Exception as e:
-        err = f"(LLM error for {client_id} / '{query}': {type(e).__name__}: {e})"
-        return err, sources_summary
+    return content_extracted, sourcelinks
 
 # ===================== Main =====================
 
@@ -233,6 +250,7 @@ def main():
     for c in all_clients:
         print("  -", c)
 
+    # Restrict to a single client if requested
     if TARGET_CLIENT_ID:
         clients = [c for c in all_clients if c == TARGET_CLIENT_ID]
         if not clients:
@@ -246,6 +264,7 @@ def main():
         clients = all_clients
         print("\nRunning for ALL finance clients.")
 
+    # AWS session (for embeddings, not LLM)
     session = Session(
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
@@ -260,12 +279,11 @@ def main():
 
         for q in QUERIES:
             print(f"  - Query: {q} ...", end="", flush=True)
-            content, sources = answer_for_query(session, client_id, q)
+            content_extracted, sourcelinks = extract_for_query(session, client_id, q)
 
-            # Cell value is JSON: {"content_extracted": "...", "sourcelinks": "..."}
             cell_obj = {
-                "content_extracted": content,
-                "sourcelinks": sources,
+                "content_extracted": content_extracted,
+                "sourcelinks": sourcelinks,
             }
             row[q] = json.dumps(cell_obj, ensure_ascii=False)
             print(" done.")
