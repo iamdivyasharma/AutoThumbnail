@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""
+rag_finance_queries_wide_excel_llm_per_client.py
+
+FINANCE-only, query-based, WITH LLM, wide Excel format.
+
+For EACH FINANCE client FAISS index and EACH free-form query, create a
+SEPARATE Excel file:
+
+  ./finance_query_exports/<sanitized_client_id>.xlsx
+
+Each Excel has:
+
+  Client | <Query1> | <Query2> | ... | <QueryN>
+
+Each query column cell contains a JSON string:
+
+  {
+    "content_extracted": "<LLM answer ONLY>",
+    "source_links": "<newline-separated sources (max 10)>"
+  }
+
+Notes:
+- Uses FINANCE indexes only: FAISS_INDEX_DIR / "finance"
+- QUERIES is a list of questions you define.
+- Scans FINANCE_INDEX_ROOT recursively for all client indexes,
+  OR you can restrict to a single TARGET_CLIENT_ID.
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import re
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
+
+import pandas as pd
+from boto3 import Session
+from langchain_aws import BedrockEmbeddings, ChatBedrock
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# ===================== EDIT THESE =====================
+
+FAISS_INDEX_DIR    = Path("/ABS/PATH/TO/faiss_indices").resolve()   # root used by indexer
+FINANCE_INDEX_ROOT = FAISS_INDEX_DIR / "finance"                    # finance-only indexes
+
+# Directory where per-client Excel files will be written
+OUTPUT_DIR         = Path("./finance_query_exports").resolve()
+
+# Run only for a single finance client id (relative under finance/), or "" for ALL
+# Example: "clientA/us" or "ABB - SWITZZERLNA/us"
+TARGET_CLIENT_ID = ""   # e.g. "ABB - SWITZZERLNA/us"  or "" for all
+
+# 👉 ALL your queries here (each becomes a column in Excel)
+QUERIES: List[str] = [
+    "Is there a COLA clause?",
+    "How does the COLA rule apply?",
+    "What is the COLA source data to be used?",
+    # Add more:
+    # "How are retirees treated under this plan?",
+    # "What are the eligibility criteria for this benefit?",
+]
+
+# AWS (for Bedrock; use IAM role in SageMaker in real setup)
+AWS_REGION = "us-east-1"
+AWS_ACCESS_KEY_ID     = "YOUR_ACCESS_KEY_ID"
+AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
+
+# Models
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+
+# Retrieval / generation params
+K_PER_CLIENT = 4          # how many chunks per query (leave this as-is)
+MAX_TOKENS   = 1200
+TEMPERATURE  = 0.2
+MAX_SOURCE_LINES = 10     # ✅ top-N sources only
+
+# ===================== Prompt (generic) =====================
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a precise, client-scoped contract assistant for FINANCE documents. "
+     "Use ONLY the Provided Context, which comes from a single client's policies/contracts. "
+     "Answer the question as completely and specifically as possible based on that context. "
+     "If the context is insufficient to answer something, say you don't know and what is missing. "
+     "Do not hallucinate. Do not add citations or bracket labels."),
+    ("human",
+     "Client: {client_id}\n"
+     "Question: {query}\n\n"
+     "Provided Context:\n{context}\n\n"
+     "Write the best possible answer now.")
+])
+
+# ===================== Helpers =====================
+
+def list_finance_clients(root: Path) -> List[str]:
+    """
+    Find all finance client index directories under FINANCE_INDEX_ROOT.
+    A directory is a client index if it contains index.faiss + index.pkl.
+    """
+    if not root.exists():
+        return []
+
+    clients: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        filenames_set = set(filenames)
+        if "index.faiss" in filenames_set and "index.pkl" in filenames_set:
+            p = Path(dirpath)
+            rel = p.relative_to(root)       # relative to finance root
+            client_id = rel.as_posix()      # e.g. "clientA/us"
+            clients.append(client_id)
+
+    return sorted(set(clients))
+
+
+def load_vs_for_client(client_id: str, session: Session) -> FAISS:
+    """
+    Load FAISS for a given finance client_id (relative under FINANCE_INDEX_ROOT).
+    """
+    emb = BedrockEmbeddings(
+        model_id=EMBED_MODEL,
+        client=session.client("bedrock-runtime"),
+    )
+    index_dir = FINANCE_INDEX_ROOT / client_id
+    return FAISS.load_local(str(index_dir), emb, allow_dangerous_deserialization=True)
+
+
+def format_docs_for_llm(docs) -> str:
+    """
+    Turn retrieved Documents into a text block for the LLM.
+    This is only for LLM context, not for Excel output.
+    """
+    chunks = []
+    for d in docs:
+        m = d.metadata or {}
+        chunk = (
+            f"(client_id: {m.get('client_id')}, "
+            f"category: {m.get('category')}, "
+            f"policy: {m.get('policy_id')}, "
+            f"page: {m.get('page', m.get('page_start', '?'))})\n"
+            f"{d.page_content}"
+        )
+        chunks.append(chunk)
+    return "\n\n".join(chunks)
+
+
+def shorten_source_path(source_file: str, client_id: str) -> str:
+    """
+    Strip everything before the client_id in the path.
+
+    Example:
+      source_file: /ce/finance/ABB - SWITZZERLNA/us/file.pdf
+      client_id:   ABB - SWITZZERLNA/us
+      -> ABB - SWITZZERLNA/us/file.pdf
+
+    If client_id is not found in source_file, return basename.
+    """
+    if not source_file:
+        return ""
+
+    s = str(source_file)
+    idx = s.find(client_id)
+    if idx != -1:
+        return s[idx:]  # from client_id onward
+    # Fallback: just the filename
+    return Path(s).name
+
+
+def build_sources_summary(docs, client_id: str, max_lines: int = MAX_SOURCE_LINES) -> str:
+    """
+    Build a simple human-readable summary of sources (max `max_lines`):
+
+      policy: <policy_id> ; pages: X or X-Y ; source: <shortened_path>
+
+    `shortened_path` starts from the client_id (or basename fallback).
+    """
+    seen = set()
+    lines: List[str] = []
+
+    for d in docs:
+        m = d.metadata or {}
+        policy_id = m.get("policy_id") or Path(m.get("source_file", "")).name or "UNKNOWN_POLICY"
+        raw_source_file = m.get("source_file", "")
+
+        short_path = shorten_source_path(raw_source_file, client_id)
+
+        page = m.get("page")
+        page_start = m.get("page_start")
+        page_end = m.get("page_end")
+
+        if page is not None:
+            page_str = str(page)
+        elif page_start is not None and page_end is not None:
+            page_str = f"{page_start}-{page_end}" if page_start != page_end else str(page_start)
+        elif page_start is not None:
+            page_str = str(page_start)
+        else:
+            page_str = "?"
+
+        key = (policy_id, page_str, short_path)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        lines.append(f"policy: {policy_id} ; pages: {page_str} ; source: {short_path}")
+
+        if len(lines) >= max_lines:
+            break  # ✅ only top N sources
+
+    return "\n".join(lines)
+
+
+def answer_for_query(session: Session, client_id: str, query: str) -> Tuple[str, str]:
+    """
+    For a given finance client_id and query:
+
+      - Run FAISS retrieval
+      - Build LLM context from docs
+      - Call LLM to get 'content_extracted'
+      - Build 'source_links' string from docs (top 10, shortened paths)
+
+    Returns:
+      content_extracted (LLM answer ONLY),
+      source_links (newline-separated sources)
+    """
+    vs = load_vs_for_client(client_id, session)
+    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": K_PER_CLIENT})
+
+    docs = retriever.get_relevant_documents(query)
+    print(f"[DEBUG] Retrieved {len(docs)} docs for client='{client_id}', query='{query}'")
+
+    if not docs:
+        msg = f"(No matching context found in finance index for client '{client_id}' and query '{query}'.)"
+        return msg, ""
+
+    # Try to filter by metadata, but if that empties it, fall back to ALL docs
+    cid_norm = client_id.strip().lower()
+    filtered_docs = []
+    for d in docs:
+        m = d.metadata or {}
+        meta_cid = str(m.get("client_id", "")).strip().lower()
+        meta_cat = str(m.get("category", "")).strip().lower()
+        print(f"[DEBUG] doc meta: client_id='{meta_cid}', category='{meta_cat}', policy='{m.get('policy_id')}'")
+        if meta_cid == cid_norm and meta_cat == "finance":
+            filtered_docs.append(d)
+
+    if not filtered_docs:
+        print(f"[WARN] No docs passed metadata filter for client='{client_id}'. "
+              f"Using all {len(docs)} retrieved docs as context.")
+        filtered_docs = docs
+
+    context_text = format_docs_for_llm(filtered_docs)
+    source_links = build_sources_summary(filtered_docs, client_id=client_id)
+
+    # Call LLM – ONLY its answer goes into 'content_extracted'
+    llm = ChatBedrock(
+        client=session.client("bedrock-runtime"),
+        model_id=LLM_MODEL,
+        model_kwargs={
+            "temperature": float(TEMPERATURE),
+            "max_tokens": int(MAX_TOKENS),
+        },
+    )
+    chain = PROMPT | llm | StrOutputParser()
+
+    try:
+        answer = chain.invoke({
+            "client_id": client_id,
+            "query": query,
+            "context": context_text,
+        })
+        content_extracted = answer
+    except Exception as e:
+        content_extracted = f"(LLM error for {client_id} / '{query}': {type(e).__name__}: {e})"
+
+    return content_extracted, source_links
+
+
+def sanitize_filename(s: str) -> str:
+    """
+    Turn client_id into a safe filename.
+    Example: "ABB - SWITZZERLNA/us" -> "ABB___SWITZZERLNA_us"
+    """
+    # replace path separators with underscore, then strip weird chars
+    s = s.replace("/", "_")
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
+
+
+# ===================== Main =====================
+
+def main():
+    if not QUERIES:
+        raise SystemExit("QUERIES list is empty. Please define at least one query string in QUERIES.")
+
+    all_clients = list_finance_clients(FINANCE_INDEX_ROOT)
+    if not all_clients:
+        raise SystemExit(f"No finance clients found under {FINANCE_INDEX_ROOT}")
+
+    print("Finance clients found:")
+    for c in all_clients:
+        print("  -", c)
+
+    # Restrict to a single client if requested
+    if TARGET_CLIENT_ID:
+        clients = [c for c in all_clients if c == TARGET_CLIENT_ID]
+        if not clients:
+            raise SystemExit(
+                f"\nTARGET_CLIENT_ID='{TARGET_CLIENT_ID}' not found.\n"
+                f"Make sure there is a folder: {FINANCE_INDEX_ROOT / TARGET_CLIENT_ID} "
+                f"with index.faiss and index.pkl."
+            )
+        print(f"\nRunning ONLY for client: {TARGET_CLIENT_ID}")
+    else:
+        clients = all_clients
+        print("\nRunning for ALL finance clients.")
+
+    # AWS session
+    session = Session(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
+    )
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 🔹 Per-client Excel
+    for client_id in clients:
+        print(f"\n=== Client: {client_id} ===")
+        row: Dict[str, Any] = {"Client": client_id}
+
+        for q in QUERIES:
+            print(f"  - Query: {q} ...", end="", flush=True)
+            content_extracted, source_links = answer_for_query(session, client_id, q)
+
+            cell_obj = {
+                "content_extracted": content_extracted,
+                "source_links": source_links,
+            }
+            row[q] = json.dumps(cell_obj, ensure_ascii=False)
+            print(" done.")
+
+        df = pd.DataFrame([row])
+
+        safe_name = sanitize_filename(client_id)
+        out_path = OUTPUT_DIR / f"finance_queries_{safe_name}.xlsx"
+        df.to_excel(out_path, index=False)
+        print(f"  -> Saved: {out_path}")
+
+    print("\nAll client exports completed.")
+
+if __name__ == "__main__":
+    main()
