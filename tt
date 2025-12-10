@@ -1,0 +1,548 @@
+#!/usr/bin/env python3
+"""
+rag_finance_queries_wide_excel_llm_per_client.py
+
+FINANCE-only, file-based, WITH LLM, wide Excel format.
+
+For EACH FINANCE client FAISS index and EACH FILE (policy),
+create ONE Excel file:
+
+  ./finance_query_exports/finance_queries_<sanitized_client_id>.xlsx
+
+Each Excel has:
+
+  Row    = one file/policy in that client-category
+  Column = one JSON field from the LLM output (1–20 fields)
+
+Columns (example):
+
+  Client | Policy | Source File | <field_1> | <field_2> | ... | <field_20> | FlatString | Sources
+
+Where:
+- JSON fields 1–20 come from your fixed schema in the system prompt.
+- FlatString is the semicolon-separated string of the 20 values, in order.
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import re
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
+
+import pandas as pd
+from boto3 import Session
+from langchain_aws import BedrockEmbeddings, ChatBedrock
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# ===================== CONFIG =====================
+
+FAISS_INDEX_DIR    = Path("/ABS/PATH/TO/faiss_indices").resolve()   # root used by indexer
+FINANCE_INDEX_ROOT = FAISS_INDEX_DIR / "finance"                    # finance-only indexes
+
+# Directory where per-client Excel files will be written
+OUTPUT_DIR         = Path("./finance_query_exports").resolve()
+
+# Run only for a single finance client id (relative under finance/), or "" for ALL
+# Example: "ABB - SWITZZERLNA/us"
+TARGET_CLIENT_ID = ""   # "" => run for all finance clients
+
+# 🔹 Single source of truth:
+#    key   = JSON field name (exact key in the JSON output)
+#    value = retrieval question / label (you said they are same as fields, so we keep them same)
+#    👉 Replace these placeholder names with your real 20 keys.
+FIELD_DEFS: Dict[str, str] = {
+    "the name": "the name",             #  1
+    "field_2": "field_2",               #  2
+    "field_3": "field_3",               #  3
+    "field_4": "field_4",               #  4
+    "field_5": "field_5",               #  5
+    "field_6": "field_6",               #  6
+    "field_7": "field_7",               #  7
+    "field_8": "field_8",               #  8
+    "field_9": "field_9",               #  9
+    "are there": "are there",           # 10 (Yes/No/NA)
+    "field_11": "field_11",             # 11 (Yes/No/NA)
+    "field_12": "field_12",             # 12 (Yes/No/NA)
+    "field_13": "field_13",             # 13 (e.g. extracted clauses)
+    "field_14": "field_14",             # 14
+    "field_15": "field_15",             # 15
+    "field_16": "field_16",             # 16
+    "field_17": "field_17",             # 17
+    "field_18": "field_18",             # 18
+    "field_19": "field_19",             # 19
+    "field_20": "field_20",             # 20
+}
+
+# ✅ Python 3.7+ dicts preserve insertion order, so this is your field order
+FIELD_NAMES: List[str] = list(FIELD_DEFS.keys())
+
+# 🔹 Retrieval queries: you said they are already the fields in order
+RETRIEVAL_QUERIES: List[str] = FIELD_NAMES
+
+# AWS (for Bedrock; in practice, prefer IAM role/env vars)
+AWS_REGION = "us-east-1"
+AWS_ACCESS_KEY_ID     = "YOUR_ACCESS_KEY_ID"
+AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
+
+# Models
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+# 👉 Update to your actual Claude Sonnet 4.5 model id on Bedrock if different
+LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+
+# Retrieval / generation params
+K_PER_CLIENT      = 4
+MAX_TOKENS        = 1200
+TEMPERATURE       = 0.2
+MAX_SOURCE_LINES  = 10     # top-N sources lines in "Sources" column
+
+# ===================== PROMPT (system + human) =====================
+
+PROMPT_MULTI = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """
+Instructions:
+1. You are a precise, client-scoped contract assistant for FINANCE documents.
+2. Use ONLY the Provided Context, which comes from a single client's policies/contracts.
+3. Answer only about the given client and the given policy (file).
+4. If the context is insufficient to answer something, say you don't know and what is missing.
+5. Do not hallucinate or invent terms not present in the contract.
+6. Do not add citations, references, or bracket labels in the answers.
+7. Follow the output JSON schema exactly (field names and types).
+8. Do not output anything except what is described below.
+
+Context examples:
+- (OPTIONAL) You can paste your own concrete examples of how to treat missing clauses,
+  ambiguous language, etc., if you want to customize this further.
+
+Important notes:
+1. The context may contain multiple relevant clauses; you must capture them all where appropriate.
+2. If a requested field is not explicitly stated, output "NA" or an empty string as appropriate.
+3. All Yes/No/NA answers MUST be exactly one of: "Yes", "No", "NA".
+4. Do NOT infer terms or obligations that are not clearly stated.
+5. Keep wording concise but legally precise for all free-text fields.
+6. Dates should be in ISO format (YYYY-MM-DD) if possible.
+7. Monetary amounts should include currency or units if given.
+8. If the contract is silent on a question, clearly reflect that in the relevant field.
+9. Be internally consistent across all 20 fields.
+10. Never change, rename, add, or remove keys from the JSON schema.
+11. All output must be valid UTF-8 text.
+12. Do NOT wrap the JSON in backticks or any other markup.
+
+Output results in the following JSON structure (this is the EXACT key set; update the field names
+to match your FIELD_DEFS above):
+
+{
+  "the name": "free text",
+  "field_2": "free text",
+  "field_3": "free text",
+  "field_4": "free text",
+  "field_5": "free text",
+  "field_6": "free text",
+  "field_7": "free text",
+  "field_8": "free text",
+  "field_9": "free text",
+  "are there": "Yes/No/NA",
+  "field_11": "Yes/No/NA",
+  "field_12": "Yes/No/NA",
+  "field_13": "free text (e.g. extracted clauses)",
+  "field_14": "free text",
+  "field_15": "free text",
+  "field_16": "free text",
+  "field_17": "free text",
+  "field_18": "free text",
+  "field_19": "free text",
+  "field_20": "free text"
+}
+
+In addition to this JSON object, you MUST also output, on the NEXT line only,
+a single semicolon-separated string that contains ALL 20 values in the SAME ORDER
+as the JSON, WITHOUT labels, including any extracted clauses.
+
+The format MUST be:
+
+{ ...full JSON object exactly as above... }
+value_for_the_name;value_for_field_2;value_for_field_3;...;value_for_field_20
+
+Rules for the semicolon-separated string:
+- It must contain exactly 20 values separated by ';'.
+- Do not include field names, labels, or quotes around the entire string.
+- Preserve semicolons only as delimiters between values.
+- If a value is NA or empty, still include an empty position between semicolons.
+- Do NOT output any text before the JSON.
+- Do NOT output any text after the semicolon-separated string.
+- Do NOT wrap the JSON or the semicolon string in backticks.
+"""
+    ),
+    (
+        "human",
+        """
+Client: {client_id}
+Policy (file): {policy_id}
+
+Questions / aspects to consider when filling the 20 JSON fields:
+{questions_block}
+
+Provided Context (from this client's file only):
+{context}
+
+Now produce:
+1) Exactly ONE JSON object with the 20 fields as specified in the system instructions.
+2) On the next line, exactly ONE semicolon-separated string with the 20 values
+   in the same order, without labels.
+"""
+    ),
+])
+
+# ===================== Helpers =====================
+
+def list_finance_clients(root: Path) -> List[str]:
+    """
+    Find all client_ids under FINANCE_INDEX_ROOT that contain FAISS indexes.
+    client_id is the relative path (posix) below FINANCE_INDEX_ROOT.
+    """
+    if not root.exists():
+        return []
+    clients: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        filenames_set = set(filenames)
+        if "index.faiss" in filenames_set and "index.pkl" in filenames_set:
+            p = Path(dirpath)
+            rel = p.relative_to(root)
+            client_id = rel.as_posix()
+            clients.append(client_id)
+    return sorted(set(clients))
+
+
+def load_vs_for_client(client_id: str, session: Session) -> FAISS:
+    emb = BedrockEmbeddings(
+        model_id=EMBED_MODEL,
+        client=session.client("bedrock-runtime"),
+    )
+    index_dir = FINANCE_INDEX_ROOT / client_id
+    return FAISS.load_local(str(index_dir), emb, allow_dangerous_deserialization=True)
+
+
+def format_docs_for_llm(docs) -> str:
+    chunks = []
+    for d in docs:
+        m = d.metadata or {}
+        chunk = (
+            f"(client_id: {m.get('client_id')}, "
+            f"category: {m.get('category')}, "
+            f"policy: {m.get('policy_id')}, "
+            f"page: {m.get('page', m.get('page_start', '?'))})\n"
+            f"{d.page_content}"
+        )
+        chunks.append(chunk)
+    return "\n\n".join(chunks)
+
+
+def shorten_source_path(source_file: str, client_id: str) -> str:
+    if not source_file:
+        return ""
+    s = str(source_file)
+    idx = s.find(client_id)
+    if idx != -1:
+        return s[idx:]
+    return Path(s).name
+
+
+def build_sources_summary(docs, client_id: str, max_lines: int = MAX_SOURCE_LINES) -> str:
+    seen = set()
+    lines: List[str] = []
+    for d in docs:
+        m = d.metadata or {}
+        policy_id = m.get("policy_id") or Path(m.get("source_file", "")).name or "UNKNOWN_POLICY"
+        raw_source_file = m.get("source_file", "")
+        short_path = shorten_source_path(raw_source_file, client_id)
+
+        page = m.get("page")
+        page_start = m.get("page_start")
+        page_end = m.get("page_end")
+
+        if page is not None:
+            page_str = str(page)
+        elif page_start is not None and page_end is not None:
+            page_str = f"{page_start}-{page_end}" if page_start != page_end else str(page_start)
+        elif page_start is not None:
+            page_str = str(page_start)
+        else:
+            page_str = "?"
+
+        key = (policy_id, page_str, short_path)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        lines.append(f"Document: {policy_id} ; Page no.: {page_str} ")
+
+        if len(lines) >= max_lines:
+            break
+    return "\n".join(lines)
+
+
+def sanitize_filename(s: str) -> str:
+    s = s.replace("/", "_")
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
+
+
+def load_manifest_for_client(client_id: str) -> List[Dict[str, Any]]:
+    """
+    Read manifest.json under finance/<client_id>/ and return its 'docs' list.
+    Each entry corresponds to one file (policy) in that client-category index.
+    """
+    manifest_path = FINANCE_INDEX_ROOT / client_id / "manifest.json"
+    if not manifest_path.exists():
+        print(f"[WARN] No manifest.json for client '{client_id}' at {manifest_path}")
+        return []
+
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[WARN] Failed to read manifest for '{client_id}': {e}")
+        return []
+
+    docs = data.get("docs", [])
+    if not isinstance(docs, list):
+        print(f"[WARN] manifest.json for '{client_id}' has no 'docs' list")
+        return []
+    return docs
+
+
+# ===================== LLM per FILE (one call, 20 fields) =====================
+
+def answer_all_queries_for_file(
+    session: Session,
+    client_id: str,
+    policy_id: str,
+    retrieval_queries: List[str],
+) -> Tuple[Dict[str, str], str, str]:
+    """
+    For a given client_id + policy_id (single file) and a list of retrieval_queries:
+      1) Retrieve context separately for each retrieval query, restricted to this file.
+      2) Union all retrieved chunks as a single context for the LLM.
+      3) Make ONE Claude call that fills all 20 JSON fields + semicolon string.
+      4) Return:
+           - values_by_field: { field_name -> value string }
+           - flat_string: 'v1;v2;...;v20'
+           - sources_summary: newline-separated sources summary
+    """
+    vs = load_vs_for_client(client_id, session)
+    retriever = vs.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": K_PER_CLIENT},
+    )
+
+    cid_norm = client_id.strip().lower()
+    pol_norm = policy_id.strip().lower()
+
+    all_docs = []
+
+    for q in retrieval_queries:
+        docs = retriever.get_relevant_documents(q)
+        print(f"[DEBUG] Retrieved {len(docs)} docs for client='{client_id}', policy='{policy_id}', query='{q}'")
+
+        filtered = []
+        for d in docs:
+            m = d.metadata or {}
+            meta_cid = str(m.get("client_id", "")).strip().lower()
+            meta_cat = str(m.get("category", "")).strip().lower()
+            meta_pol = str(m.get("policy_id", "")).strip().lower()
+            print(
+                f"[DEBUG] doc meta: client_id='{meta_cid}', "
+                f"category='{meta_cat}', policy='{meta_pol}'"
+            )
+
+            # Strict file-scope: correct client, finance category, and this policy/file
+            if meta_cid == cid_norm and meta_cat == "finance" and meta_pol == pol_norm:
+                filtered.append(d)
+
+        if not filtered:
+            print(
+                f"[WARN] No docs passed metadata filter for client='{client_id}', "
+                f"policy='{policy_id}', query='{q}'. Using all {len(docs)} retrieved docs."
+            )
+            filtered = docs
+
+        all_docs.extend(filtered)
+
+    # Deduplicate docs in context
+    seen = set()
+    unique_docs = []
+    for d in all_docs:
+        m = d.metadata or {}
+        key = (
+            m.get("policy_id"),
+            m.get("page"),
+            m.get("page_start"),
+            m.get("page_end"),
+            m.get("source_file"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_docs.append(d)
+
+    if not unique_docs:
+        print(f"[WARN] No usable context docs for client='{client_id}', policy='{policy_id}'.")
+        values_by_field = {field: "" for field in FIELD_NAMES}
+        flat_string = ";".join("" for _ in FIELD_NAMES)
+        sources_summary = ""
+        return values_by_field, flat_string, sources_summary
+
+    context_text = format_docs_for_llm(unique_docs)
+
+    # Here, questions_block is just the list of field names (as you requested)
+    questions_block = "\n".join(f"- {name}" for name in FIELD_NAMES)
+
+    llm = ChatBedrock(
+        client=session.client("bedrock-runtime"),
+        model_id=LLM_MODEL,
+        model_kwargs={
+            "temperature": float(TEMPERATURE),
+            "max_tokens": int(MAX_TOKENS),
+        },
+    )
+
+    chain = PROMPT_MULTI | llm | StrOutputParser()
+
+    try:
+        llm_output = chain.invoke({
+            "client_id": client_id,
+            "policy_id": policy_id,
+            "questions_block": questions_block,
+            "context": context_text,
+        })
+    except Exception as e:
+        print(f"[WARN] LLM error for client='{client_id}', policy='{policy_id}': {type(e).__name__}: {e}")
+        llm_output = ""
+
+    # Split into JSON + flat string
+    lines = [ln for ln in (llm_output or "").splitlines() if ln.strip()]
+    json_str = lines[0].strip() if lines else "{}"
+    flat_string = lines[1].strip() if len(lines) > 1 else ""
+
+    try:
+        parsed = json.loads(json_str)
+    except Exception as e:
+        print(f"[WARN] Failed to parse JSON for client='{client_id}', policy='{policy_id}': {e}")
+        parsed = {}
+
+    values_by_field = {
+        field: str(parsed.get(field, "") or "") for field in FIELD_NAMES
+    }
+
+    # If flat_string missing or obviously broken, reconstruct from parsed
+    if not flat_string or flat_string.count(";") + 1 != len(FIELD_NAMES):
+        flat_values = [values_by_field.get(field, "") for field in FIELD_NAMES]
+        flat_string = ";".join(flat_values)
+
+    sources_summary = build_sources_summary(unique_docs, client_id=client_id, max_lines=MAX_SOURCE_LINES)
+
+    return values_by_field, flat_string, sources_summary
+
+
+# ===================== Main =====================
+
+def main():
+    if not FIELD_NAMES:
+        raise SystemExit(
+            "FIELD_DEFS is empty. Please define your 20 JSON fields in FIELD_DEFS."
+        )
+    if len(FIELD_NAMES) != 20:
+        raise SystemExit(
+            f"FIELD_DEFS must contain exactly 20 fields, found {len(FIELD_NAMES)}."
+        )
+
+    all_clients = list_finance_clients(FINANCE_INDEX_ROOT)
+    if not all_clients:
+        raise SystemExit(f"No finance clients found under {FINANCE_INDEX_ROOT}")
+
+    print("Finance clients found:")
+    for c in all_clients:
+        print("  -", c)
+
+    if TARGET_CLIENT_ID:
+        clients = [c for c in all_clients if c == TARGET_CLIENT_ID]
+        if not clients:
+            raise SystemExit(
+                f"\nTARGET_CLIENT_ID='{TARGET_CLIENT_ID}' not found.\n"
+                f"Make sure there is a folder: {FINANCE_INDEX_ROOT / TARGET_CLIENT_ID} "
+                f"with index.faiss and index.pkl."
+            )
+        print(f"\nRunning ONLY for client: {TARGET_CLIENT_ID}")
+    else:
+        clients = all_clients
+        print("\nRunning for ALL finance clients.")
+
+    session = Session(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
+    )
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    for client_id in clients:
+        print(f"\n=== Client: {client_id} ===")
+
+        safe_name = sanitize_filename(client_id)
+        out_path = OUTPUT_DIR / f"finance_queries_{safe_name}.xlsx"
+
+        # Optional: skip if this client's Excel already exists
+        if out_path.exists():
+            print(f"  -> Skipping {client_id}: {out_path} already exists.")
+            continue
+
+        manifest_docs = load_manifest_for_client(client_id)
+        if not manifest_docs:
+            print(f"[WARN] No manifest docs for client '{client_id}', skipping.")
+            continue
+
+        rows: List[Dict[str, Any]] = []
+
+        for doc_info in manifest_docs:
+            policy_id = doc_info.get("policy_id") or Path(doc_info.get("source_file", "")).name
+            source_file = doc_info.get("source_file", "")
+
+            print(f"  -> File (policy): {policy_id}")
+
+            values_by_field, flat_string, sources_summary = answer_all_queries_for_file(
+                session=session,
+                client_id=client_id,
+                policy_id=policy_id,
+                retrieval_queries=RETRIEVAL_QUERIES,
+            )
+
+            row: Dict[str, Any] = {
+                "Client": client_id,
+                "Policy": policy_id,
+                "Source File": source_file,
+                "FlatString": flat_string,   # semicolon string of 20 values
+                "Sources": sources_summary,  # document/page summary
+            }
+
+            # Each JSON field becomes its own column
+            for field in FIELD_NAMES:
+                row[field] = values_by_field.get(field, "")
+
+            rows.append(row)
+
+        if not rows:
+            print(f"[WARN] No rows generated for client '{client_id}'.")
+            continue
+
+        df = pd.DataFrame(rows)
+        df.to_excel(out_path, index=False)
+        print(f"  -> Saved: {out_path}")
+
+    print("\nAll client exports completed.")
+
+
+if __name__ == "__main__":
+    main()
