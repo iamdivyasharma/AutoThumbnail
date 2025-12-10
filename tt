@@ -12,15 +12,15 @@ create ONE Excel file:
 Each Excel has:
 
   Row    = one file/policy in that client-category
-  Column = one JSON field from the LLM output (1–20 fields)
+  Column = one JSON field from the LLM output (1..N fields)
 
 Columns (example):
 
-  Client | Policy | Source File | <field_1> | <field_2> | ... | <field_20> | FlatString | Sources
+  Client | Policy | Source File | <field_1> | ... | <field_N> | FlatString | Sources
 
 Where:
-- JSON fields 1–20 come from your fixed schema in the system prompt.
-- FlatString is the semicolon-separated string of the 20 values, in order.
+- JSON fields come from your fixed schema in the system prompt.
+- FlatString is the semicolon-separated string of the N values, in order.
 """
 
 from __future__ import annotations
@@ -52,35 +52,40 @@ TARGET_CLIENT_ID = ""   # "" => run for all finance clients
 
 # 🔹 Single source of truth:
 #    key   = JSON field name (exact key in the JSON output)
-#    value = retrieval question / label (you said they are same as fields, so we keep them same)
-#    👉 Replace these placeholder names with your real 20 keys.
+#    value = label / hint (for now we just keep same as key; LLM uses system prompt, not this)
+#    👉 Put ALL your ~42 field names here in the desired order.
 FIELD_DEFS: Dict[str, str] = {
-    "the name": "the name",             #  1
-    "field_2": "field_2",               #  2
-    "field_3": "field_3",               #  3
-    "field_4": "field_4",               #  4
-    "field_5": "field_5",               #  5
-    "field_6": "field_6",               #  6
-    "field_7": "field_7",               #  7
-    "field_8": "field_8",               #  8
-    "field_9": "field_9",               #  9
-    "are there": "are there",           # 10 (Yes/No/NA)
-    "field_11": "field_11",             # 11 (Yes/No/NA)
-    "field_12": "field_12",             # 12 (Yes/No/NA)
-    "field_13": "field_13",             # 13 (e.g. extracted clauses)
-    "field_14": "field_14",             # 14
-    "field_15": "field_15",             # 15
-    "field_16": "field_16",             # 16
-    "field_17": "field_17",             # 17
-    "field_18": "field_18",             # 18
-    "field_19": "field_19",             # 19
-    "field_20": "field_20",             # 20
+    # === EXAMPLE ===
+    "the name": "the name",
+    "field_2": "field_2",
+    "field_3": "field_3",
+    "field_4": "field_4",
+    "field_5": "field_5",
+    "field_6": "field_6",
+    "field_7": "field_7",
+    "field_8": "field_8",
+    "field_9": "field_9",
+    "are there": "are there",
+    "field_11": "field_11",
+    "field_12": "field_12",
+    "field_13": "field_13",
+    "field_14": "field_14",
+    "field_15": "field_15",
+    "field_16": "field_16",
+    "field_17": "field_17",
+    "field_18": "field_18",
+    "field_19": "field_19",
+    "field_20": "field_20",
+    # ADD the rest up to your 42 fields, in order:
+    # "field_21": "field_21",
+    # ...
+    # "field_42": "field_42",
 }
 
-# ✅ Python 3.7+ dicts preserve insertion order, so this is your field order
+# ✅ Dict preserves insertion order in Python 3.7+, so this is your field order
 FIELD_NAMES: List[str] = list(FIELD_DEFS.keys())
 
-# 🔹 Retrieval queries: you said they are already the fields in order
+# 🔹 Retrieval queries: you said they are same as fields (in order)
 RETRIEVAL_QUERIES: List[str] = FIELD_NAMES
 
 # AWS (for Bedrock; in practice, prefer IAM role/env vars)
@@ -95,11 +100,22 @@ LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
 
 # Retrieval / generation params
 K_PER_CLIENT      = 4
-MAX_TOKENS        = 1200
+MAX_TOKENS        = 2000
 TEMPERATURE       = 0.2
 MAX_SOURCE_LINES  = 10     # top-N sources lines in "Sources" column
 
-# ===================== PROMPT (system + human) =====================
+# ===================== PROMPT TEMPLATE (system + human) =====================
+
+def build_json_schema_example() -> str:
+    """
+    Build a JSON skeleton string with all FIELD_NAMES to embed in the system prompt.
+    """
+    lines = ["{"]
+    for i, field in enumerate(FIELD_NAMES):
+        comma = "," if i < len(FIELD_NAMES) - 1 else ""
+        lines.append(f'  "{field}": "..."{comma}')
+    lines.append("}")
+    return "\n".join(lines)
 
 PROMPT_MULTI = ChatPromptTemplate.from_messages([
     (
@@ -107,71 +123,48 @@ PROMPT_MULTI = ChatPromptTemplate.from_messages([
         """
 Instructions:
 1. You are a precise, client-scoped contract assistant for FINANCE documents.
-2. Use ONLY the Provided Context, which comes from a single client's policies/contracts.
-3. Answer only about the given client and the given policy (file).
-4. If the context is insufficient to answer something, say you don't know and what is missing.
-5. Do not hallucinate or invent terms not present in the contract.
-6. Do not add citations, references, or bracket labels in the answers.
-7. Follow the output JSON schema exactly (field names and types).
-8. Do not output anything except what is described below.
-
-Context examples:
-- (OPTIONAL) You can paste your own concrete examples of how to treat missing clauses,
-  ambiguous language, etc., if you want to customize this further.
+2. Use ONLY the Provided Context, which comes from a single client’s policies/contracts.
+3. Answer only about the given client and the given policy (file). Ignore any other clients or policies.
+4. If the context is insufficient to answer something, explicitly say you don’t know and what is missing.
+5. Do NOT hallucinate, infer, or invent terms that are not clearly stated in the contract.
+6. Do NOT add citations, references, or bracket labels in any of the field values.
+7. Follow the output JSON schema exactly: use the exact field names expected by the calling system.
+8. Do NOT output anything except:
+   - a single JSON object with the required fields, and
+   - on the next line, a single semicolon-separated string of all field values.
 
 Important notes:
-1. The context may contain multiple relevant clauses; you must capture them all where appropriate.
-2. If a requested field is not explicitly stated, output "NA" or an empty string as appropriate.
-3. All Yes/No/NA answers MUST be exactly one of: "Yes", "No", "NA".
-4. Do NOT infer terms or obligations that are not clearly stated.
-5. Keep wording concise but legally precise for all free-text fields.
-6. Dates should be in ISO format (YYYY-MM-DD) if possible.
-7. Monetary amounts should include currency or units if given.
-8. If the contract is silent on a question, clearly reflect that in the relevant field.
-9. Be internally consistent across all 20 fields.
+1. The Provided Context may contain multiple documents for the same policy; treat them as a single contract.
+2. When the contract is silent on a question, do NOT guess. Return "NA" or an empty string.
+3. For Yes/No/NA fields, the value MUST be exactly one of: "Yes", "No", or "NA".
+4. Free-text fields may contain any text: extracted clauses, explanations, references to sections, etc.
+5. Some fields may be booleans, dates, numbers, or lists/dictionaries; return them as valid JSON values.
+6. Dates should be in ISO format "YYYY-MM-DD" where possible; if not available, use the date format as written.
+7. Monetary amounts should include currency or units if they are given in the contract.
+8. If there are multiple relevant clauses for a field, summarize them or include all of them clearly.
+9. Be internally consistent across all fields; do not contradict yourself.
 10. Never change, rename, add, or remove keys from the JSON schema.
-11. All output must be valid UTF-8 text.
-12. Do NOT wrap the JSON in backticks or any other markup.
+11. All output must be valid UTF-8 and valid JSON in the first line.
+12. Do NOT wrap the JSON or the semicolon string in backticks or any other markup.
 
-Output results in the following JSON structure (this is the EXACT key set; update the field names
-to match your FIELD_DEFS above):
+You MUST output results in the following JSON structure.
+This is the EXACT set of keys you must use:
 
-{
-  "the name": "free text",
-  "field_2": "free text",
-  "field_3": "free text",
-  "field_4": "free text",
-  "field_5": "free text",
-  "field_6": "free text",
-  "field_7": "free text",
-  "field_8": "free text",
-  "field_9": "free text",
-  "are there": "Yes/No/NA",
-  "field_11": "Yes/No/NA",
-  "field_12": "Yes/No/NA",
-  "field_13": "free text (e.g. extracted clauses)",
-  "field_14": "free text",
-  "field_15": "free text",
-  "field_16": "free text",
-  "field_17": "free text",
-  "field_18": "free text",
-  "field_19": "free text",
-  "field_20": "free text"
-}
+{json_schema_example}
 
 In addition to this JSON object, you MUST also output, on the NEXT line only,
-a single semicolon-separated string that contains ALL 20 values in the SAME ORDER
+a single semicolon-separated string that contains ALL {num_fields} values in the SAME ORDER
 as the JSON, WITHOUT labels, including any extracted clauses.
 
 The format MUST be:
 
-{ ...full JSON object exactly as above... }
-value_for_the_name;value_for_field_2;value_for_field_3;...;value_for_field_20
+{{ ...full JSON object exactly as above... }}
+value_for_first_field;value_for_second_field;...;value_for_last_field
 
 Rules for the semicolon-separated string:
-- It must contain exactly 20 values separated by ';'.
+- It must contain exactly {num_fields} values separated by ';'.
 - Do not include field names, labels, or quotes around the entire string.
-- Preserve semicolons only as delimiters between values.
+- Use the same order of fields as in the JSON.
 - If a value is NA or empty, still include an empty position between semicolons.
 - Do NOT output any text before the JSON.
 - Do NOT output any text after the semicolon-separated string.
@@ -184,15 +177,15 @@ Rules for the semicolon-separated string:
 Client: {client_id}
 Policy (file): {policy_id}
 
-Questions / aspects to consider when filling the 20 JSON fields:
+Questions / aspects to consider when filling the {num_fields} JSON fields:
 {questions_block}
 
 Provided Context (from this client's file only):
 {context}
 
 Now produce:
-1) Exactly ONE JSON object with the 20 fields as specified in the system instructions.
-2) On the next line, exactly ONE semicolon-separated string with the 20 values
+1) Exactly ONE JSON object with the {num_fields} fields as specified in the system instructions.
+2) On the next line, exactly ONE semicolon-separated string with the {num_fields} values
    in the same order, without labels.
 """
     ),
@@ -314,7 +307,7 @@ def load_manifest_for_client(client_id: str) -> List[Dict[str, Any]]:
     return docs
 
 
-# ===================== LLM per FILE (one call, 20 fields) =====================
+# ===================== LLM per FILE (one call, N fields) =====================
 
 def answer_all_queries_for_file(
     session: Session,
@@ -326,10 +319,10 @@ def answer_all_queries_for_file(
     For a given client_id + policy_id (single file) and a list of retrieval_queries:
       1) Retrieve context separately for each retrieval query, restricted to this file.
       2) Union all retrieved chunks as a single context for the LLM.
-      3) Make ONE Claude call that fills all 20 JSON fields + semicolon string.
+      3) Make ONE Claude call that fills all fields + semicolon string.
       4) Return:
            - values_by_field: { field_name -> value string }
-           - flat_string: 'v1;v2;...;v20'
+           - flat_string: 'v1;v2;...;vN'
            - sources_summary: newline-separated sources summary
     """
     vs = load_vs_for_client(client_id, session)
@@ -397,8 +390,9 @@ def answer_all_queries_for_file(
 
     context_text = format_docs_for_llm(unique_docs)
 
-    # Here, questions_block is just the list of field names (as you requested)
+    num_fields = len(FIELD_NAMES)
     questions_block = "\n".join(f"- {name}" for name in FIELD_NAMES)
+    json_schema_example = build_json_schema_example()
 
     llm = ChatBedrock(
         client=session.client("bedrock-runtime"),
@@ -417,6 +411,8 @@ def answer_all_queries_for_file(
             "policy_id": policy_id,
             "questions_block": questions_block,
             "context": context_text,
+            "num_fields": num_fields,
+            "json_schema_example": json_schema_example,
         })
     except Exception as e:
         print(f"[WARN] LLM error for client='{client_id}', policy='{policy_id}': {type(e).__name__}: {e}")
@@ -433,11 +429,12 @@ def answer_all_queries_for_file(
         print(f"[WARN] Failed to parse JSON for client='{client_id}', policy='{policy_id}': {e}")
         parsed = {}
 
+    # Whatever types came back (string/bool/list/dict/etc.), stringify for Excel
     values_by_field = {
         field: str(parsed.get(field, "") or "") for field in FIELD_NAMES
     }
 
-    # If flat_string missing or obviously broken, reconstruct from parsed
+    # If flat_string missing or obviously broken, reconstruct from parsed values
     if not flat_string or flat_string.count(";") + 1 != len(FIELD_NAMES):
         flat_values = [values_by_field.get(field, "") for field in FIELD_NAMES]
         flat_string = ";".join(flat_values)
@@ -452,12 +449,14 @@ def answer_all_queries_for_file(
 def main():
     if not FIELD_NAMES:
         raise SystemExit(
-            "FIELD_DEFS is empty. Please define your 20 JSON fields in FIELD_DEFS."
+            "FIELD_DEFS is empty. Please define your JSON fields in FIELD_DEFS."
         )
-    if len(FIELD_NAMES) != 20:
-        raise SystemExit(
-            f"FIELD_DEFS must contain exactly 20 fields, found {len(FIELD_NAMES)}."
-        )
+
+    # Optional: hard check for 42 if you want
+    # if len(FIELD_NAMES) != 42:
+    #     raise SystemExit(
+    #         f"FIELD_DEFS must contain exactly 42 fields, found {len(FIELD_NAMES)}."
+    #     )
 
     all_clients = list_finance_clients(FINANCE_INDEX_ROOT)
     if not all_clients:
@@ -523,7 +522,7 @@ def main():
                 "Client": client_id,
                 "Policy": policy_id,
                 "Source File": source_file,
-                "FlatString": flat_string,   # semicolon string of 20 values
+                "FlatString": flat_string,   # semicolon string of all field values
                 "Sources": sources_summary,  # document/page summary
             }
 
