@@ -1,0 +1,67 @@
+    # ---- JSON extraction (JSON-only output expected) ----
+    llm_output = (llm_output or "").strip()
+
+    # Try to extract a JSON block (handles accidental headings / fences)
+    try:
+        json_str = extract_json_block(llm_output)
+    except ValueError:
+        # If no special markers, assume the whole output is the JSON
+        json_str = llm_output
+        print(f"[INFO] Using full LLM output as JSON for client='{client_id}', policy='{policy_id}', group='{group_label}'")
+
+    try:
+        parsed = json.loads(json_str)
+    except Exception as e:
+        print(f"[WARN] Failed to parse JSON for client='{client_id}', policy='{policy_id}', group='{group_label}': {e}")
+        print(f"[DEBUG] JSON candidate was:\n{json_str}")
+        parsed = {}
+
+
+
+
+def extract_json_block(text: str) -> str:
+    """
+    Extract the JSON object from an LLM response that looks like:
+
+      ## JSON Output
+      ```json
+      { ... }
+      ```
+      ## Semicolon Divided String
+      ...
+
+    Returns the JSON string (e.g. '{ "1": { "answer": "..." }, ... }')
+
+    Raises ValueError if nothing is found.
+    """
+    # 1) Prefer fenced ```json ... ``` block
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # 2) Fallback: first { ... } after "## JSON Output"
+    m = re.search(r"##\s*JSON\s*Output.*?(\{.*?\})",
+                  text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # 3) Last fallback: any { ... } in the text
+    m = re.search(r"(\{.*\})", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    raise ValueError("No JSON block found in LLM output")
+
+
+def list_finance_clients(root: Path) -> List[str]:
+    if not root.exists():
+        return []
+    clients: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        filenames_set = set(filenames)
+        if "index.faiss" in filenames_set and "index.pkl" in filenames_set:
+            p = Path(dirpath)
+            rel = p.relative_to(root)
+            client_id = rel.as_posix()
+            clients.append(client_id)
+    return sorted(set(clients))
