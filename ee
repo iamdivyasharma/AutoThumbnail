@@ -1,0 +1,123 @@
+import pandas as pd, json, re
+from pathlib import Path
+
+# --- CONFIG ---
+input_path  = Path("combined_finance_output.xlsx")        # change if needed
+output_path = Path("combined_finance_output_flat.xlsx")
+anchor_col  = "the name of the comapny contract by"       # must match header
+
+# --- READ ---
+df = pd.read_excel(input_path)
+if df.empty:
+    raise SystemExit("Input Excel is empty")
+
+# Use LAST column as JSON column (change this if you know the exact name)
+json_col = df.columns[-1]
+print("Using JSON column:", json_col)
+
+# --- PARSE JSON & NORMALIZE TO HAVE extracted_clauses LIST ---
+parsed = []
+max_clauses = 0
+
+for raw in df[json_col]:
+    # default empty dict
+    obj = {}
+
+    if not pd.isna(raw):
+        s = str(raw).strip()
+        if s:
+            # try direct JSON
+            try:
+                obj = json.loads(s)
+            except Exception:
+                # try to extract first {...} or [...] block
+                m = re.search(r"(\[.*\]|\{.*\})", s, re.DOTALL)
+                if m:
+                    try:
+                        obj = json.loads(m.group(1))
+                    except Exception:
+                        obj = {}
+
+    # if it's a bare list, treat it as extracted_clauses
+    if isinstance(obj, list):
+        obj = {"extracted_clauses": obj}
+    elif not isinstance(obj, dict):
+        obj = {}
+
+    # normalize extracted_clauses to a Python list
+    clauses = obj.get("extracted_clauses", [])
+    if isinstance(clauses, str):
+        # might be JSON string
+        try:
+            clauses = json.loads(clauses)
+        except Exception:
+            clauses = []
+
+    if not isinstance(clauses, list):
+        clauses = []
+
+    obj["extracted_clauses"] = clauses
+    max_clauses = max(max_clauses, len(clauses))
+    parsed.append(obj)
+
+print("Max clauses found in any row:", max_clauses)
+
+# --- CREATE extracted_clauses COLUMNS ---
+for i in range(max_clauses):
+    # first column named 'extracted_clauses', rest visually blank
+    col_name = "extracted_clauses" if i == 0 else " " * i
+    vals = []
+
+    for obj in parsed:
+        clauses = obj.get("extracted_clauses", [])
+        if i >= len(clauses):
+            vals.append("")
+            continue
+
+        item = clauses[i]
+        if not isinstance(item, dict):
+            vals.append(str(item))
+            continue
+
+        t   = str(item.get("clause_type", "")).strip()
+        txt = str(item.get("clause_text", "")).strip()
+
+        # handle section_reference / section_refernce / section / section_ref
+        sec = (
+            item.get("section_reference")
+            or item.get("section_refernce")
+            or item.get("section_ref")
+            or item.get("section")
+            or ""
+        )
+        sec = str(sec).strip()
+
+        parts = []
+        if t and txt:
+            parts.append(f"{t} - {txt}")
+        elif t:
+            parts.append(t)
+        elif txt:
+            parts.append(txt)
+        if sec:
+            parts.append(f"Section {sec}")
+
+        vals.append(", ".join(parts))
+
+    df[col_name] = vals
+
+# --- DROP ORIGINAL JSON COLUMN ---
+df = df.drop(columns=[json_col])
+
+# --- DROP ALL COLUMNS BEFORE ANCHOR ---
+if anchor_col in df.columns:
+    idx = df.columns.get_loc(anchor_col)
+    print(f"Anchor '{anchor_col}' at index {idx}; dropping {idx} column(s) before it.")
+    df = df.iloc[:, idx:]
+else:
+    print(f"WARNING: anchor column {anchor_col!r} not found; keeping all columns.")
+
+# --- SAVE ---
+output_path.parent.mkdir(parents=True, exist_ok=True)
+df.to_excel(output_path, index=False)
+print("Saved to:", output_path)
