@@ -1,0 +1,1464 @@
+
+# generate_hparam_config.py
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Dict
+import fitz  # PyMuPDF
+
+# Adjust to match your project layout
+LOCAL_DOC_ROOT = Path("ce").resolve()
+FINANCE_ROOT = LOCAL_DOC_ROOT / "finance"
+
+# Where to save the config used by indexer.py
+CONFIG_PATH = Path("config/hparam_overrides.json").resolve()
+
+
+def get_pdf_page_count(pdf_path: Path) -> int:
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            return doc.page_count or 0
+    except Exception as e:
+        print(f"[WARN] Could not read pages for {pdf_path}: {e}")
+        return 0
+
+
+# def choose_hparams_for_pages(pages: int) -> Dict[str, float]:
+#     """
+#     Simple rule-based mapping from number of pages -> k, max_tokens, temperature.
+
+#     You can adjust these thresholds and values however you like.
+#     """
+#     if pages <= 5:
+#         k = 3
+#         max_tokens = 1200
+#         temperature = 0.0
+#     elif pages <= 20:
+#         k = 4
+#         max_tokens = 2000
+#         temperature = 0.0
+#     elif pages <= 50:
+#         k = 5
+#         max_tokens = 2600
+#         temperature = 0.0
+#     else:
+#         k = 6
+#         max_tokens = 3200
+#         temperature = 0.0
+
+#     return {"k": k, "max_tokens": max_tokens, "temperature": temperature}
+
+
+def choose_hparams_for_pages(pages: int) -> Dict[str, float]:
+    if pages is None or pages <= 0:
+        pages = 1
+
+    # ---- k (top-k) ----
+    if pages <= 5:
+        k = 8
+    elif pages <= 10:
+        k = 12
+    elif pages <= 20:
+        k = 20
+    elif pages <= 30:
+        k = 28
+    elif pages <= 40:
+        k = 35   
+    elif pages <= 60:
+        k = 42
+    else:
+        k = 50
+
+    # ---- max_tokens: fixed for all files ----
+    max_tokens = 7500
+
+    # ---- temperature: always deterministic ----
+    temperature = 0.0
+
+    return {
+        "k": k,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+
+
+def main():
+    if not FINANCE_ROOT.exists():
+        raise SystemExit(f"Finance root does not exist: {FINANCE_ROOT}")
+
+    overrides: Dict[str, Dict[str, float]] = {}
+
+    # Scan ALL PDFs under ce/finance (recursively)
+    for pdf_path in FINANCE_ROOT.rglob("*.pdf"):
+        pages = get_pdf_page_count(pdf_path)
+        hparams = choose_hparams_for_pages(pages)
+
+        key = pdf_path.name  # used by indexer: path.name
+        overrides[key] = {
+            "pages": pages,
+            "k": hparams["k"],
+            "max_tokens": hparams["max_tokens"],
+            "temperature": hparams["temperature"],
+        }
+
+        print(f"[CONFIG] {key}: pages={pages}, k={hparams['k']}, "
+              f"max_tokens={hparams['max_tokens']}, temperature={hparams['temperature']}")
+
+    # (Optional) include DOCX as 1-page approximations
+    for docx_path in FINANCE_ROOT.rglob("*.docx"):
+        key = docx_path.name
+        if key in overrides:
+            continue  # already added as PDF with same name (unlikely)
+
+        pages = 1  # heuristic for DOCX
+        hparams = choose_hparams_for_pages(pages)
+        overrides[key] = {
+            "pages": pages,
+            "k": hparams["k"],
+            "max_tokens": hparams["max_tokens"],
+            "temperature": hparams["temperature"],
+        }
+        print(f"[CONFIG] {key}: (DOCX) pages={pages}, k={hparams['k']}, "
+              f"max_tokens={hparams['max_tokens']}, temperature={hparams['temperature']}")
+
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(overrides, indent=2), encoding="utf-8")
+
+    print(f"\n[CONFIG] Saved {len(overrides)} entries to {CONFIG_PATH}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+#indexer using config..
+
+
+from __future__ import annotations
+
+import os
+import re
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Iterable, Optional
+from collections import defaultdict
+
+import fitz  # PyMuPDF
+
+from langchain_aws import BedrockEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.schema import Document
+
+from langchain.document_loaders import AmazonTextractPDFLoader
+
+try:
+    from docx import Document as DocxDocument
+    _HAS_PYTHON_DOCX = True
+except Exception:
+    _HAS_PYTHON_DOCX = False
+
+
+# ===================== LOCAL PATH CONFIG =====================
+
+# Local root where SageMaker (or your env) sees ce/legal and ce/finance
+LOCAL_DOC_ROOT = Path("ce").resolve()
+
+CATEGORY_ROOTS: Dict[str, Path] = {
+    "legal":   LOCAL_DOC_ROOT / "legal",
+    "finance": LOCAL_DOC_ROOT / "finance",
+}
+
+# Where to write FAISS indices
+FAISS_INDEX_DIR = Path("/opt/ml/faiss_indices").resolve()
+
+# ===================== S3 DOC CONFIG (for Textract) =====================
+
+S3_DOC_BUCKET = "YOUR_SOURCE_DOC_BUCKET"       # TODO: change this
+S3_DOC_PREFIX = "user/d/ce"                    # TODO: adjust to your layout
+
+# ===================== AWS / BEDROCK / TEXTRACT CONFIG =====================
+
+REGION      = os.getenv("AWS_REGION", "us-east-1")
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+
+AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+
+import boto3
+from boto3 import Session
+
+if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+    SESSION = Session(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=REGION,
+    )
+else:
+    SESSION = Session(region_name=REGION)
+
+TEXTRACT_CLIENT = SESSION.client("textract")
+
+TEXTRACT_POLL_INTERVAL = 5  # seconds
+
+# ===================== CHUNKING CONFIG =====================
+
+CHUNK_SIZE    = 1200
+CHUNK_OVERLAP = 150
+
+# ===================== PER-FILE HYPERPARAM CONFIG =====================
+
+# Global defaults (used if not overridden)
+DEFAULT_K = 4
+DEFAULT_MAX_TOKENS = 2000
+DEFAULT_TEMPERATURE = 0.0
+
+HPARAM_CONFIG_PATH = Path("config/hparam_overrides.json").resolve()
+
+
+def load_hparam_overrides_from_file() -> Dict[str, Dict[str, float]]:
+    """
+    Load per-file hyperparameter overrides from a JSON config file.
+
+    Expected JSON structure:
+    {
+      "FileName1.pdf": {
+        "pages": 27,
+        "k": 5,
+        "max_tokens": 2600,
+        "temperature": 0.0
+      },
+      ...
+    }
+    """
+    if not HPARAM_CONFIG_PATH.exists():
+        print(f"[INFO] No hyperparam config found at {HPARAM_CONFIG_PATH}, using defaults only.")
+        return {}
+
+    try:
+        text = HPARAM_CONFIG_PATH.read_text(encoding="utf-8")
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            print(f"[WARN] Hyperparam config {HPARAM_CONFIG_PATH} must be a JSON object; ignoring.")
+            return {}
+        return data
+    except Exception as e:
+        print(f"[WARN] Failed to load hyperparam config {HPARAM_CONFIG_PATH}: {e}")
+        return {}
+
+
+HPARAM_OVERRIDES: Dict[str, Dict[str, float]] = load_hparam_overrides_from_file()
+
+
+# ===================== HELPERS =====================
+
+def local_path_to_s3_key(path: Path) -> Optional[str]:
+    """
+    Map a local path under LOCAL_DOC_ROOT to the S3 key used for Textract.
+    Example:
+      LOCAL_DOC_ROOT = /opt/ml/input/ce
+      path           = /opt/ml/input/ce/legal/ClientA/file1.pdf
+      relative       = legal/ClientA/file1.pdf
+      S3_DOC_PREFIX  = "user/d/ce"
+      => S3 key      = "user/d/ce/legal/ClientA/file1.pdf"
+    """
+    try:
+        rel = path.resolve().relative_to(LOCAL_DOC_ROOT.resolve())
+    except ValueError:
+        print(f"[WARN] Path {path} is not under LOCAL_DOC_ROOT {LOCAL_DOC_ROOT}; cannot map to S3 key.")
+        return None
+
+    rel_key = rel.as_posix()
+    if S3_DOC_PREFIX:
+        return f"{S3_DOC_PREFIX.rstrip('/')}/{rel_key}"
+    else:
+        return rel_key
+
+
+def load_metadata_for_file(doc_path: Path) -> Optional[dict]:
+    """
+    Given a document path like:
+      /.../deal1.pdf
+    we look for:
+      /.../deal1.pdf.metadata.json
+    or (fallback)
+      /.../deal1.pdf.metadata
+
+    We then return the metadataAtrributes block (preferred),
+    or the whole JSON if that key is missing.
+    """
+    meta_candidates = [
+        doc_path.with_name(doc_path.name + ".metadata.json"),
+        doc_path.with_name(doc_path.name + ".metadata"),
+    ]
+
+    for meta_path in meta_candidates:
+        if not meta_path.exists():
+            continue
+
+        try:
+            text = meta_path.read_text(encoding="utf-8", errors="ignore").strip()
+            data = json.loads(text)
+        except Exception as e:
+            print(f"[WARN] Failed to read metadata for {doc_path} from {meta_path}: {e}")
+            continue
+
+        meta_block = (
+            data.get("metadataAtrributes")
+            or data.get("metadataAttributes")
+            or data
+        )
+        return meta_block
+
+    return None
+
+
+def clean_text(t: str) -> str:
+    """Light cleanup; keep punctuation and newlines."""
+    return re.sub(r"[ \t]+\n", "\n", t or "").strip()
+
+
+def chunk_text(
+    text: str,
+    chunk_size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP
+) -> List[Tuple[int, int, str]]:
+    """
+    Split `text` into chunks with overlap.
+    Returns list of (start_idx, end_idx, chunk_text).
+    """
+    text = text or ""
+    n = len(text)
+    if n <= chunk_size:
+        return [(0, n, text)]
+    chunks = []
+    start = 0
+    while start < n:
+        end = min(n, start + chunk_size)
+        chunk = text[start:end]
+        chunks.append((start, end, chunk))
+        if end == n:
+            break
+        start = max(0, end - overlap)
+    return chunks
+
+
+@dataclass
+class DocInfo:
+    policy_id: str
+    source_file: str
+    pages: int
+    modified_time: int
+    metadata: Optional[dict] = None
+    k: int = DEFAULT_K
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    temperature: float = DEFAULT_TEMPERATURE
+
+
+def get_hparams_for_file(path: Path, metadata: Optional[dict]) -> Dict[str, float]:
+    """
+    Decide hyperparameters for this file.
+
+    We use:
+      - HPARAM_OVERRIDES[filename] if present
+      - Otherwise global defaults
+    """
+    key = path.name
+    override = HPARAM_OVERRIDES.get(key, {}) or {}
+
+    k = int(override.get("k", DEFAULT_K))
+    max_tokens = int(override.get("max_tokens", DEFAULT_MAX_TOKENS))
+    temperature = float(override.get("temperature", DEFAULT_TEMPERATURE))
+
+    return {
+        "k": k,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+
+def embedder():
+    return BedrockEmbeddings(
+        model_id=EMBED_MODEL,
+        client=SESSION.client("bedrock-runtime")
+    )
+
+
+# ===================== CLIENT SCAN (LOCAL FOLDERS) =====================
+
+def scan_category_client_files() -> Dict[str, Dict[str, List[Path]]]:
+    """
+    Returns:
+      {
+        "finance": {
+          "ClientA/subfolder1": [Path(...), ...],
+          ...
+        },
+        "legal": {
+          "client1": [Path(...), ...],
+          ...
+        }
+      }
+    """
+    out: Dict[str, Dict[str, List[Path]]] = {}
+
+    for category, root in CATEGORY_ROOTS.items():
+        if not root.exists():
+            print(f"[WARN] Category root does not exist: {root}")
+            continue
+
+        cat_map: Dict[str, List[Path]] = {}
+
+        if category == "legal":
+            # Original behavior: client folder directly under ce/legal
+            for client_dir in root.iterdir():
+                if not client_dir.is_dir():
+                    continue
+
+                client_id = client_dir.name.strip().lower()
+
+                pdfs = list(client_dir.rglob("*.pdf"))
+                docs = list(client_dir.rglob("*.doc")) + list(client_dir.rglob("*.docx"))
+                files = sorted(pdfs + docs, key=lambda p: p.name.lower())
+
+                if not files:
+                    continue
+
+                cat_map.setdefault(client_id, []).extend(files)
+
+        elif category == "finance":
+            # New behavior: subfolder-wise inside each client
+            for client_dir in root.iterdir():
+                if not client_dir.is_dir():
+                    continue
+
+                for sub_dir in client_dir.rglob("*"):
+                    if not sub_dir.is_dir():
+                        continue
+
+                    rel = sub_dir.relative_to(root)
+                    if str(rel) == client_dir.name:
+                        continue
+
+                    client_id = rel.as_posix()  # "client1/subA"
+
+                    pdfs = list(sub_dir.glob("*.pdf"))
+                    docs = list(sub_dir.glob("*.doc")) + list(sub_dir.glob("*.docx"))
+                    files = sorted(pdfs + docs, key=lambda p: p.name.lower())
+
+                    if not files:
+                        continue
+
+                    cat_map.setdefault(client_id, []).extend(files)
+
+        if cat_map:
+            out[category] = cat_map
+
+    return out
+
+
+# ===================== SCANNED PDF DETECTION & TEXTRACT =====================
+
+def is_scanned_pdf(pdf_path: Path, sample_pages: int = 3, char_threshold: int = 50) -> bool:
+    """
+    Heuristic:
+      - Open PDF with PyMuPDF.
+      - Sample up to `sample_pages` pages.
+      - If total extracted text length < char_threshold * sampled_pages,
+        treat as scanned.
+    """
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            n_pages = doc.page_count
+            if n_pages == 0:
+                return True
+            to_sample = min(n_pages, sample_pages)
+            total_chars = 0
+            for i in range(to_sample):
+                page = doc.load_page(i)
+                txt = page.get_text("text") or ""
+                total_chars += len(txt.strip())
+            if total_chars < char_threshold * to_sample:
+                return True
+            return False
+    except Exception as e:
+        print(f"[WARN] Failed to inspect {pdf_path} for scanned detection: {e}")
+        # If we can't read text at all, treat as scanned
+        return True
+
+
+def textract_start_job(bucket: str, key: str) -> Optional[str]:
+    try:
+        resp = TEXTRACT_CLIENT.start_document_text_detection(
+            DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}}
+        )
+        job_id = resp["JobId"]
+        print(f"[TEXTRACT] Started job {job_id} for s3://{bucket}/{key}")
+        return job_id
+    except Exception as e:
+        print(f"[WARN] Failed to start Textract job for s3://{bucket}/{key}: {e}")
+        return None
+
+
+def textract_wait_for_job(job_id: str) -> bool:
+    while True:
+        try:
+            resp = TEXTRACT_CLIENT.get_document_text_detection(
+                JobId=job_id,
+                MaxResults=1
+            )
+        except Exception as e:
+            print(f"[WARN] get_document_text_detection failed for JobId {job_id}: {e}")
+            return False
+
+        status = resp.get("JobStatus")
+        if status == "SUCCEEDED":
+            print(f"[TEXTRACT] Job {job_id} SUCCEEDED")
+            return True
+        if status in ("FAILED", "PARTIAL_SUCCESS"):
+            print(f"[WARN] Textract job {job_id} ended with status {status}")
+            return False
+
+        print(f"[TEXTRACT] Job {job_id} status {status}, waiting...")
+        time.sleep(TEXTRACT_POLL_INTERVAL)
+
+
+def textract_collect_blocks(job_id: str) -> List[dict]:
+    blocks: List[dict] = []
+    next_token: Optional[str] = None
+
+    while True:
+        kwargs = {"JobId": job_id, "MaxResults": 1000}
+        if next_token:
+            kwargs["NextToken"] = next_token
+
+        resp = TEXTRACT_CLIENT.get_document_text_detection(**kwargs)
+        blocks.extend(resp.get("Blocks", []))
+        next_token = resp.get("NextToken")
+        if not next_token:
+            break
+
+    return blocks
+
+
+def textract_pdf_to_page_texts_s3(pdf_path: Path) -> List[Tuple[int, str]]:
+    """
+    Call Textract on the S3 version of this PDF and return per-page text.
+    """
+    s3_key = local_path_to_s3_key(pdf_path)
+    if not s3_key:
+        return []
+
+    job_id = textract_start_job(S3_DOC_BUCKET, s3_key)
+    if not job_id:
+        return []
+
+    if not textract_wait_for_job(job_id):
+        return []
+
+    blocks = textract_collect_blocks(job_id)
+    if not blocks:
+        return []
+
+    page_lines: Dict[int, List[str]] = defaultdict(list)
+    for b in blocks:
+        if b.get("BlockType") == "LINE":
+            text = (b.get("Text") or "").strip()
+            if not text:
+                continue
+            page_num = int(b.get("Page") or 1)
+            page_lines[page_num].append(text)
+
+    page_texts: List[Tuple[int, str]] = []
+    for page_num in sorted(page_lines.keys()):
+        combined = "\n".join(page_lines[page_num])
+        combined = clean_text(combined)
+        if combined.strip():
+            page_texts.append((page_num, combined))
+
+    return page_texts
+
+
+# ===================== CHUNKING FOR FILE TYPES =====================
+
+def make_chunks_for_pdf(pdf_path: Path, category: str, client_id: str) -> Iterable[Document]:
+    """
+    For PDFs:
+      - If likely scanned -> use Textract via S3
+      - Else -> use PyMuPDF text
+    Then chunk and yield LangChain Document objects.
+    """
+    page_texts: List[Tuple[int, str]] = []
+
+    scanned = is_scanned_pdf(pdf_path)
+    if scanned:
+        print(f"[PDF] {pdf_path} appears scanned, using Textract via S3")
+        page_texts = textract_pdf_to_page_texts_s3(pdf_path)
+    else:
+        try:
+            with fitz.open(str(pdf_path)) as doc:
+                for i in range(doc.page_count):
+                    txt = clean_text(doc.load_page(i).get_text("text") or "")
+                    if txt.strip():
+                        page_texts.append((i + 1, txt))
+        except Exception as e:
+            print(f"[WARN] Failed to read PDF {pdf_path} with PyMuPDF: {e}")
+            # As a last resort, try Textract
+            page_texts = textract_pdf_to_page_texts_s3(pdf_path)
+
+    if not page_texts:
+        print(f"[WARN] No text found for PDF {pdf_path}")
+        return
+
+    # Combine all text to chunk
+    combined = ""
+    page_ranges: List[Tuple[int, int, int]] = []  # (start_idx, end_idx, page_num)
+    cursor = 0
+
+    for page_num, txt in page_texts:
+        start = cursor
+        combined += txt + "\n"
+        cursor = len(combined)
+        page_ranges.append((start, cursor, page_num))
+
+    for c_start, c_end, chunk in chunk_text(combined):
+        pages = sorted({
+            page_num
+            for p_start, p_end, page_num in page_ranges
+            if not (p_end <= c_start or p_start >= c_end)
+        })
+        if not pages:
+            continue
+
+        meta = {
+            "category": category,
+            "client_id": client_id,
+            "policy_id": pdf_path.name,
+            "page_start": pages[0],
+            "page_end": pages[-1],
+            "source_file": str(pdf_path.resolve()),
+            "extracted_by": "pymupdf_or_textract",
+        }
+        yield Document(page_content=chunk, metadata=meta)
+
+
+def make_chunks_for_docx(doc_path: Path, category: str, client_id: str) -> Iterable[Document]:
+    if not _HAS_PYTHON_DOCX:
+        print(f"[WARN] python-docx not available; skipping {doc_path}")
+        return
+
+    if doc_path.suffix.lower() != ".docx":
+        print(f"[WARN] Skipping non-DOCX file in DOCX handler: {doc_path}")
+        return
+
+    policy_id = doc_path.name
+    print(f"[DEBUG] Starting DOCX extraction for {doc_path}")
+
+    try:
+        doc = DocxDocument(str(doc_path))
+    except Exception as e:
+        print(f"[WARN] Failed to open DOCX {doc_path} with python-docx: {e}")
+        return
+
+    texts = []
+    for para in doc.paragraphs:
+        t = (para.text or "").strip()
+        if t:
+            texts.append(t)
+
+    full_text = "\n".join(texts).strip()
+    if not full_text:
+        print(f"[DEBUG] No text found in DOCX {doc_path}")
+        return
+
+    chunks = chunk_text(full_text)
+    print(f"[DEBUG] Generated {len(chunks)} chunks for DOCX {doc_path}")
+
+    for logical_page, (_, _, chunk) in enumerate(chunks, start=1):
+        meta = {
+            "category": category,
+            "client_id": client_id,
+            "policy_id": policy_id,
+            "page": logical_page,
+            "source_file": str(doc_path.resolve()),
+            "extracted_by": "python-docx",
+        }
+        yield Document(page_content=chunk, metadata=meta)
+
+
+def make_chunks_for_file(path: Path, category: str, client_id: str) -> Iterable[Document]:
+    suf = path.suffix.lower()
+    if suf == ".pdf":
+        yield from make_chunks_for_pdf(path, category, client_id)
+    elif suf in (".doc", ".docx"):
+        yield from make_chunks_for_docx(path, category, client_id)
+    else:
+        print(f"[INFO] Skipping unsupported file type: {path}")
+
+
+def build_manifest_entry(path: Path) -> DocInfo:
+    pages = 0
+    if path.suffix.lower() == ".pdf":
+        try:
+            with fitz.open(str(path)) as doc:
+                pages = doc.page_count
+        except Exception:
+            pages = 0
+
+    stat = path.stat()
+    meta = load_metadata_for_file(path)
+
+    hparams = get_hparams_for_file(path, meta)
+
+    return DocInfo(
+        policy_id=path.name,
+        source_file=str(path.resolve()),
+        pages=pages,
+        modified_time=int(stat.st_mtime),
+        metadata=meta,
+        k=hparams["k"],
+        max_tokens=hparams["max_tokens"],
+        temperature=hparams["temperature"],
+    )
+
+
+# ===================== INDEX BUILDING =====================
+
+def index_client(category: str, client_id: str, files: List[Path]) -> None:
+    client_dir = FAISS_INDEX_DIR / category / client_id
+    client_dir.mkdir(parents=True, exist_ok=True)
+
+    docs: List[Document] = []
+    manifest_rows: List[DocInfo] = []
+
+    for path in files:
+        print(f"[{category}/{client_id}] Processing {path}")
+        manifest_rows.append(build_manifest_entry(path))
+        for doc in make_chunks_for_file(path, category, client_id):
+            docs.append(doc)
+
+    if not docs:
+        print(f"[{category}/{client_id}] No extractable text; skipping index.")
+        return
+
+    print(f"[{category}/{client_id}] Building FAISS with {len(docs)} chunks…")
+    vs = FAISS.from_documents(docs, embedder())
+    vs.save_local(str(client_dir))
+
+    manifest = {
+        "category": category,
+        "client_id": client_id,
+        "docs": [
+            {
+                "policy_id": m.policy_id,
+                "source_file": m.source_file,
+                "pages": m.pages,
+                "modified_time": m.modified_time,
+                "metadata": m.metadata,
+                "k": m.k,
+                "max_tokens": m.max_tokens,
+                "temperature": m.temperature,
+            }
+            for m in manifest_rows
+        ],
+        "generated_time": int(time.time()),
+    }
+
+    (client_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+    print(f"[{category}/{client_id}] Done. Index at {client_dir}")
+
+
+# ===================== ENTRYPOINT =====================
+
+def main():
+    FAISS_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+    by_cat_client = scan_category_client_files()
+    if not by_cat_client:
+        print("No files (PDF/DOC/DOCX) found under any category root.")
+        return
+
+    for category, clients in by_cat_client.items():
+        for client_id, files in clients.items():
+            print(f"\n==== Indexing {category}/{client_id} with {len(files)} file(s) ====")
+            index_client(category, client_id, files)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+from __future__ import annotations
+
+import os
+import json
+import re
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
+
+import pandas as pd
+from boto3 import Session
+from langchain_aws import BedrockEmbeddings, ChatBedrock
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# ===================== CONFIG =====================
+
+# TODO: set this correctly (the same root used by your indexer)
+FAISS_INDEX_DIR    = Path("/ABS/PATH/TO/faiss_indices").resolve()
+FINANCE_INDEX_ROOT = FAISS_INDEX_DIR / "finance"
+
+OUTPUT_DIR         = Path("./finance_query_exports").resolve()
+
+# Run only for a single finance client id (relative under finance/), or "" for ALL
+# Example: "BMW/us"
+TARGET_CLIENT_ID = ""   # "" => run for all finance clients
+
+# 🔹 FIELD_DEFS:
+#   key   = JSON field name (Excel column name AND JSON key)
+#   value = dict:
+#             "query": natural-language retrieval question for RAG + LLM
+#             "type":  optional hint: "free_text", "date", "yes_no", "list_of_dict", etc.
+#
+# 👉 IMPORTANT:
+#  - Keys MUST match exactly the JSON keys in your system prompt.
+#  - Put ALL your ~42 fields here, in the ORDER you want them in Excel / FlatString.
+FIELD_DEFS: Dict[str, Dict[str, str]] = {
+    # ==== EXAMPLES – replace with YOUR real 42 fields ====
+    "the name of the company": {
+        "query": "What is the legal name of the company (contracting party) in this contract?",
+        "type": "free_text",
+    },
+    "contract_period.START DATE": {
+        "query": "What is the contract start date or effective date of this agreement? Return only the date.",
+        "type": "date",
+    },
+    "contract_period.END DATE": {
+        "query": "What is the contract end date, expiration date, or termination date if specified?",
+        "type": "date",
+    },
+    "renewal_terms:renewal_period": {
+        "query": "What are the renewal terms and renewal period for this contract?",
+        "type": "free_text",
+    },
+    "can fee be applied to all countries": {
+        "query": (
+            "Does the fee or COLA apply to all countries covered by this contract? "
+            "Answer Yes/No/NA and explain briefly in free text."
+        ),
+        "type": "yes_no",
+    },
+    "extracted_clauses": {
+        "query": (
+            "Extract all clauses related to COLA or material price adjustments. "
+            "For each clause, return an object with: "
+            "clause_type (e.g. 'COLA material'), "
+            "clause_text (exact text from the contract), and "
+            "section_reference (section number or reference if available). "
+            "The field 'extracted_clauses' must be a JSON array of such objects."
+        ),
+        "type": "list_of_dict",
+    },
+    # 🔻 Add the rest of your ~42 fields here:
+    # "field_6": {"query": "Question for field_6", "type": "free_text"},
+    # ...
+    # "field_42": {"query": "Question for field_42", "type": "free_text"},
+}
+
+# Field order (Python 3.7+ preserves dict insertion order)
+FIELD_NAMES: List[str] = list(FIELD_DEFS.keys())
+
+# AWS / Bedrock (prefer env vars / IAM role in real usage)
+AWS_REGION = "us-east-1"
+AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "YOUR_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "YOUR_SECRET_ACCESS_KEY")
+
+EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+# Update to your actual Claude Sonnet model id on Bedrock if different
+LLM_MODEL   = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+
+# --------- DEFAULT RAG / generation params (used as fallback) ----------
+K_DEFAULT        = 4      # default k if manifest doesn't specify
+MAX_TOKENS_DEFAULT = 2000 # default max tokens
+TEMP_DEFAULT       = 0.0  # default temperature
+MAX_SOURCE_LINES   = 10   # max lines in Sources column
+
+# ===================== PROMPT TEMPLATE (system + human, per GROUP) =====================
+
+def build_json_schema_example(field_names_subset: List[str]) -> str:
+    """
+    Build a JSON-like skeleton string with the subset of field names
+    to embed in the system prompt.
+    """
+    lines = ["{"]
+    for i, field in enumerate(field_names_subset):
+        field_type = FIELD_DEFS[field].get("type", "free_text")
+        comma = "," if i < len(field_names_subset) - 1 else ""
+        lines.append(f'  "{field}": "<{field_type}>"{comma}')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+PROMPT_MULTI = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """
+Instructions:
+1. You are a precise, client-scoped contract assistant for FINANCE documents.
+2. Use ONLY the Provided Context, which comes from a single client’s policies/contracts.
+3. Answer only about the given client and the given policy (file).
+4. If the context is insufficient to answer something, explicitly say you don’t know and what is missing.
+5. Do NOT hallucinate, infer, or invent terms that are not clearly stated in the contract.
+6. Do NOT add citations, references, or bracket labels in any of the field values.
+7. Follow the output JSON schema exactly: use the exact field names expected by the calling system.
+8. Do NOT output anything except:
+   - a single JSON object with the required fields, and
+   - on the next line, a single semicolon-separated string of all field values for these fields.
+
+Important notes:
+1. The Provided Context may contain multiple relevant clauses; treat them as part of the same contract.
+2. When the contract is silent on a question, do NOT guess. Return "NA" or an empty string, as appropriate.
+3. For Yes/No/NA fields, the value MUST be exactly one of: "Yes", "No", or "NA".
+4. Free-text fields may contain any text: extracted clauses, explanations, references to sections, etc.
+5. Some fields may be booleans, dates, numbers, lists, or nested objects; return them as valid JSON values.
+6. Dates should be in ISO format "YYYY-MM-DD" where possible.
+7. Monetary amounts should include currency or units if given.
+8. If there are multiple relevant clauses for a field, summarize them or include them clearly.
+9. Be internally consistent across all fields; do not contradict yourself.
+10. Never change, rename, add, or remove keys from the JSON schema.
+11. All output must be valid UTF-8 and valid JSON in the first line.
+12. Do NOT wrap the JSON or the semicolon string in backticks or any other markup.
+
+You MUST output a single JSON object with EXACTLY {num_fields} keys.
+The keys must be exactly these (order matters):
+
+{json_schema_example}
+
+In addition to this JSON object, you MUST also output, on the NEXT line only,
+a single semicolon-separated string that contains ALL {num_fields} values in the SAME ORDER
+as the JSON, WITHOUT labels.
+
+Rules for the semicolon-separated string:
+- It must contain exactly {num_fields} values separated by ';'.
+- Do not include field names, labels, or quotes around the entire string.
+- Use the same order of fields as in the JSON.
+- If a value is NA or empty, still include an empty position between semicolons.
+- Do NOT output any text before the JSON.
+- Do NOT output any text after the semicolon-separated string.
+"""
+    ),
+    (
+        "human",
+        """
+Client: {client_id}
+Policy (file): {policy_id}
+
+Questions / aspects to consider when filling these {num_fields} JSON fields:
+{questions_block}
+
+Provided Context (from this client's file only):
+{context}
+
+Now produce:
+1) Exactly ONE JSON object with these {num_fields} fields as specified in the system instructions.
+2) On the next line, exactly ONE semicolon-separated string with the {num_fields} values
+   in the same order, without labels.
+"""
+    ),
+])
+
+# ===================== Helpers =====================
+
+import re  # you already import re above, so this is fine
+
+def extract_json_block(text: str) -> str:
+    """
+    Extract the JSON object from an LLM response that looks like:
+
+      ## JSON Output
+      ```json
+      { ... }
+      ```
+      ## Semicolon Divided String
+      ...
+
+    Returns the JSON string (e.g. '{ "1": { "answer": "..." }, ... }')
+
+    Raises ValueError if nothing is found.
+    """
+    # 1) Prefer fenced ```json ... ``` block
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # 2) Fallback: first { ... } after "## JSON Output"
+    m = re.search(r"##\s*JSON\s*Output.*?(\{.*?\})",
+                  text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # 3) Last fallback: any { ... } in the text
+    m = re.search(r"(\{.*\})", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    raise ValueError("No JSON block found in LLM output")
+
+
+def list_finance_clients(root: Path) -> List[str]:
+    if not root.exists():
+        return []
+    clients: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        filenames_set = set(filenames)
+        if "index.faiss" in filenames_set and "index.pkl" in filenames_set:
+            p = Path(dirpath)
+            rel = p.relative_to(root)
+            client_id = rel.as_posix()
+            clients.append(client_id)
+    return sorted(set(clients))
+
+
+def load_vs_for_client(client_id: str, session: Session) -> FAISS:
+    emb = BedrockEmbeddings(
+        model_id=EMBED_MODEL,
+        client=session.client("bedrock-runtime"),
+    )
+    index_dir = FINANCE_INDEX_ROOT / client_id
+    return FAISS.load_local(str(index_dir), emb, allow_dangerous_deserialization=True)
+
+
+def format_docs_for_llm(docs) -> str:
+    chunks = []
+    for d in docs:
+        m = d.metadata or {}
+        chunk = (
+            f"(client_id: {m.get('client_id')}, "
+            f"category: {m.get('category')}, "
+            f"policy: {m.get('policy_id')}, "
+            f"page: {m.get('page', m.get('page_start', '?'))})\n"
+            f"{d.page_content}"
+        )
+        chunks.append(chunk)
+    return "\n\n".join(chunks)
+
+
+def shorten_source_path(source_file: str, client_id: str) -> str:
+    if not source_file:
+        return ""
+    s = str(source_file)
+    idx = s.find(client_id)
+    if idx != -1:
+        return s[idx:]
+    return Path(s).name
+
+
+def build_sources_summary(docs, client_id: str, max_lines: int = MAX_SOURCE_LINES) -> str:
+    seen = set()
+    lines: List[str] = []
+    for d in docs:
+        m = d.metadata or {}
+        policy_id = m.get("policy_id") or Path(m.get("source_file", "")).name or "UNKNOWN_POLICY"
+        raw_source_file = m.get("source_file", "")
+        short_path = shorten_source_path(raw_source_file, client_id)
+
+        page = m.get("page")
+        page_start = m.get("page_start")
+        page_end = m.get("page_end")
+
+        if page is not None:
+            page_str = str(page)
+        elif page_start is not None and page_end is not None:
+            page_str = f"{page_start}-{page_end}" if page_start != page_end else str(page_start)
+        elif page_start is not None:
+            page_str = str(page_start)
+        else:
+            page_str = "?"
+
+        key = (policy_id, page_str, short_path)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        lines.append(f"Document: {policy_id} ; Page no.: {page_str} ")
+
+        if len(lines) >= max_lines:
+            break
+    return "\n".join(lines)
+
+
+def sanitize_filename(s: str) -> str:
+    s = s.replace("/", "_")
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
+
+
+def load_manifest_for_client(client_id: str) -> List[Dict[str, Any]]:
+    """
+    Read manifest.json generated by indexer.py for this finance client.
+    Each doc entry may contain:
+      policy_id, source_file, pages, modified_time, metadata,
+      k, max_tokens, temperature
+    """
+    manifest_path = FINANCE_INDEX_ROOT / client_id / "manifest.json"
+    if not manifest_path.exists():
+        print(f"[WARN] No manifest.json for client '{client_id}' at {manifest_path}")
+        return []
+
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[WARN] Failed to read manifest for '{client_id}': {e}")
+        return []
+
+    docs = data.get("docs", [])
+    if not isinstance(docs, list):
+        print(f"[WARN] manifest.json for '{client_id}' has no 'docs' list")
+        return []
+    return docs
+
+# ===================== LLM per FILE-GROUP (2 calls per file) =====================
+
+def answer_fields_for_file_group(
+    session: Session,
+    client_id: str,
+    policy_id: str,
+    field_names_subset: List[str],
+    group_label: str,
+    k: int,
+    max_tokens: int,
+    temperature: float,
+) -> Tuple[Dict[str, str], str]:
+    """
+    For a given client_id + policy_id and subset of field names:
+
+      1) Retrieve context separately for each field's retrieval query.
+      2) Union all retrieved chunks as a single context for the LLM.
+      3) Make ONE Claude call that fills only these fields + semicolon string.
+      4) Return:
+           - values_by_field_subset: { field_name -> value string }
+           - sources_summary: newline-separated sources summary
+
+    Uses per-file hyperparameters:
+      - k           => retriever top-k
+      - max_tokens  => LLM max tokens
+      - temperature => LLM temperature
+    """
+    values_by_field_subset: Dict[str, str] = {}
+
+    if not field_names_subset:
+        return values_by_field_subset, ""
+
+    print(
+        f"[INFO] Building context for client='{client_id}', policy='{policy_id}', "
+        f"group='{group_label}', k={k}, max_tokens={max_tokens}, temperature={temperature}"
+    )
+
+    vs = load_vs_for_client(client_id, session)
+    retriever = vs.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": k},
+    )
+
+    cid_norm = client_id.strip().lower()
+    pol_norm = policy_id.strip().lower()
+
+    all_docs = []
+
+    # ---- RAG: each field's retrieval query ----
+    for field_name in field_names_subset:
+        q = FIELD_DEFS[field_name]["query"]
+        print(f"[DEBUG] Retrieval query for this file/group: field='{field_name}', query='{q}'")
+        docs = retriever.get_relevant_documents(q)
+        print(f"[DEBUG] Retrieved {len(docs)} docs for client='{client_id}', policy='{policy_id}', field='{field_name}'")
+
+        filtered = []
+        for d in docs:
+            m = d.metadata or {}
+            meta_cid = str(m.get("client_id", "")).strip().lower()
+            meta_cat = str(m.get("category", "")).strip().lower()
+            meta_pol = str(m.get("policy_id", "")).strip().lower()
+            print(
+                f"[DEBUG] doc meta: client_id='{meta_cid}', "
+                f"category='{meta_cat}', policy='{meta_pol}'"
+            )
+
+            # Strict: same client, finance category, same file (policy)
+            if meta_cid == cid_norm and meta_cat == "finance" and meta_pol == pol_norm:
+                filtered.append(d)
+
+        if not filtered:
+            print(
+                f"[WARN] No docs passed metadata filter for client='{client_id}', "
+                f"policy='{policy_id}', field='{field_name}'. Using all {len(docs)} retrieved docs."
+            )
+            filtered = docs
+
+        all_docs.extend(filtered)
+
+    # Deduplicate docs in context
+    seen = set()
+    unique_docs = []
+    for d in all_docs:
+        m = d.metadata or {}
+        key = (
+            m.get("policy_id"),
+            m.get("page"),
+            m.get("page_start"),
+            m.get("page_end"),
+            m.get("source_file"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_docs.append(d)
+
+    if not unique_docs:
+        print(f"[WARN] No usable context docs for client='{client_id}', policy='{policy_id}', group='{group_label}'.")
+        sources_summary = ""
+        return values_by_field_subset, sources_summary
+
+    context_text = format_docs_for_llm(unique_docs)
+
+    num_fields = len(field_names_subset)
+    questions_block = "\n".join(
+        f"- {FIELD_DEFS[field]['query']}" for field in field_names_subset
+    )
+    json_schema_example = build_json_schema_example(field_names_subset)
+
+    llm = ChatBedrock(
+        client=session.client("bedrock-runtime"),
+        model_id=LLM_MODEL,
+        model_kwargs={
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
+        },
+    )
+
+    chain = PROMPT_MULTI | llm | StrOutputParser()
+
+    try:
+        llm_output = chain.invoke({
+            "client_id": client_id,
+            "policy_id": policy_id,
+            "questions_block": questions_block,
+            "context": context_text,
+            "num_fields": num_fields,
+            "json_schema_example": json_schema_example,
+        })
+    except Exception as e:
+        print(f"[WARN] LLM error for client='{client_id}', policy='{policy_id}', group='{group_label}': {type(e).__name__}: {e}")
+        llm_output = ""
+
+    # ---- DEBUG: save raw LLM output for this file + group ----
+    debug_dir = OUTPUT_DIR / "llm_raw"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    debug_file = debug_dir / (
+        f"{sanitize_filename(client_id)}__{sanitize_filename(policy_id)}__{group_label}.txt"
+    )
+    try:
+        debug_file.write_text(llm_output or "", encoding="utf-8")
+        print(f"[DEBUG] Saved raw LLM output to {debug_file}")
+    except Exception as e:
+        print(f"[WARN] Could not save raw LLM output: {e}")
+
+    # ---- JSON extraction (JSON-only output expected) ----
+    llm_output = (llm_output or "").strip()
+
+    # Try to extract a JSON block (handles accidental headings / fences)
+    try:
+        json_str = extract_json_block(llm_output)
+    except ValueError:
+        # If no special markers, assume the whole output is the JSON
+        json_str = llm_output
+        print(f"[INFO] Using full LLM output as JSON for client='{client_id}', policy='{policy_id}', group='{group_label}'")
+
+    try:
+        parsed = json.loads(json_str)
+    except Exception as e:
+        print(f"[WARN] Failed to parse JSON for client='{client_id}', policy='{policy_id}', group='{group_label}': {e}")
+        print(f"[DEBUG] JSON candidate was:\n{json_str}")
+        parsed = {}
+
+    if isinstance(parsed, dict):
+        expected = set(field_names_subset)
+        actual   = set(parsed.keys())
+        missing  = expected - actual
+        extra    = actual - expected
+        if missing:
+            print(f"[WARN] Missing keys in LLM JSON for {client_id}/{policy_id} group='{group_label}': {missing}")
+        if extra:
+            print(f"[WARN] Unexpected keys in LLM JSON for {client_id}/{policy_id} group='{group_label}': {extra}")
+    else:
+        print(f"[WARN] Parsed JSON is not an object for {client_id}/{policy_id}, group='{group_label}', type={type(parsed)}")
+        parsed = {}
+
+    # Convert values to strings for Excel (serialize dict/list as JSON string)
+    for field in field_names_subset:
+        value = parsed.get(field, "")
+        if value is None:
+            values_by_field_subset[field] = ""
+        elif isinstance(value, (dict, list)):
+            values_by_field_subset[field] = json.dumps(value, ensure_ascii=False)
+        else:
+            values_by_field_subset[field] = str(value)
+
+    sources_summary = build_sources_summary(unique_docs, client_id=client_id, max_lines=MAX_SOURCE_LINES)
+    return values_by_field_subset, sources_summary
+
+# ===================== Main =====================
+
+def main():
+    if not FIELD_NAMES:
+        raise SystemExit("FIELD_DEFS is empty. Please define your JSON fields in FIELD_DEFS.")
+
+    # Split fields into two groups for 2 LLM calls per file
+    n_fields = len(FIELD_NAMES)
+    mid = n_fields // 2
+    GROUP_1_FIELDS = FIELD_NAMES[:mid]
+    GROUP_2_FIELDS = FIELD_NAMES[mid:]
+
+    print(f"Total fields: {n_fields}")
+    print(f"Group 1 fields ({len(GROUP_1_FIELDS)}): {GROUP_1_FIELDS}")
+    print(f"Group 2 fields ({len(GROUP_2_FIELDS)}): {GROUP_2_FIELDS}")
+
+    all_clients = list_finance_clients(FINANCE_INDEX_ROOT)
+    if not all_clients:
+        raise SystemExit(f"No finance clients found under {FINANCE_INDEX_ROOT}")
+
+    print("Finance clients found:")
+    for c in all_clients:
+        print("  -", c)
+
+    if TARGET_CLIENT_ID:
+        clients = [c for c in all_clients if c == TARGET_CLIENT_ID]
+        if not clients:
+            raise SystemExit(
+                f"\nTARGET_CLIENT_ID='{TARGET_CLIENT_ID}' not found.\n"
+                f"Make sure there is a folder: {FINANCE_INDEX_ROOT / TARGET_CLIENT_ID} "
+                f"with index.faiss and index.pkl."
+            )
+        print(f"\nRunning ONLY for client: {TARGET_CLIENT_ID}")
+    else:
+        clients = all_clients
+        print("\nRunning for ALL finance clients.")
+
+    session = Session(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
+    )
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    for client_id in clients:
+        print(f"\n=== Client: {client_id} ===")
+
+        safe_name = sanitize_filename(client_id)
+        out_path = OUTPUT_DIR / f"finance_queries_{safe_name}.xlsx"
+
+        # Optional: skip if already created
+        if out_path.exists():
+            print(f"  -> Skipping {client_id}: {out_path} already exists.")
+            continue
+
+        manifest_docs = load_manifest_for_client(client_id)
+        if not manifest_docs:
+            print(f"[WARN] No manifest docs for client '{client_id}', skipping.")
+            continue
+
+        rows: List[Dict[str, Any]] = []
+
+        for doc_info in manifest_docs:
+            policy_id = doc_info.get("policy_id") or Path(doc_info.get("source_file", "")).name
+            source_file = doc_info.get("source_file", "")
+
+            # 🔹 Get per-file hyperparams (from manifest, else defaults)
+            doc_k = int(doc_info.get("k", K_DEFAULT))
+            doc_max_tokens = int(doc_info.get("max_tokens", MAX_TOKENS_DEFAULT))
+            doc_temperature = float(doc_info.get("temperature", TEMP_DEFAULT))
+
+            print(
+                f"  -> File (policy): {policy_id} "
+                f"[k={doc_k}, max_tokens={doc_max_tokens}, temperature={doc_temperature}]"
+            )
+
+            # ---- LLM Call 1: Group 1 fields ----
+            vals_1, sources_1 = answer_fields_for_file_group(
+                session=session,
+                client_id=client_id,
+                policy_id=policy_id,
+                field_names_subset=GROUP_1_FIELDS,
+                group_label="group1",
+                k=doc_k,
+                max_tokens=doc_max_tokens,
+                temperature=doc_temperature,
+            )
+
+            # ---- LLM Call 2: Group 2 fields ----
+            vals_2, sources_2 = answer_fields_for_file_group(
+                session=session,
+                client_id=client_id,
+                policy_id=policy_id,
+                field_names_subset=GROUP_2_FIELDS,
+                group_label="group2",
+                k=doc_k,
+                max_tokens=doc_max_tokens,
+                temperature=doc_temperature,
+            )
+
+            # Merge values
+            values_all: Dict[str, str] = {}
+            for field in FIELD_NAMES:
+                if field in vals_1:
+                    values_all[field] = vals_1[field]
+                elif field in vals_2:
+                    values_all[field] = vals_2[field]
+                else:
+                    values_all[field] = ""
+
+            # Build FlatString from ALL fields in order
+            flat_values = [values_all.get(field, "") for field in FIELD_NAMES]
+            flat_string = ";".join(flat_values)
+
+            # Merge sources summaries
+            sources_summary_parts = []
+            if sources_1:
+                sources_summary_parts.append("[Group 1]\n" + sources_1)
+            if sources_2:
+                sources_summary_parts.append("[Group 2]\n" + sources_2)
+            sources_summary = "\n\n".join(sources_summary_parts)
+
+            row: Dict[str, Any] = {
+                "Client": client_id,
+                "Policy": policy_id,
+                "Source File": source_file,
+                "FlatString": flat_string,
+                "Sources": sources_summary,
+            }
+
+            for field in FIELD_NAMES:
+                row[field] = values_all.get(field, "")
+
+            rows.append(row)
+
+        if not rows:
+            print(f"[WARN] No rows generated for client '{client_id}'.")
+            continue
+
+        df = pd.DataFrame(rows)
+        df.to_excel(out_path, index=False)
+        print(f"  -> Saved: {out_path}")
+
+    print("\nAll client exports completed.")
+
+
+if __name__ == "__main__":
+    main()
