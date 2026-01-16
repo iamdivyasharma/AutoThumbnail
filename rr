@@ -1,0 +1,64 @@
+def _build_nl_answer(self, query: str, resolved: List[Dict[str, Any]], scopes: List[str], docs_preview: List[Dict[str, Any]]) -> str:
+    q = (query or "").lower().strip()
+
+    client_txt = ""
+    country_txt = ""
+
+    if resolved:
+        r = resolved[0]
+        client_txt = str(r.get("client_name") or "")
+        country_txt = str(r.get("country") or "")
+
+    # If user asked for file names / list docs
+    if any(x in q for x in ["file", "files", "file name", "filenames", "documents", "docs", "list"]):
+        if not scopes:
+            return "I could not find any matching scope/index folders for that client and country."
+
+        if not docs_preview:
+            return f"I found the scope {scopes[0]} but the manifest did not return any documents."
+
+        names = [d.get("policy_id") for d in docs_preview if d.get("policy_id")]
+        total = len(names)
+
+        top = ", ".join(names[:8])
+        more = "" if total <= 8 else f" (and {total-8} more)"
+
+        return f"I found {total} contract files for {client_txt} in {country_txt} under scope {scopes[0]}. Top files: {top}{more}."
+
+    # If user asked CAPID / CID
+    if any(x in q for x in ["capid", "cap id", "cid", "client id", "clientid"]):
+        if not resolved:
+            return "I could not resolve the client from your query."
+        cid_val = resolved[0].get("cid")
+        return f"The client id (CID/CAPID) for {client_txt} in {country_txt} is {cid_val}."
+
+    # Default generic answer
+    if not resolved:
+        return "I could not resolve the client and country from your query."
+
+    if scopes:
+        return f"I resolved {client_txt} in {country_txt}. Available scope(s): {', '.join(scopes[:5])}."
+    return f"I resolved {client_txt} in {country_txt}, but no matching FAISS scope was found."
+
+
+
+
+answer = self._build_nl_answer(query=query, resolved=matches[:1], scopes=scopes, docs_preview=docs_preview)
+
+return {
+    "answer": answer,
+    "query": query,
+    "category": category,
+    "resolved": matches[:1],
+    "scopes": scopes,
+    "docs_preview": docs_preview,
+    "manifest_count": len(self.scope_to_manifest),
+}
+
+
+@app.post("/api/metadata/lookup")
+def metadata_lookup(req: MetadataLookupRequest):
+    svc.ensure_loaded()
+    return svc.lookup(query=req.query, category=req.category or "finance", country=req.country)
+
+
