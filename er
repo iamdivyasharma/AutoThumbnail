@@ -1,0 +1,240 @@
+from __future__ import annotations
+
+import os
+import uuid
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+# ✅ Load .env automatically (recommended)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# ✅ AWS Bedrock (optional for LLM answering)
+import boto3
+from boto3 import Session
+
+# ✅ Your service (MUST be inside services/metadata_service.py)
+from services.metadata_service import MetadataService
+
+
+# ============================================================
+# ENV CONFIG
+# ============================================================
+
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+BEDROCK_LLM_MODEL = os.getenv(
+    "BEDROCK_LLM_MODEL",
+    "anthropic.claude-3-5-sonnet-20240620-v1:0",  # replace if you want Claude Sonnet 4.5 in Bedrock
+)
+
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+
+FAISS_INDEX_DIR = os.getenv("FAISS_INDEX_DIR", "/opt/ml/faiss_indices")
+
+CLIENT_MASTER_CSV = os.getenv("CLIENT_MASTER_CSV", "Excel/Contractextraction list1.csv")
+SCHEMA_JSON_PATH = os.getenv("SCHEMA_JSON_PATH", "data/client_master_schema.json")
+
+# column names in your CSV
+CLIENT_NAME_COL = os.getenv("CLIENT_NAME_COL", "parent_hq")
+COUNTRY_COL = os.getenv("COUNTRY_COL", "country__c")
+CID_COL = os.getenv("CID_COL", "cid")
+
+DEFAULT_LIMIT = int(os.getenv("METADATA_DEFAULT_LIMIT", "10"))
+
+
+# ============================================================
+# AWS SESSION (safe)
+# ============================================================
+
+if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+    SESSION = Session(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
+    )
+else:
+    # ✅ Best practice on SageMaker: use IAM role
+    SESSION = Session(region_name=AWS_REGION)
+
+BEDROCK_RUNTIME = SESSION.client("bedrock-runtime")
+
+
+# ============================================================
+# FASTAPI APP
+# ============================================================
+
+app = FastAPI(
+    title="Metadata Lookup API (CAPID/CID/Manifest Lookup)",
+    version="1.0.0",
+    description="Metadata Lookup using Client Master CSV + Schema + FAISS manifests",
+)
+
+
+# ============================================================
+# SIMPLE SESSION MEMORY
+# (keeps last resolved client/country/scopes so user can ask follow-ups)
+# ============================================================
+
+_SESSION_MEMORY: Dict[str, Dict[str, Any]] = {}
+
+
+# ============================================================
+# Pydantic Models
+# ============================================================
+
+class MetadataLookupRequest(BaseModel):
+    query: str = Field(..., description="Natural language query like: 'capid for google us'")
+    category: Optional[str] = Field(default="finance", description="finance or legal")
+    country: Optional[str] = Field(default=None, description="US, UK, INDIA, etc.")
+    use_llm: bool = Field(default=False, description="If true, return a natural language answer using Bedrock LLM")
+    session_id: Optional[str] = Field(default=None, description="Session id for follow-up queries (optional)")
+    limit: Optional[int] = Field(default=None, description="Max matches to return")
+
+
+class MetadataLookupResponse(BaseModel):
+    session_id: str
+    query: str
+    category: str
+    country: Optional[str]
+    answer_text: Optional[str]
+    top_matches: List[Dict[str, Any]]
+    scopes: List[str]
+    docs_preview: List[Dict[str, Any]]
+
+
+# ============================================================
+# Metadata Service Init
+# ============================================================
+
+svc = MetadataService(
+    client_master_csv_path=CLIENT_MASTER_CSV,
+    schema_json_path=SCHEMA_JSON_PATH,
+    faiss_index_dir=FAISS_INDEX_DIR,
+    client_name_col=CLIENT_NAME_COL,
+    country_col=COUNTRY_COL,
+    cid_col=CID_COL,
+)
+svc.ensure_loaded()
+
+
+# ============================================================
+# LLM Answer builder (optional)
+# ============================================================
+
+def _llm_answer_from_lookup(query: str, lookup_result: Dict[str, Any], session_mem: Dict[str, Any]) -> str:
+    """
+    Takes lookup_result dict (top_matches + scopes + docs_preview),
+    and asks Claude to format the final human answer.
+    """
+    # Keep it deterministic
+    system = (
+        "You are a metadata assistant. "
+        "You must answer ONLY from the provided structured result. "
+        "If CAPID/CID is not present, say it is not found. "
+        "If multiple matches exist, list them and ask for country clarification. "
+        "Be short and direct."
+    )
+
+    # Include memory context
+    memory_hint = ""
+    if session_mem:
+        memory_hint = f"\nSession memory:\n{session_mem}\n"
+
+    user = f"""
+User query:
+{query}
+
+Lookup result JSON:
+{lookup_result}
+{memory_hint}
+
+Return the best possible answer for the user.
+"""
+
+    # Bedrock Converse format
+    body = {
+        "messages": [
+            {"role": "user", "content": [{"text": user}]}
+        ],
+        "system": [{"text": system}],
+        "inferenceConfig": {
+            "temperature": 0.0,
+            "maxTokens": 600,
+        },
+    }
+
+    resp = BEDROCK_RUNTIME.converse(
+        modelId=BEDROCK_LLM_MODEL,
+        **body
+    )
+
+    text_out = resp["output"]["message"]["content"][0]["text"]
+    return text_out.strip()
+
+
+# ============================================================
+# Routes
+# ============================================================
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/api/metadata/lookup", response_model=MetadataLookupResponse)
+def metadata_lookup(payload: MetadataLookupRequest):
+    if not payload.query or not payload.query.strip():
+        raise HTTPException(status_code=400, detail="query is required")
+
+    category = (payload.category or "finance").strip().lower()
+    if category not in {"finance", "legal"}:
+        raise HTTPException(status_code=400, detail="category must be finance or legal")
+
+    country = payload.country.strip().upper() if payload.country else None
+    limit = int(payload.limit or DEFAULT_LIMIT)
+
+    # ✅ session memory
+    session_id = payload.session_id or str(uuid.uuid4())
+    mem = _SESSION_MEMORY.get(session_id, {})
+
+    # ✅ run deterministic metadata lookup
+    result = svc.lookup(
+        query=payload.query,
+        category=category,
+        country=country,
+        limit=limit,
+    )
+
+    # store memory for followups
+    _SESSION_MEMORY[session_id] = {
+        "last_query": payload.query,
+        "category": category,
+        "country": country,
+        "scopes": result.get("scopes", []),
+        "top_match": (result.get("top_matches") or [{}])[0],
+    }
+
+    answer_text = None
+    if payload.use_llm:
+        try:
+            answer_text = _llm_answer_from_lookup(payload.query, result, _SESSION_MEMORY[session_id])
+        except Exception as e:
+            answer_text = f"(LLM formatting failed: {e})"
+
+    return MetadataLookupResponse(
+        session_id=session_id,
+        query=payload.query,
+        category=category,
+        country=country,
+        answer_text=answer_text,
+        top_matches=result.get("top_matches", []),
+        scopes=result.get("scopes", []),
+        docs_preview=result.get("docs_preview", []),
+    )
