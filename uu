@@ -1,118 +1,97 @@
-import os
-import re
+# services/metadata_service.py
+from __future__ import annotations
+
 import json
+import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-def _make_acronym(name: str) -> str:
-    """
-    Build acronym from a client name.
-    Example: "A.P. Moller Maersk" -> "APMM"
-    """
-    words = re.split(r"[^A-Za-z0-9]+", name or "")
-    words = [w for w in words if w]
-    if not words:
-        return ""
-    return "".join(w[0].upper() for w in words if w[0].isalnum())
 
 def _norm(s: str) -> str:
-    """Normalize for fuzzy compare: keep only alphanumeric, lowercase."""
-    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
 
-def _best_key_match(target: str, keys: List[str]) -> Optional[str]:
+def _make_acronym(name: str) -> str:
     """
-    Find best matching metadata key for something like "agreement type".
-    Example:
-      target="agreement type"
-      key="APXT_readl...agreement_type_C"
+    Example: "A.P. Moller Maersk" -> "APMM"
     """
-    t = _norm(target)
-    if not t:
-        return None
-
-    # try exact contains match
-    for k in keys:
-        if t in _norm(k):
-            return k
-
-    # fallback: if agreementtype not found, check partial tokens
-    tokens = re.split(r"\s+", target.lower().strip())
-    tokens = [x for x in tokens if x]
-    for k in keys:
-        kn = _norm(k)
-        if all(_norm(tok) in kn for tok in tokens):
-            return k
-
-    return None
+    parts = re.split(r"[^A-Za-z0-9]+", name or "")
+    parts = [p for p in parts if p]
+    return "".join(p[0].upper() for p in parts if p and p[0].isalnum())
 
 
 class MetadataService:
     """
-    Metadata lookup service:
-    - client master CSV (cid, country__c, parent_hq)
-    - FAISS index folder contains manifest.json for each scope
+    Metadata Lookup Service
+    - Reads client master CSV (your Excel exported csv)
+    - Uses schema json (prebuilt once) to know column list/types
+    - Resolves client from natural language (supports acronym match like APMM)
     """
 
     def __init__(
         self,
         client_master_csv_path: str,
-        faiss_index_dir: str,
+        schema_json_path: Optional[str] = None,
         client_name_col: str = "parent_hq",
         country_col: str = "country__c",
         cid_col: str = "cid",
     ):
-        self.client_master_csv_path = Path(client_master_csv_path)
-        self.faiss_index_dir = Path(faiss_index_dir)
+        self.client_master_csv_path = str(client_master_csv_path)
+        self.schema_json_path = str(schema_json_path) if schema_json_path else None
 
         self.client_name_col = client_name_col
         self.country_col = country_col
         self.cid_col = cid_col
 
         self.df: Optional[pd.DataFrame] = None
-        self._id_to_dir: Dict[str, Path] = {}
+        self.schema: Dict[str, Any] = {}
 
-    def ensure_loaded(self):
-        if self.df is None:
-            if not self.client_master_csv_path.exists():
-                raise FileNotFoundError(f"Client master CSV not found: {self.client_master_csv_path}")
-
-            self.df = pd.read_csv(self.client_master_csv_path)
-            # normalize for safe searching
-            self.df[self.client_name_col] = self.df[self.client_name_col].astype(str)
-            self.df[self.country_col] = self.df[self.country_col].astype(str)
-            self.df[self.cid_col] = self.df[self.cid_col].astype(str)
-
-        if not self._id_to_dir:
-            self._refresh_id_map()
-
-    def _refresh_id_map(self):
-        """
-        Build normalized scope-id -> actual folder path mapping
-        Handles case-sensitive folders like AMGEN/US, Amgen/us, etc.
-        """
-        self._id_to_dir = {}
-        if not self.faiss_index_dir.exists():
+    # ----------------------------
+    # Loading
+    # ----------------------------
+    def ensure_loaded(self) -> None:
+        if self.df is not None:
             return
 
-        for dirpath, dirnames, filenames in os.walk(self.faiss_index_dir):
-            dirpath = Path(dirpath)
-            if "manifest.json" in filenames:
-                rel = dirpath.relative_to(self.faiss_index_dir).as_posix()  # finance/AMGEN/US
-                nid = rel.lower()
-                self._id_to_dir[nid] = dirpath
+        csv_path = Path(self.client_master_csv_path)
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Client master CSV not found: {csv_path}")
+
+        # Robust CSV read (works for large files too)
+        self.df = pd.read_csv(
+            csv_path,
+            dtype=str,
+            keep_default_na=False,
+            encoding="utf-8",
+            on_bad_lines="skip",
+        )
+
+        # normalize column names (keep original too)
+        self.df.columns = [str(c).strip() for c in self.df.columns]
+
+        # load schema json (optional)
+        if self.schema_json_path:
+            sp = Path(self.schema_json_path)
+            if sp.exists():
+                try:
+                    self.schema = json.loads(sp.read_text(encoding="utf-8"))
+                except Exception:
+                    self.schema = {}
+            else:
+                self.schema = {}
+
+    # ----------------------------
+    # Client resolve (name + acronym)
+    # ----------------------------
     def _resolve_client_from_query(self, query: str) -> Optional[Dict[str, str]]:
-        """
-        Resolve client from query using:
-        1) Acronym match (APMM)
-        2) Fuzzy contains match on parent_hq name
-        """
+        assert self.df is not None
+
         q = (query or "").strip()
         q_norm = _norm(q)
 
-        # tokens from query (supports APMM typed alone)
+        # tokens from query
         raw_tokens = re.split(r"[^A-Za-z0-9]+", q)
         raw_tokens_upper = {t.upper() for t in raw_tokens if t}
 
@@ -128,21 +107,17 @@ class MetadataService:
             if not name_norm:
                 continue
 
-            # --------- 1) ACRONYM MATCH (strongest) ----------
+            # 1) ACRONYM MATCH (strong)
             acr = _make_acronym(name)
             if acr and acr in raw_tokens_upper:
-                # immediate strong match
                 score = 1000
+
+            # 2) CONTAINS match
+            elif name_norm in q_norm or q_norm in name_norm:
+                score = 500 + min(len(name_norm), 200)
+
             else:
-                # --------- 2) FUZZY CONTAINS ----------
-                # Very tolerant:
-                # - query contains name
-                # - name contains query
-                if name_norm in q_norm or q_norm in name_norm:
-                    score = 500 + min(len(name_norm), 200)
-                else:
-                    # fallback: weak similarity based on shared chunks
-                    score = 0
+                score = 0
 
             if score > best_score:
                 best_score = score
@@ -157,137 +132,44 @@ class MetadataService:
             "country": str(best_row.get(self.country_col, "")).strip(),
         }
 
-    # def _resolve_client_from_query(self, query: str) -> Optional[Dict[str, str]]:
-    #     """
-    #     Resolve client from query using fuzzy contains over parent_hq
-    #     Example: "AMGEn" -> matches "AMGEN"
-    #     """
-    #     qn = _norm(query)
-
-    #     best = None
-    #     best_len = 0
-
-    #     for _, row in self.df.iterrows():
-    #         name = str(row.get(self.client_name_col, "")).strip()
-    #         nn = _norm(name)
-
-    #         if not nn:
-    #             continue
-
-    #         # contains logic (very tolerant)
-    #         if nn in qn or qn in nn:
-    #             if len(nn) > best_len:
-    #                 best = row
-    #                 best_len = len(nn)
-
-    #     if best is None:
-    #         return None
-
-    #     return {
-    #         "client_name": str(best.get(self.client_name_col, "")).strip(),
-    #         "cid": str(best.get(self.cid_col, "")).strip(),
-    #         "country": str(best.get(self.country_col, "")).strip(),
-    #     }
-
-    def _resolve_scope_dir(self, client_name: str, country: Optional[str], category: str) -> Optional[Tuple[str, Path]]:
+    # ----------------------------
+    # Public API used by FastAPI
+    # ----------------------------
+    def lookup(
+        self,
+        query: str,
+        country: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
-        Find the scope folder that matches:
-          finance/<client>/<country>
-        in a case-safe way using the _id_to_dir map.
-        """
-        c = (client_name or "").strip()
-        if not c:
-            return None
-
-        # try direct scope first
-        if country:
-            scope_id = f"{category}/{c}/{country}".lower()
-            if scope_id in self._id_to_dir:
-                return scope_id, self._id_to_dir[scope_id]
-
-        # fallback scopes if no country match
-        for fallback in ["corporatefamily", "ultimateparent"]:
-            scope_id = f"{category}/{c}/{fallback}".lower()
-            if scope_id in self._id_to_dir:
-                return scope_id, self._id_to_dir[scope_id]
-
-        return None
-
-    def _load_manifest_docs(self, scope_dir: Path) -> List[Dict[str, Any]]:
-        manifest_path = scope_dir / "manifest.json"
-        if not manifest_path.exists():
-            return []
-        try:
-            data = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-        return data.get("docs", []) or []
-
-    def lookup_agreement_types(self, query: str, category: str = "finance", country: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Hard-coded useful metadata lookup:
-        agreement type values from manifest.json docs[].metadata
+        Deterministic metadata lookup (no LLM here).
+        Returns resolved client details + matched rows preview.
         """
         self.ensure_loaded()
+        assert self.df is not None
 
-        # Step 1: resolve client from query
         resolved = self._resolve_client_from_query(query)
         if not resolved:
-            return {"answer_text": "Client not found in client master sheet."}
+            return {
+                "found": False,
+                "message": "Client not found in master CSV (try a clearer name).",
+                "resolved_client": None,
+                "rows_preview": [],
+            }
 
-        client_name = resolved["client_name"]
-        cid = resolved["cid"]
-        effective_country = country or resolved.get("country")
+        # Optional country filter
+        df2 = self.df.copy()
+        if country:
+            country_norm = str(country).strip().lower()
+            df2 = df2[df2[self.country_col].astype(str).str.strip().str.lower() == country_norm]
 
-        # Step 2: resolve scope dir
-        resolved_scope = self._resolve_scope_dir(client_name, effective_country, category)
-        if not resolved_scope:
-            return {"answer_text": f"No matching scope folder found for {client_name} ({effective_country})."}
+        # Filter by resolved client name (exact)
+        cname = resolved["client_name"]
+        df2 = df2[df2[self.client_name_col].astype(str).str.strip() == cname]
 
-        scope_id, scope_dir = resolved_scope
+        preview = df2.head(10).to_dict(orient="records")
 
-        # Step 3: read manifest.json docs
-        docs = self._load_manifest_docs(scope_dir)
-        if not docs:
-            return {"answer_text": f"manifest.json found but docs[] is empty for {scope_id}."}
-
-        # Step 4: identify correct metadata key for agreement type
-        all_keys = set()
-        for d in docs:
-            md = d.get("metadata") or {}
-            for k in md.keys():
-                all_keys.add(k)
-
-        match_key = _best_key_match("agreement type", sorted(all_keys))
-        if not match_key:
-            return {"answer_text": f"No agreement type field found in manifest metadata for {scope_id}."}
-
-        # Step 5: extract values per file
-        rows = []
-        for d in docs:
-            policy = d.get("policy_id")
-            md = d.get("metadata") or {}
-            val = md.get(match_key)
-            if val is not None and str(val).strip():
-                rows.append((policy, str(val).strip()))
-
-        if not rows:
-            return {"answer_text": f"Agreement type key exists ({match_key}) but no values found in docs metadata."}
-
-        # Step 6: produce response text
-        uniq = sorted(set(v for _, v in rows))
-        lines = [
-            f"Agreement Types found for {client_name} ({effective_country}) [CID={cid}] in scope {scope_id}:",
-            f"Detected field key: {match_key}",
-            "",
-        ]
-        for policy, v in rows[:50]:
-            lines.append(f"- {policy}: {v}")
-
-        if len(rows) > 50:
-            lines.append(f"... and {len(rows)-50} more files")
-
-        lines.append("")
-        lines.append(f"Unique agreement types: {', '.join(uniq)}")
-
-        return {"answer_text": "\n".join(lines)}
+        return {
+            "found": True,
+            "resolved_client": resolved,
+            "rows_preview": preview,
+        }
