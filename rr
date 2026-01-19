@@ -1,373 +1,307 @@
 # services/metadata_service.py
-
 from __future__ import annotations
-import os
+
 import json
+import os
 import re
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+from difflib import SequenceMatcher
+
+try:
+    from langchain_aws import ChatBedrockConverse
+except Exception:
+    ChatBedrockConverse = None
 
 
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
 
-def _make_acronym(name: str) -> str:
-    """
-    Example: "A.P. Moller Maersk" -> "APMM"
-    """
-    parts = re.split(r"[^A-Za-z0-9]+", name or "")
-    parts = [p for p in parts if p]
-    # take first character of each token
-    return "".join(p[0].upper() for p in parts if p[0].isalnum())
+def _best_match(query: str, choices: List[str]) -> Tuple[Optional[str], float]:
+    """Return (best_choice, score) using SequenceMatcher."""
+    q = _norm(query)
+    best = None
+    best_score = 0.0
+    for c in choices:
+        score = SequenceMatcher(None, q, _norm(c)).ratio()
+        if score > best_score:
+            best_score = score
+            best = c
+    return best, best_score
 
 
-@dataclass
-class LookupResult:
-    found: bool
-    answer_text: str
-    matched_client_name: Optional[str] = None
-    cid: Optional[str] = None
-    country: Optional[str] = None
-    scopes: Optional[List[str]] = None
+def _find_best_key(field_request: str, available_keys: List[str]) -> Optional[str]:
+    """
+    User might ask for 'agreement type' but key in manifest metadata could be:
+      - agreement_type__c
+      - APXT_real_agreement_type_C
+      - Agreement_Type
+    So we fuzzy match keys.
+    """
+    want = _norm(field_request)
+    if not available_keys:
+        return None
+
+    # First: direct contains logic
+    for k in available_keys:
+        nk = _norm(k)
+        if "agreement" in want and "type" in want:
+            if "agreement" in nk and "type" in nk:
+                return k
+
+    # Fuzzy fallback
+    best_key, score = _best_match(field_request, available_keys)
+    if best_key and score >= 0.55:
+        return best_key
+    return None
 
 
 class MetadataService:
     def __init__(
         self,
         client_master_csv_path: str,
-        schema_json_path: Optional[str] = None,
+        schema_json_path: str,
         client_name_col: str = "parent_hq",
         country_col: str = "country__c",
         cid_col: str = "cid",
-        faiss_index_dir: Optional[str] = None,   # ✅ FIX: now accepted
+        faiss_index_dir: str = "/opt/ml/faiss_indices",
+        aws_region: str = "us-east-1",
+        llm_model_id: str = "anthropic.claude-3-5-sonnet-20240620-v1:0",
     ):
         self.client_master_csv_path = Path(client_master_csv_path)
-        self.schema_json_path = Path(schema_json_path) if schema_json_path else None
+        self.schema_json_path = Path(schema_json_path)
 
         self.client_name_col = client_name_col
         self.country_col = country_col
         self.cid_col = cid_col
 
-        # ✅ Optional FAISS root for building scope suggestions like finance/<client>/<country>
-        self.faiss_index_dir = Path(
-            faiss_index_dir or os.getenv("FAISS_INDEX_DIR", "/opt/ml/faiss_indices")
-        )
+        self.faiss_index_dir = Path(faiss_index_dir)
+        self.aws_region = aws_region
+        self.llm_model_id = llm_model_id
 
         self.df: Optional[pd.DataFrame] = None
         self.schema: Dict[str, Any] = {}
-
-        # cached name matching
-        self._names: List[str] = []
-        self._names_norm: List[str] = []
-        self._names_acronym: List[str] = []
+        self._index_map: Dict[str, Path] = {}  # normalized "finance/amgen/us" -> real path
 
     def ensure_loaded(self):
-        if self.df is not None:
+        # Load CSV (deterministic)
+        if self.df is None:
+            if not self.client_master_csv_path.exists():
+                raise FileNotFoundError(f"Client master CSV not found: {self.client_master_csv_path}")
+            self.df = pd.read_csv(self.client_master_csv_path, dtype=str, keep_default_na=False)
+
+        # Load schema json (deterministic)
+        if not self.schema:
+            if self.schema_json_path.exists():
+                self.schema = json.loads(self.schema_json_path.read_text(encoding="utf-8"))
+            else:
+                self.schema = {}
+
+        # Build index folder map once
+        if not self._index_map:
+            self._build_index_map()
+
+    def _build_index_map(self):
+        """
+        Scan FAISS folder structure and create mapping like:
+          finance/amgen/us -> /opt/ml/faiss_indices/finance/AMGEN/US
+        This works even if folder uses uppercase.
+        """
+        idx = {}
+        if not self.faiss_index_dir.exists():
+            self._index_map = idx
             return
 
-        if not self.client_master_csv_path.exists():
-            raise FileNotFoundError(f"Client master CSV not found: {self.client_master_csv_path}")
+        for dirpath, dirnames, filenames in os.walk(self.faiss_index_dir):
+            dirpath = Path(dirpath)
+            if "manifest.json" in filenames:
+                rel = dirpath.relative_to(self.faiss_index_dir).as_posix()
+                idx[_norm(rel).replace(" ", "")] = dirpath
 
-        # ✅ uses CSV only (no BadZipFile Excel errors)
-        self.df = pd.read_csv(self.client_master_csv_path)
+        self._index_map = idx
 
-        # schema optional
-        if self.schema_json_path and self.schema_json_path.exists():
-            self.schema = json.loads(self.schema_json_path.read_text())
-        else:
-            self.schema = {"columns": list(self.df.columns)}
-
-        if self.client_name_col not in self.df.columns:
-            raise ValueError(f"Missing client_name_col='{self.client_name_col}' in CSV columns={list(self.df.columns)}")
-
-        # cache normalized names + acronym
-        self._names = self.df[self.client_name_col].fillna("").astype(str).tolist()
-        self._names_norm = [_norm(x) for x in self._names]
-        self._names_acronym = [_make_acronym(x) for x in self._names]
-
-    def _match_client(self, query: str) -> Optional[int]:
+    def _resolve_client_from_csv(self, query: str) -> Optional[Dict[str, str]]:
         """
-        Return best matching row index in df for client name.
-        Priority:
-          1) Acronym match  (APMM)
-          2) Contains match (google)
-          3) Reverse contains
+        Find best matching client row based on client name column.
+        Works for 'APMM' even if CSV has 'A.P. Moller Maersk'.
         """
-        qn = _norm(query)
-        if not qn:
+        assert self.df is not None
+
+        q = query.strip()
+        if not q:
             return None
 
-        q_tokens = set(qn.split())
-        q_upper_tokens = {t.upper() for t in re.split(r"[^A-Za-z0-9]+", query or "") if t}
+        # create choices list from CSV
+        names = self.df[self.client_name_col].tolist()
+        best_name, score = _best_match(q, names)
 
-        # 1) acronym match
-        for i, ac in enumerate(self._names_acronym):
-            if ac and ac in q_upper_tokens:
-                return i
+        if not best_name or score < 0.40:
+            return None
 
-        # 2) contains match
-        for i, name_norm in enumerate(self._names_norm):
-            if name_norm and name_norm in qn:
-                return i
-
-        # 3) reverse contains (query inside client name)
-        for i, name_norm in enumerate(self._names_norm):
-            if name_norm and qn in name_norm:
-                return i
-
-        # 4) token overlap (light fuzzy)
-        best_i = None
-        best_score = 0
-        for i, name_norm in enumerate(self._names_norm):
-            toks = set(name_norm.split())
-            score = len(toks.intersection(q_tokens))
-            if score > best_score:
-                best_score = score
-                best_i = i
-
-        return best_i if best_score > 0 else None
-
-    def lookup(self, query: str, country: Optional[str] = None, category: str = "finance") -> Dict[str, Any]:
-        """
-        Lookup client/cid/country from client_master CSV.
-        Returns basic info + optional scopes list.
-        """
-        self.ensure_loaded()
-
-        idx = self._match_client(query)
-        if idx is None:
-            return {
-                "found": False,
-                "answer_text": f"Could not find a matching client for '{query}'.",
-                "matched_client_name": None,
-                "cid": None,
-                "country": country,
-                "scopes": [],
-            }
-
-        row = self.df.iloc[idx]
-        client_name = str(row.get(self.client_name_col, "")).strip()
-        cid = str(row.get(self.cid_col, "")).strip() if self.cid_col in self.df.columns else None
-
-        # if country not provided, try from sheet
-        sheet_country = None
-        if self.country_col in self.df.columns:
-            sheet_country = str(row.get(self.country_col, "")).strip()
-
-        final_country = (country or sheet_country or "").strip()
-
-        # produce scopes (these will only be suggestions)
-        scopes = []
-        client_folder_guess = client_name.strip().lower().replace(" ", "_")
-
-        if final_country:
-            scopes.append(f"{category}/{client_folder_guess}/{final_country.lower()}")
-        scopes.append(f"{category}/{client_folder_guess}/ultimateparent")
-        scopes.append(f"{category}/{client_folder_guess}/corporatefamily")
-
-        answer_text = f"Client: {client_name}"
-        if cid:
-            answer_text += f", CID/CAPID: {cid}"
-        if final_country:
-            answer_text += f", Country: {final_country}"
+        # pick first row match (if duplicates exist)
+        row = self.df[self.df[self.client_name_col] == best_name].iloc[0].to_dict()
 
         return {
-            "found": True,
-            "answer_text": answer_text,
-            "matched_client_name": client_name,
-            "cid": cid,
-            "country": final_country,
-            "scopes": scopes,
+            "client_name": row.get(self.client_name_col, ""),
+            "cid": row.get(self.cid_col, ""),
+            "country": row.get(self.country_col, ""),
         }
 
+    def _find_scope_path(self, category: str, client_name: str, country: Optional[str]) -> Optional[Path]:
+        """
+        Convert resolved client_name/country to scope path:
+          finance/amgen/us
+        and locate the real folder path (case insensitive).
+        """
+        cat = (category or "finance").strip().lower()
 
-# services/metadata_service.py
+        client_norm = _norm(client_name).replace(" ", "")
+        if not client_norm:
+            return None
 
-from __future__ import annotations
-import os
-import json
-import re
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Dict, Any, List
+        if country:
+            country_norm = _norm(country).replace(" ", "")
+            scope_id = f"{cat}/{client_norm}/{country_norm}"
+            return self._index_map.get(scope_id)
 
-import pandas as pd
+        # fallback
+        scope_id_cf = f"{cat}/{client_norm}/corporatefamily"
+        scope_id_up = f"{cat}/{client_norm}/ultimateparent"
+        return self._index_map.get(scope_id_cf) or self._index_map.get(scope_id_up)
 
+    def _load_manifest(self, scope_path: Path) -> Dict[str, Any]:
+        manifest_path = scope_path / "manifest.json"
+        if not manifest_path.exists():
+            return {}
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
 
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
-
-
-def _make_acronym(name: str) -> str:
-    """
-    Example: "A.P. Moller Maersk" -> "APMM"
-    """
-    parts = re.split(r"[^A-Za-z0-9]+", name or "")
-    parts = [p for p in parts if p]
-    # take first character of each token
-    return "".join(p[0].upper() for p in parts if p[0].isalnum())
-
-
-@dataclass
-class LookupResult:
-    found: bool
-    answer_text: str
-    matched_client_name: Optional[str] = None
-    cid: Optional[str] = None
-    country: Optional[str] = None
-    scopes: Optional[List[str]] = None
-
-
-class MetadataService:
-    def __init__(
+    def lookup(
         self,
-        client_master_csv_path: str,
-        schema_json_path: Optional[str] = None,
-        client_name_col: str = "parent_hq",
-        country_col: str = "country__c",
-        cid_col: str = "cid",
-        faiss_index_dir: Optional[str] = None,   # ✅ FIX: now accepted
-    ):
-        self.client_master_csv_path = Path(client_master_csv_path)
-        self.schema_json_path = Path(schema_json_path) if schema_json_path else None
-
-        self.client_name_col = client_name_col
-        self.country_col = country_col
-        self.cid_col = cid_col
-
-        # ✅ Optional FAISS root for building scope suggestions like finance/<client>/<country>
-        self.faiss_index_dir = Path(
-            faiss_index_dir or os.getenv("FAISS_INDEX_DIR", "/opt/ml/faiss_indices")
-        )
-
-        self.df: Optional[pd.DataFrame] = None
-        self.schema: Dict[str, Any] = {}
-
-        # cached name matching
-        self._names: List[str] = []
-        self._names_norm: List[str] = []
-        self._names_acronym: List[str] = []
-
-    def ensure_loaded(self):
-        if self.df is not None:
-            return
-
-        if not self.client_master_csv_path.exists():
-            raise FileNotFoundError(f"Client master CSV not found: {self.client_master_csv_path}")
-
-        # ✅ uses CSV only (no BadZipFile Excel errors)
-        self.df = pd.read_csv(self.client_master_csv_path)
-
-        # schema optional
-        if self.schema_json_path and self.schema_json_path.exists():
-            self.schema = json.loads(self.schema_json_path.read_text())
-        else:
-            self.schema = {"columns": list(self.df.columns)}
-
-        if self.client_name_col not in self.df.columns:
-            raise ValueError(f"Missing client_name_col='{self.client_name_col}' in CSV columns={list(self.df.columns)}")
-
-        # cache normalized names + acronym
-        self._names = self.df[self.client_name_col].fillna("").astype(str).tolist()
-        self._names_norm = [_norm(x) for x in self._names]
-        self._names_acronym = [_make_acronym(x) for x in self._names]
-
-    def _match_client(self, query: str) -> Optional[int]:
+        query: str,
+        country: Optional[str] = None,
+        category: str = "finance",
+        limit: int = 50,
+        use_llm: bool = False,
+        **kwargs,
+    ) -> Dict[str, Any]:
         """
-        Return best matching row index in df for client name.
-        Priority:
-          1) Acronym match  (APMM)
-          2) Contains match (google)
-          3) Reverse contains
-        """
-        qn = _norm(query)
-        if not qn:
-            return None
-
-        q_tokens = set(qn.split())
-        q_upper_tokens = {t.upper() for t in re.split(r"[^A-Za-z0-9]+", query or "") if t}
-
-        # 1) acronym match
-        for i, ac in enumerate(self._names_acronym):
-            if ac and ac in q_upper_tokens:
-                return i
-
-        # 2) contains match
-        for i, name_norm in enumerate(self._names_norm):
-            if name_norm and name_norm in qn:
-                return i
-
-        # 3) reverse contains (query inside client name)
-        for i, name_norm in enumerate(self._names_norm):
-            if name_norm and qn in name_norm:
-                return i
-
-        # 4) token overlap (light fuzzy)
-        best_i = None
-        best_score = 0
-        for i, name_norm in enumerate(self._names_norm):
-            toks = set(name_norm.split())
-            score = len(toks.intersection(q_tokens))
-            if score > best_score:
-                best_score = score
-                best_i = i
-
-        return best_i if best_score > 0 else None
-
-    def lookup(self, query: str, country: Optional[str] = None, category: str = "finance") -> Dict[str, Any]:
-        """
-        Lookup client/cid/country from client_master CSV.
-        Returns basic info + optional scopes list.
+        ✅ Main method used by app.py
+        Returns dict containing answer_text only (simple)
         """
         self.ensure_loaded()
 
-        idx = self._match_client(query)
-        if idx is None:
+        # 1) Resolve client info from CSV
+        resolved = self._resolve_client_from_csv(query)
+        if not resolved:
+            return {"answer_text": f"Client not found in master CSV for query: {query}"}
+
+        client_name = resolved["client_name"]
+        cid = resolved["cid"]
+
+        # 2) Determine country (request overrides CSV)
+        resolved_country = (country or resolved["country"] or "").strip()
+        if resolved_country:
+            resolved_country = resolved_country.upper()
+
+        # 3) Find scope folder
+        scope_path = self._find_scope_path(category, client_name, resolved_country)
+        if not scope_path:
             return {
-                "found": False,
-                "answer_text": f"Could not find a matching client for '{query}'.",
-                "matched_client_name": None,
-                "cid": None,
-                "country": country,
-                "scopes": [],
+                "answer_text": (
+                    f"Found client '{client_name}' (CID={cid}) "
+                    f"but no manifest folder found under {self.faiss_index_dir} for country='{resolved_country}'."
+                )
             }
 
-        row = self.df.iloc[idx]
-        client_name = str(row.get(self.client_name_col, "")).strip()
-        cid = str(row.get(self.cid_col, "")).strip() if self.cid_col in self.df.columns else None
+        # 4) Read manifest.json
+        manifest = self._load_manifest(scope_path)
+        docs = manifest.get("docs", [])
+        if not docs:
+            return {"answer_text": f"Manifest found for {client_name} but has no docs."}
 
-        # if country not provided, try from sheet
-        sheet_country = None
-        if self.country_col in self.df.columns:
-            sheet_country = str(row.get(self.country_col, "")).strip()
+        docs = docs[: min(limit, len(docs))]
 
-        final_country = (country or sheet_country or "").strip()
+        # 5) If user asks "file names" -> list them
+        qn = _norm(query)
+        if "file" in qn or "files" in qn or "document" in qn or "documents" in qn:
+            names = [d.get("policy_id") for d in docs if d.get("policy_id")]
+            if not names:
+                return {"answer_text": f"No filenames found in manifest for {client_name}."}
 
-        # produce scopes (these will only be suggestions)
-        scopes = []
-        client_folder_guess = client_name.strip().lower().replace(" ", "_")
+            out = "\n".join([f"- {n}" for n in names])
+            return {"answer_text": f"Files under {client_name} ({resolved_country}):\n{out}"}
 
-        if final_country:
-            scopes.append(f"{category}/{client_folder_guess}/{final_country.lower()}")
-        scopes.append(f"{category}/{client_folder_guess}/ultimateparent")
-        scopes.append(f"{category}/{client_folder_guess}/corporatefamily")
+        # 6) Otherwise try to answer attributes like "agreement type"
+        # Collect available keys across all doc metadata
+        all_keys = set()
+        for d in docs:
+            meta = d.get("metadata") or {}
+            if isinstance(meta, dict):
+                for k in meta.keys():
+                    all_keys.add(k)
 
-        answer_text = f"Client: {client_name}"
-        if cid:
-            answer_text += f", CID/CAPID: {cid}"
-        if final_country:
-            answer_text += f", Country: {final_country}"
+        keys = sorted(all_keys)
 
+        # choose key based on query request
+        field_key = _find_best_key(query, keys)
+        if not field_key:
+            # fallback: if user asked for capid/cid
+            if "capid" in qn or "cap id" in qn or "client id" in qn or "cid" in qn:
+                return {
+                    "answer_text": f"Client '{client_name}' has CID={cid} and country={resolved_country}."
+                }
+
+            # show keys preview
+            sample_keys = ", ".join(keys[:20]) if keys else "(none)"
+            return {"answer_text": f"I found {client_name} but couldn't detect which metadata field you want. Example keys: {sample_keys}"}
+
+        # Extract values per file for that field
+        rows = []
+        for d in docs:
+            pol = d.get("policy_id", "")
+            meta = d.get("metadata") or {}
+            val = meta.get(field_key) if isinstance(meta, dict) else None
+            if val:
+                rows.append(f"- {pol}: {field_key} = {val}")
+
+        if not rows:
+            return {"answer_text": f"I found {client_name} docs but '{field_key}' is empty/not present in those files."}
+
+        facts_text = "\n".join(rows)
+
+        # 7) Optional LLM summary (NO hallucination allowed)
+        if use_llm and ChatBedrockConverse is not None:
+            import boto3
+            llm = ChatBedrockConverse(
+                model_id=self.llm_model_id,
+                client=boto3.client("bedrock-runtime", region_name=self.aws_region),
+                temperature=0.0,
+                max_tokens=600,
+            )
+
+            prompt = (
+                "You are a strict metadata assistant.\n"
+                "Use ONLY the facts provided below.\n"
+                "Do NOT guess anything.\n"
+                "Answer in 3-5 lines, summarize clearly.\n\n"
+                f"FACTS:\n{facts_text}\n\n"
+                f"QUESTION: {query}\n"
+            )
+
+            try:
+                resp = llm.invoke(prompt)
+                return {"answer_text": str(resp)}
+            except Exception:
+                pass
+
+        # Default deterministic answer
         return {
-            "found": True,
-            "answer_text": answer_text,
-            "matched_client_name": client_name,
-            "cid": cid,
-            "country": final_country,
-            "scopes": scopes,
+            "answer_text": (
+                f"Client: {client_name} (CID={cid}) Country={resolved_country}\n"
+                f"Field matched: {field_key}\n"
+                f"{facts_text}"
+            )
         }
-
