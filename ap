@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from services.metadata_service import MetadataService
+
+# Load .env if present (works in SageMaker + local)
+load_dotenv()
+
+# -------------------- CONFIG (via .env) --------------------
+
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+BEDROCK_EMBED_MODEL = os.getenv("BEDROCK_EMBED_MODEL", "amazon.titan-embed-text-v2:0")
+BEDROCK_LLM_MODEL = os.getenv(
+    "BEDROCK_LLM_MODEL",
+    # You can change this to your Claude Sonnet model id
+    "anthropic.claude-3-5-sonnet-20240620-v1:0",
+)
+
+FAISS_INDEX_DIR = Path(os.getenv("FAISS_INDEX_DIR", "/opt/ml/faiss_indices")).resolve()
+
+# Your master CSV (you said this path)
+CLIENT_MASTER_CSV = Path(
+    os.getenv("CLIENT_MASTER_CSV", "Excel/Contractextraction list1.csv")
+).resolve()
+
+# Schema JSON generated one-time from your sheet
+CLIENT_MASTER_SCHEMA_JSON = Path(
+    os.getenv("CLIENT_MASTER_SCHEMA_JSON", "data/client_master_schema.json")
+).resolve()
+
+# Column names in your CSV
+CLIENT_NAME_COL = os.getenv("CLIENT_NAME_COL", "parent_hq")
+COUNTRY_COL = os.getenv("COUNTRY_COL", "country__c")
+CID_COL = os.getenv("CID_COL", "cid")
+
+# -------------------- APP --------------------
+
+app = FastAPI(title="Metadata Lookup API", version="2.0")
+
+svc = MetadataService(
+    aws_region=AWS_REGION,
+    embed_model_id=BEDROCK_EMBED_MODEL,
+    llm_model_id=BEDROCK_LLM_MODEL,
+    faiss_index_dir=str(FAISS_INDEX_DIR),
+    client_master_csv_path=str(CLIENT_MASTER_CSV),
+    schema_json_path=str(CLIENT_MASTER_SCHEMA_JSON),
+    client_name_col=CLIENT_NAME_COL,
+    country_col=COUNTRY_COL,
+    cid_col=CID_COL,
+)
+
+
+@app.on_event("startup")
+def _startup():
+    # Load CSV + schema + scan manifest.json files once
+    svc.ensure_loaded()
+
+
+# -------------------- API Models --------------------
+
+class MetadataLookupRequest(BaseModel):
+    query: str = Field(..., description="Natural language query")
+    category: Optional[str] = Field(
+        default=None, description="legal|finance (optional)"
+    )
+    country: Optional[str] = Field(
+        default=None, description="Country code like US, UK, INDIA (optional)"
+    )
+    session_id: Optional[str] = Field(
+        default=None, description="Optional session for memory"
+    )
+    use_llm: bool = Field(
+        default=True,
+        description="Use LLM to parse the query + generate final answer",
+    )
+
+
+class MetadataLookupResponse(BaseModel):
+    answer: str
+
+
+# -------------------- Routes --------------------
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "faiss_index_dir": str(FAISS_INDEX_DIR),
+        "client_master_csv": str(CLIENT_MASTER_CSV),
+        "schema_json": str(CLIENT_MASTER_SCHEMA_JSON),
+        "bedrock_region": AWS_REGION,
+    }
+
+
+@app.post("/api/metadata/lookup", response_model=MetadataLookupResponse)
+def metadata_lookup(payload: MetadataLookupRequest):
+    if not payload.query or not payload.query.strip():
+        raise HTTPException(400, "Missing query")
+
+    try:
+        answer = svc.lookup(
+            query=payload.query.strip(),
+            category=payload.category,
+            country=payload.country,
+            session_id=payload.session_id,
+            use_llm=bool(payload.use_llm),
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Lookup failed: {e}")
+
+    return MetadataLookupResponse(answer=answer)
