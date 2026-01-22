@@ -2,19 +2,18 @@ from __future__ import annotations
 
 import os
 import re
-import json
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple, Iterable, Optional
 from urllib.parse import urlparse
 
+import boto3
 import fitz  # PyMuPDF
 
 from langchain.schema import Document
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import AmazonTextractPDFLoader
 from langchain_aws import BedrockEmbeddings
-import boto3
 
 
 # ========================= CONFIG =========================
@@ -95,10 +94,7 @@ def build_s3_uri(client_id: str, filename: str, s3_root_uri: str) -> str:
 # ------------------- Local PDF Scan -----------------------
 
 def scan_local_pdfs_by_client_folder(root: Path) -> Dict[str, List[Path]]:
-    """
-    ✅ Client ID comes from local folder name only.
-    root/<client_folder>/*.pdf
-    """
+    
     out: Dict[str, List[Path]] = {}
     if not root.exists():
         return out
@@ -115,7 +111,7 @@ def scan_local_pdfs_by_client_folder(root: Path) -> Dict[str, List[Path]]:
 
 def is_scanned_pdf(local_pdf: Path) -> bool:
     """
-    Detect scanned PDF by checking if first N pages have almost no native text.
+    Heuristic: if first N pages have almost no native text => scanned.
     """
     try:
         with fitz.open(str(local_pdf)) as doc:
@@ -136,16 +132,13 @@ def is_scanned_pdf(local_pdf: Path) -> bool:
             return total_chars < SCAN_TOTAL_TEXT_MIN_CHARS
 
     except Exception:
-        # if PyMuPDF fails reading -> treat as scanned
+        # If PyMuPDF can't read -> treat as scanned to attempt Textract
         return True
 
 
 # ------------------- Extractors ---------------------------
 
 def extract_native_pymupdf_chunks(local_pdf: Path, client_id: str) -> Iterable[Document]:
-    """
-    Extract native text from local PDF using PyMuPDF.
-    """
     filename = local_pdf.name
     with fitz.open(str(local_pdf)) as doc:
         for pnum in range(doc.page_count):
@@ -168,12 +161,7 @@ def extract_native_pymupdf_chunks(local_pdf: Path, client_id: str) -> Iterable[D
 
 
 def extract_textract_chunks(s3_pdf_uri: str, client_id: str, local_pdf: Optional[Path] = None) -> Iterable[Document]:
-    """
-    ✅ Uses Textract loader WITHOUT passing client=textract_client
-    ✅ Does NOT call S3 head_object
-    """
     filename = s3_pdf_uri.split("/")[-1]
-
     loader = AmazonTextractPDFLoader(s3_pdf_uri)
     page_docs = loader.load()
 
@@ -207,86 +195,50 @@ def extract_textract_chunks(s3_pdf_uri: str, client_id: str, local_pdf: Optional
 # ---------------- Embeddings / Indexing -------------------
 
 def get_embeddings() -> BedrockEmbeddings:
-    """
-    Bedrock embeddings (uses SageMaker role or AWS env keys).
-    """
     bedrock_runtime = boto3.client("bedrock-runtime", region_name=REGION)
     return BedrockEmbeddings(model_id=EMBED_MODEL, client=bedrock_runtime)
 
 
 def index_one_client(client_id: str, local_pdfs: List[Path], embeddings: BedrockEmbeddings) -> None:
-    """
-    Saves FAISS into FAISS_INDEX_DIR/<client_id>/
-    """
+    
     client_dir = FAISS_INDEX_DIR / client_id
     client_dir.mkdir(parents=True, exist_ok=True)
 
     all_chunks: List[Document] = []
-    manifest_docs: List[dict] = []
 
+    start_t = time.time()
     for local_pdf in local_pdfs:
         filename = local_pdf.name
         scanned = is_scanned_pdf(local_pdf)
         s3_uri = build_s3_uri(client_id, filename, S3_ROOT_URI)
 
-        # pages count from local
-        try:
-            with fitz.open(str(local_pdf)) as doc:
-                pages = doc.page_count
-        except Exception:
-            pages = 0
-
-        chunks_count = 0
-        extracted_by = "pymupdf"
-
-        try:
-            if scanned:
-                extracted_by = "textract"
+        if scanned:
+            print(f"[{client_id}] Scanned -> Textract: {filename}")
+            try:
                 for d in extract_textract_chunks(s3_uri, client_id, local_pdf=local_pdf):
                     all_chunks.append(d)
-                    chunks_count += 1
-            else:
-                extracted_by = "pymupdf"
+            except Exception as e:
+                print(f"[WARN] Textract failed for {s3_uri}: {e}")
+                # If Textract fails, you can still try native extraction:
+                # for d in extract_native_pymupdf_chunks(local_pdf, client_id):
+                #     all_chunks.append(d)
+        else:
+            print(f"[{client_id}] Native -> PyMuPDF: {filename}")
+            try:
                 for d in extract_native_pymupdf_chunks(local_pdf, client_id):
                     all_chunks.append(d)
-                    chunks_count += 1
-
-        except Exception as e:
-            print(f"[WARN] Extraction failed for {local_pdf}: {e}")
-
-        manifest_docs.append(
-            {
-                "client_id": client_id,
-                "policy_id": filename,
-                "local_file": str(local_pdf),
-                "s3_uri": s3_uri,
-                "pages": pages,
-                "scanned": scanned,
-                "extracted_by": extracted_by,
-                "chunks_indexed": chunks_count,
-            }
-        )
+            except Exception as e:
+                print(f"[WARN] PyMuPDF failed for {local_pdf}: {e}")
 
     if not all_chunks:
         print(f"[{client_id}] No chunks extracted. Skipping FAISS.")
         return
 
-    print(f"[{client_id}] Building FAISS with {len(all_chunks)} chunks...")
+    print(f"[{client_id}] Building FAISS with {len(all_chunks)} chunks ...")
     vs = FAISS.from_documents(all_chunks, embeddings)
     vs.save_local(str(client_dir))
 
-    manifest = {
-        "client_id": client_id,
-        "local_root": str(LOCAL_PDF_ROOT),
-        "s3_root": S3_ROOT_URI,
-        "embedding_model": EMBED_MODEL,
-        "region": REGION,
-        "generated_time": int(time.time()),
-        "docs": manifest_docs,
-    }
-    (client_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-
-    print(f"[{client_id}] ✅ Saved FAISS at: {client_dir}")
+    print(f"[{client_id}] Saved FAISS at: {client_dir} (took {time.time() - start_t:.1f}s)")
 
 
 def main():
