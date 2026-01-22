@@ -4,7 +4,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple, Iterable, Optional
+from typing import Dict, List, Tuple, Iterable
 from urllib.parse import urlparse
 
 import boto3
@@ -20,30 +20,23 @@ from langchain_aws import BedrockEmbeddings
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "amazon.titan-embed-text-v2:0")
 
-# Local structure:
-# greenlight/gl_to13/<client_folder>/*.pdf
+# Local: greenlight/gl_to13/<CLIENT_FOLDER>/*.pdf
 LOCAL_PDF_ROOT = Path(os.environ.get("LOCAL_PDF_ROOT", "greenlight/gl_to13")).resolve()
 
-# S3 structure must match:
-# s3://bucket/root/<client_folder>/<same_filename>.pdf
+# S3: s3://bucket/ALL_PDFS/<CLIENT_FOLDER>/<same_filename>.pdf
 S3_ROOT_URI = os.environ.get("S3_ROOT_URI", "s3://YOUR_BUCKET/ALL_PDFS/")
 
-# Output FAISS:
-# FAISS_INDEX_DIR/<client_folder>/
+# Output: FAISS_INDEX_DIR/<CLIENT_FOLDER>/
 FAISS_INDEX_DIR = Path(os.environ.get("FAISS_INDEX_DIR", "/opt/ml/processing/faiss_indices")).resolve()
 
-# Chunking
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "150"))
 
-# Scanned detection thresholds
 SCAN_PAGES_TO_CHECK = int(os.environ.get("SCAN_PAGES_TO_CHECK", "3"))
 SCAN_TEXT_MIN_CHARS_PER_PAGE = int(os.environ.get("SCAN_TEXT_MIN_CHARS_PER_PAGE", "80"))
 SCAN_TOTAL_TEXT_MIN_CHARS = int(os.environ.get("SCAN_TOTAL_TEXT_MIN_CHARS", "150"))
 # ==========================================================
 
-
-# ---------------------- Utilities -------------------------
 
 def clean_text(t: str) -> str:
     t = t or ""
@@ -72,7 +65,7 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> List[Tuple[int, int,
 
 def parse_s3_uri(s3_uri: str) -> tuple[str, str]:
     if not s3_uri.startswith("s3://"):
-        raise ValueError(f"Not a valid S3 URI: {s3_uri}")
+        raise ValueError(f"Invalid S3 URI: {s3_uri}")
     p = urlparse(s3_uri)
     return p.netloc, p.path.lstrip("/")
 
@@ -81,62 +74,59 @@ def ensure_trailing_slash(prefix: str) -> str:
     return prefix if (not prefix or prefix.endswith("/")) else prefix + "/"
 
 
-def build_s3_uri(client_id: str, filename: str, s3_root_uri: str) -> str:
+def s3_uri_from_local_path(local_pdf: Path) -> str:
     """
-    s3://bucket/root/<client_id>/<filename>
+    ✅ Correct mapping:
+    local: LOCAL_PDF_ROOT/<CLIENT_FOLDER>/file.pdf
+    s3:    S3_ROOT_URI/<CLIENT_FOLDER>/file.pdf
+
+    Preserves CLIENT_FOLDER case exactly as local.
     """
-    bucket, root_prefix = parse_s3_uri(s3_root_uri)
-    root_prefix = ensure_trailing_slash(root_prefix)
-    key = f"{root_prefix}{client_id}/{filename}"
+    bucket, s3_prefix = parse_s3_uri(S3_ROOT_URI)
+    s3_prefix = ensure_trailing_slash(s3_prefix)
+
+    rel = local_pdf.relative_to(LOCAL_PDF_ROOT).as_posix()  # preserves folder case
+    key = f"{s3_prefix}{rel}"
     return f"s3://{bucket}/{key}"
 
 
-# ------------------- Local PDF Scan -----------------------
-
 def scan_local_pdfs_by_client_folder(root: Path) -> Dict[str, List[Path]]:
-    
+    """
+    ✅ Client id = folder name exactly (NO lowercasing)
+    """
     out: Dict[str, List[Path]] = {}
-    if not root.exists():
-        return out
-
-    for client_dir in sorted([p for p in root.iterdir() if p.is_dir()], key=lambda x: x.name.lower()):
-        client_id = client_dir.name.strip().lower()
-        pdfs = sorted(list(client_dir.rglob("*.pdf")), key=lambda x: x.name.lower())
+    for client_dir in sorted([p for p in root.iterdir() if p.is_dir()], key=lambda x: x.name):
+        client_id = client_dir.name  # keep case
+        pdfs = sorted(list(client_dir.rglob("*.pdf")), key=lambda x: x.name)
         if pdfs:
             out[client_id] = pdfs
     return out
 
 
-# ---------------- Scanned PDF Detection -------------------
-
 def is_scanned_pdf(local_pdf: Path) -> bool:
     """
-    Heuristic: if first N pages have almost no native text => scanned.
+    If first N pages contain almost no native text => scanned.
     """
     try:
         with fitz.open(str(local_pdf)) as doc:
             pages_to_check = min(doc.page_count, max(1, SCAN_PAGES_TO_CHECK))
             total_chars = 0
-            any_good_text_page = False
+            any_good_page = False
 
             for i in range(pages_to_check):
                 page = doc.load_page(i)
                 txt = clean_text(page.get_text("text") or "")
                 total_chars += len(txt)
                 if len(txt) >= SCAN_TEXT_MIN_CHARS_PER_PAGE:
-                    any_good_text_page = True
+                    any_good_page = True
 
-            if any_good_text_page:
+            if any_good_page:
                 return False
 
             return total_chars < SCAN_TOTAL_TEXT_MIN_CHARS
-
     except Exception:
-        # If PyMuPDF can't read -> treat as scanned to attempt Textract
         return True
 
-
-# ------------------- Extractors ---------------------------
 
 def extract_native_pymupdf_chunks(local_pdf: Path, client_id: str) -> Iterable[Document]:
     filename = local_pdf.name
@@ -144,7 +134,7 @@ def extract_native_pymupdf_chunks(local_pdf: Path, client_id: str) -> Iterable[D
         for pnum in range(doc.page_count):
             page = doc.load_page(pnum)
             text = clean_text(page.get_text("text") or "")
-            if not text.strip():
+            if not text:
                 continue
 
             for _, _, chunk in chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP):
@@ -160,14 +150,19 @@ def extract_native_pymupdf_chunks(local_pdf: Path, client_id: str) -> Iterable[D
                 )
 
 
-def extract_textract_chunks(s3_pdf_uri: str, client_id: str, local_pdf: Optional[Path] = None) -> Iterable[Document]:
-    filename = s3_pdf_uri.split("/")[-1]
+def extract_textract_chunks(s3_pdf_uri: str, client_id: str, local_pdf: Path) -> Iterable[Document]:
+    """
+    ✅ Uses exactly:
+       AmazonTextractPDFLoader(s3_uri)
+    """
+    filename = local_pdf.name
+
     loader = AmazonTextractPDFLoader(s3_pdf_uri)
     page_docs = loader.load()
 
     for d in page_docs:
         page_text = clean_text(d.page_content or "")
-        if not page_text.strip():
+        if not page_text:
             continue
 
         page_num = None
@@ -179,20 +174,16 @@ def extract_textract_chunks(s3_pdf_uri: str, client_id: str, local_pdf: Optional
                 "client_id": client_id,
                 "policy_id": filename,
                 "source_file": s3_pdf_uri,
+                "local_file": str(local_pdf),
                 "extracted_by": "textract",
             }
-            if local_pdf is not None:
-                meta["local_file"] = str(local_pdf)
             if page_num is not None:
                 try:
                     meta["page"] = int(page_num)
                 except Exception:
                     pass
-
             yield Document(page_content=chunk, metadata=meta)
 
-
-# ---------------- Embeddings / Indexing -------------------
 
 def get_embeddings() -> BedrockEmbeddings:
     bedrock_runtime = boto3.client("bedrock-runtime", region_name=REGION)
@@ -200,68 +191,52 @@ def get_embeddings() -> BedrockEmbeddings:
 
 
 def index_one_client(client_id: str, local_pdfs: List[Path], embeddings: BedrockEmbeddings) -> None:
-    
     client_dir = FAISS_INDEX_DIR / client_id
     client_dir.mkdir(parents=True, exist_ok=True)
 
     all_chunks: List[Document] = []
+    t0 = time.time()
 
-    start_t = time.time()
     for local_pdf in local_pdfs:
-        filename = local_pdf.name
         scanned = is_scanned_pdf(local_pdf)
-        s3_uri = build_s3_uri(client_id, filename, S3_ROOT_URI)
+        s3_uri = s3_uri_from_local_path(local_pdf)
 
         if scanned:
-            print(f"[{client_id}] Scanned -> Textract: {filename}")
-            try:
-                for d in extract_textract_chunks(s3_uri, client_id, local_pdf=local_pdf):
-                    all_chunks.append(d)
-            except Exception as e:
-                print(f"[WARN] Textract failed for {s3_uri}: {e}")
-                # If Textract fails, you can still try native extraction:
-                # for d in extract_native_pymupdf_chunks(local_pdf, client_id):
-                #     all_chunks.append(d)
+            print(f"[{client_id}] Scanned -> Textract: {local_pdf.name}")
+            print(f"           ✅ S3 URI: {s3_uri}")
+            for d in extract_textract_chunks(s3_uri, client_id, local_pdf):
+                all_chunks.append(d)
         else:
-            print(f"[{client_id}] Native -> PyMuPDF: {filename}")
-            try:
-                for d in extract_native_pymupdf_chunks(local_pdf, client_id):
-                    all_chunks.append(d)
-            except Exception as e:
-                print(f"[WARN] PyMuPDF failed for {local_pdf}: {e}")
+            print(f"[{client_id}] Native -> PyMuPDF: {local_pdf.name}")
+            for d in extract_native_pymupdf_chunks(local_pdf, client_id):
+                all_chunks.append(d)
 
     if not all_chunks:
-        print(f"[{client_id}] No chunks extracted. Skipping FAISS.")
+        print(f"[{client_id}] No chunks extracted. Skipping.")
         return
 
-    print(f"[{client_id}] Building FAISS with {len(all_chunks)} chunks ...")
+    print(f"[{client_id}] Building FAISS with {len(all_chunks)} chunks...")
     vs = FAISS.from_documents(all_chunks, embeddings)
     vs.save_local(str(client_dir))
 
-    print(f"[{client_id}] Saved FAISS at: {client_dir} (took {time.time() - start_t:.1f}s)")
+    print(f"[{client_id}] ✅ Saved FAISS at: {client_dir} (took {time.time() - t0:.1f}s)")
 
 
 def main():
     if not LOCAL_PDF_ROOT.exists():
-        raise SystemExit(f"LOCAL_PDF_ROOT does not exist: {LOCAL_PDF_ROOT}")
-
-    if not S3_ROOT_URI.startswith("s3://"):
-        raise SystemExit("S3_ROOT_URI must be like s3://bucket/prefix/")
+        raise SystemExit(f"LOCAL_PDF_ROOT not found: {LOCAL_PDF_ROOT}")
 
     FAISS_INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
     local_by_client = scan_local_pdfs_by_client_folder(LOCAL_PDF_ROOT)
     if not local_by_client:
-        print("No local client folders with PDFs found.")
+        print("No local client folders found.")
         return
-
-    total_pdfs = sum(len(v) for v in local_by_client.values())
-    print(f"Found {total_pdfs} PDFs across {len(local_by_client)} client folders.")
 
     embeddings = get_embeddings()
 
     for client_id, pdfs in local_by_client.items():
-        print(f"\n=== Indexing client: {client_id} ({len(pdfs)} PDFs) ===")
+        print(f"\n=== Indexing: {client_id} ({len(pdfs)} PDFs) ===")
         index_one_client(client_id, pdfs, embeddings)
 
 
