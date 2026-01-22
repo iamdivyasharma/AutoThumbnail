@@ -1,0 +1,113 @@
+import pandas as pd
+import json
+import ast
+
+INPUT_FILE = "input.xlsx"
+OUTPUT_FILE = "output_processed.xlsx"
+
+CLIENT_COL_CANDIDATES = ["client", "Client", "CLIENT"]
+DELIM = ".\n\n"   # remove everything BEFORE first ".\n\n"
+
+
+def safe_parse_dict(cell):
+    """Parse dict from JSON string / python-dict-string / actual dict."""
+    if pd.isna(cell):
+        return None
+    if isinstance(cell, dict):
+        return cell
+    if not isinstance(cell, str):
+        return None
+
+    s = cell.strip()
+    if not (s.startswith("{") and s.endswith("}")):
+        return None
+
+    # Try JSON
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # Try Python literal (single quotes etc.)
+    try:
+        return ast.literal_eval(s)
+    except Exception:
+        return None
+
+
+def clean_content_extracted(text):
+    """Remove everything before first '.\\n\\n' inside content_extracted."""
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+
+    idx = text.find(DELIM)
+    if idx == -1:
+        return text.strip()
+
+    return text[idx + len(DELIM):].lstrip()
+
+
+def normalize_sources(src):
+    """Return only the value part of sources (stringify list/dict if needed)."""
+    if src is None:
+        return ""
+    if isinstance(src, (dict, list)):
+        return json.dumps(src, ensure_ascii=False)
+    return str(src).strip()
+
+
+def process_excel(input_file, output_file):
+    df = pd.read_excel(input_file)
+
+    # Detect client column
+    client_col = None
+    for c in CLIENT_COL_CANDIDATES:
+        if c in df.columns:
+            client_col = c
+            break
+
+    # Columns to process = all except client column (if found)
+    cols_to_process = [c for c in df.columns if c != client_col]
+
+    output_rows = []
+
+    for _, row in df.iterrows():
+        content_row = row.copy()
+        sources_row = row.copy()
+
+        content_row["row_type"] = "content"
+        sources_row["row_type"] = "sources"
+
+        for col in cols_to_process:
+            d = safe_parse_dict(row[col])
+
+            # If cell isn't a dict like {"content_extracted":..., "sources":...}, leave it as-is
+            if not isinstance(d, dict):
+                continue
+
+            # Extract & clean
+            content_row[col] = clean_content_extracted(d.get("content_extracted", ""))
+            sources_row[col] = normalize_sources(d.get("sources", ""))
+
+        output_rows.append(content_row)
+        output_rows.append(sources_row)
+
+    df_out = pd.DataFrame(output_rows)
+
+    # Put row_type right after client column (if client col exists)
+    if client_col and "row_type" in df_out.columns:
+        cols = list(df_out.columns)
+        cols.remove("row_type")
+        insert_at = cols.index(client_col) + 1
+        cols.insert(insert_at, "row_type")
+        df_out = df_out[cols]
+
+    # Save ONE sheet only
+    df_out.to_excel(output_file, index=False)
+    print(f"✅ Saved interleaved content+sources output: {output_file}")
+
+
+if __name__ == "__main__":
+    process_excel(INPUT_FILE, OUTPUT_FILE)
