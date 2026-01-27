@@ -1,0 +1,52 @@
+# ---- CAPID direct ----
+if self._is_capid_query(query):
+    # If user gave a country, behave as before (single answer)
+    if has_user_country and resolved_country:
+        return f"CAPID / Client ID for {real_client_name} ({resolved_country}) is {cid}."
+
+    # No country provided -> list all countries from MASTER CSV for this client
+    df = self.df
+    assert df is not None
+
+    canon = canonicalize_name(real_client_name)
+    matches = df[df["__canon_name"] == canon].copy()
+
+    # If exact canonical match has no rows (rare), fallback to contains
+    if matches.empty:
+        matches = df[df["__canon_name"].str.contains(re.escape(canon), na=False)].copy()
+
+    if matches.empty:
+        # fallback to existing behavior (should not normally happen)
+        return f"CAPID / Client ID for {real_client_name} is {cid}. (No country breakdown found.)"
+
+    # Build country -> cid list (de-dup)
+    items = []
+    seen = set()
+    for _, r in matches.iterrows():
+        ctry = normalize_country(r.get(self.country_col)) or (r.get("__country") or "").strip() or "N/A"
+        rcid = str(r.get(self.cid_col) or "").strip()
+        if not rcid:
+            continue
+        key = (ctry, rcid)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append((ctry, rcid))
+
+    if not items:
+        return f"CAPID / Client ID for {real_client_name} is {cid}. (No country/CID rows found.)"
+
+    # If only one country exists, just answer it directly
+    uniq_countries = {c for c, _ in items if c and c != "N/A"}
+    if len(uniq_countries) == 1:
+        ctry, rcid = items[0]
+        return f"CAPID / Client ID for {real_client_name} ({ctry}) is {rcid}."
+
+    # Otherwise list all and ask which one
+    lines = [f"CAPID / Client IDs found for {real_client_name}:"]
+    for ctry, rcid in items[:50]:
+        lines.append(f"- Country: {ctry} | CAPID: {rcid}")
+
+    lines.append("")
+    lines.append("Which country would you like to know?")
+    return "\n".join(lines)
