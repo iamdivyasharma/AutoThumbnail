@@ -1,0 +1,763 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+from dotenv import load_dotenv
+from langchain_aws import ChatBedrockConverse
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+
+def _clean_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def canonicalize_name(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return _clean_spaces(s)
+
+
+_LEGAL_SUFFIX_TOKENS = {"inc", "ltd", "llc", "plc", "as", "sa", "ag", "gmbh", "bv", "nv", "s"}
+
+
+def acronym(name: str) -> str:
+    toks = canonicalize_name(name).split()
+    if not toks:
+        return ""
+    while toks and toks[-1] in _LEGAL_SUFFIX_TOKENS:
+        toks.pop()
+    if not toks:
+        return ""
+    return "".join(t[0] for t in toks).upper()
+
+
+def normalize_country(country: Optional[str]) -> Optional[str]:
+    if not country:
+        return None
+    c = str(country).strip().upper()
+    if c in {"UNITED STATES", "U.S.", "U.S", "US", "USA"}:
+        return "US"
+    if c in {"UNITED KINGDOM", "GREAT BRITAIN", "GB", "UK"}:
+        return "UK"
+    return c
+
+
+def is_country_token(t: str) -> bool:
+    t = (t or "").strip().upper()
+    return bool(re.fullmatch(r"[A-Z]{2,3}", t)) or t in {"INDIA", "JAPAN", "DENMARK", "UK", "USA"}
+
+
+STOPWORDS = {
+    "tell",
+    "me",
+    "the",
+    "a",
+    "an",
+    "for",
+    "of",
+    "in",
+    "on",
+    "to",
+    "please",
+    "what",
+    "is",
+    "are",
+    "give",
+    "show",
+    "list",
+    "get",
+    "all",
+    "files",
+    "file",
+    "names",
+    "documents",
+    "under",
+    "about",
+}
+
+ATTRIBUTE_HINTS = [
+    "agreement type",
+    "effective date",
+    "termination date",
+    "expiry date",
+    "governing law",
+    "notice period",
+    "renewal",
+    "auto renewal",
+    "payment term",
+]
+
+ID_WORDS = {"capid", "capoid", "cap", "cid", "client", "id", "clientid", "client_id", "client-id"}
+
+PREFERRED_NO_COUNTRY_SUBFOLDERS_NORM = {"ultimateparent", "corporatefamily"}
+
+
+def _norm_folder_name(s: str) -> str:
+    return canonicalize_name(s).replace(" ", "")
+
+
+_INTENT_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You extract structured search intent for a metadata lookup. "
+            "Return ONLY valid JSON with keys: "
+            "client_mention (string or null), country (string or null), "
+            "category (legal|finance|null), attributes (array of strings), "
+            "wants_file_list (boolean). "
+            "Do not add extra keys.",
+        ),
+        (
+            "human",
+            "Query: {query}\n\n"
+            "Examples:\n"
+            "- 'capid for google us' => {{\"client_mention\":\"google\",\"country\":\"US\",\"category\":\"finance\",\"attributes\":[\"capid\"],\"wants_file_list\":false}}\n"
+            "- 'agreement type of amgen us for all files' => {{\"client_mention\":\"amgen\",\"country\":\"US\",\"category\":\"finance\",\"attributes\":[\"agreement type\"],\"wants_file_list\":true}}\n"
+            "- 'list all files under amgen us' => {{\"client_mention\":\"amgen\",\"country\":\"US\",\"category\":\"finance\",\"attributes\":[],\"wants_file_list\":true}}\n"
+            "Return JSON now.",
+        ),
+    ]
+)
+
+_ANSWER_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a metadata assistant. Answer ONLY using the Provided Context. "
+            "If the requested info is missing, say: 'Not found in available metadata.' "
+            "If user asks for agreement type across files, return per-file results. "
+            "Keep it short and direct.",
+        ),
+        ("human", "User question: {query}\n\nProvided Context:\n{context}\n\nAnswer:"),
+    ]
+)
+
+
+@dataclass
+class ManifestDoc:
+    policy_id: str
+    source_file: Optional[str]
+    metadata: Dict[str, Any]
+
+
+class MetadataService:
+    def __init__(
+        self,
+        client_master_csv_path: str,
+        schema_json_path: str,
+        faiss_index_dir: str,
+        client_name_col: str = "parent_hq",
+        country_col: str = "country__c",
+        cid_col: str = "cid",
+        bedrock_region: str = "us-east-1",
+        llm_model_id: Optional[str] = None,
+        client_alias_map: Optional[Dict[str, str]] = None,
+        **_ignored_kwargs,
+    ):
+        load_dotenv()
+
+        self.client_master_csv_path = Path(client_master_csv_path)
+        self.schema_json_path = Path(schema_json_path)
+        self.faiss_index_dir = Path(faiss_index_dir)
+
+        self.client_name_col = client_name_col
+        self.country_col = country_col
+        self.cid_col = cid_col
+
+        self.bedrock_region = bedrock_region
+        self.llm_model_id = llm_model_id or os.getenv(
+            "BEDROCK_LLM_MODEL",
+            "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        )
+
+        self.df: Optional[pd.DataFrame] = None
+        self.schema: Dict[str, Any] = {}
+        self.manifest_rows: List[Tuple[str, str, Optional[str], Path]] = []
+        self._canon_choices: List[str] = []
+        self.sessions: Dict[str, Dict[str, Optional[str]]] = {}
+
+        alias_map = client_alias_map or {}
+        self._client_alias_map: Dict[str, str] = {canonicalize_name(k): v for k, v in alias_map.items()}
+
+    def ensure_loaded(self) -> None:
+        if self.df is None:
+            self._load_master_csv()
+        if not self.schema:
+            self._load_schema_json()
+        if not self.manifest_rows:
+            self._scan_manifests()
+
+    def _load_master_csv(self) -> None:
+        if not self.client_master_csv_path.exists():
+            raise FileNotFoundError(f"Master CSV not found: {self.client_master_csv_path}")
+
+        df = pd.read_csv(self.client_master_csv_path, dtype=str, keep_default_na=False)
+        df.columns = [str(c) for c in df.columns]
+
+        for c in [self.client_name_col, self.country_col, self.cid_col]:
+            if c not in df.columns:
+                raise ValueError(f"Master CSV missing column '{c}'. Found: {list(df.columns)[:50]}")
+
+        df["__canon_name"] = df[self.client_name_col].map(canonicalize_name)
+        df["__acronym"] = df[self.client_name_col].map(acronym)
+        df["__country"] = df[self.country_col].map(normalize_country)
+
+        self.df = df
+        self._canon_choices = df["__canon_name"].tolist()
+
+    def _load_schema_json(self) -> None:
+        if not self.schema_json_path.exists():
+            self.schema = {"columns": []}
+            return
+        try:
+            self.schema = json.loads(self.schema_json_path.read_text(encoding="utf-8"))
+        except Exception:
+            self.schema = {"columns": []}
+
+    def _scan_manifests(self) -> None:
+        if not self.faiss_index_dir.exists():
+            raise FileNotFoundError(f"FAISS index dir not found: {self.faiss_index_dir}")
+
+        rows: List[Tuple[str, str, Optional[str], Path]] = []
+        for manifest_path in self.faiss_index_dir.rglob("manifest.json"):
+            try:
+                rel = manifest_path.relative_to(self.faiss_index_dir)
+            except Exception:
+                continue
+
+            parts = rel.parts
+            if len(parts) < 3:
+                continue
+
+            category = str(parts[0]).lower()
+            client_folder = str(parts[1])
+            third_folder = str(parts[2]) if len(parts) >= 4 else None
+            rows.append((category, client_folder, third_folder, manifest_path))
+
+        self.manifest_rows = rows
+
+    def _apply_client_alias_map(self, client_mention: str, query: str) -> str:
+        cm_norm = canonicalize_name(client_mention)
+        q_norm = canonicalize_name(query)
+
+        if cm_norm and cm_norm in self._client_alias_map:
+            return self._client_alias_map[cm_norm]
+
+        for alias_norm, real_name in self._client_alias_map.items():
+            if alias_norm and re.search(rf"\b{re.escape(alias_norm)}\b", q_norm):
+                return real_name
+
+        return client_mention
+
+    def _llm(self) -> ChatBedrockConverse:
+        import boto3
+
+        client = boto3.client("bedrock-runtime", region_name=self.bedrock_region)
+        return ChatBedrockConverse(
+            model_id=self.llm_model_id,
+            client=client,
+            temperature=0.0,
+            max_tokens=700,
+        )
+
+    def _parse_intent_llm(self, query: str) -> Dict[str, Any]:
+        chain = _INTENT_PROMPT | self._llm() | StrOutputParser()
+        raw = (chain.invoke({"query": query}) or "").strip()
+
+        raw = re.sub(r"^```(json)?", "", raw, flags=re.I).strip()
+        raw = re.sub(r"```$", "", raw).strip()
+
+        try:
+            data = json.loads(raw)
+            data["country"] = normalize_country(data.get("country"))
+            if data.get("category"):
+                data["category"] = str(data["category"]).strip().lower()
+            data["attributes"] = data.get("attributes") or []
+            data["wants_file_list"] = bool(data.get("wants_file_list") or False)
+            return data
+        except Exception:
+            return {
+                "client_mention": None,
+                "country": None,
+                "category": None,
+                "attributes": [],
+                "wants_file_list": False,
+            }
+
+    def _extract_client_guess(self, query: str) -> str:
+        q = canonicalize_name(query)
+        toks = [t for t in q.split() if t and t not in STOPWORDS]
+        toks = [t for t in toks if not is_country_token(t)]
+        toks = [t for t in toks if t not in ID_WORDS]
+        if not toks:
+            return ""
+        return max(toks, key=len)
+
+    def _resolve_country_from_query(self, query: str) -> Optional[str]:
+        toks = re.split(r"[^A-Za-z0-9]+", query or "")
+        for t in toks[::-1]:
+            if is_country_token(t):
+                return normalize_country(t)
+        return None
+
+    def _resolve_client_row(self, client_mention: str, country: Optional[str] = None) -> Optional[pd.Series]:
+        assert self.df is not None
+
+        cm = _clean_spaces(client_mention)
+        if not cm:
+            return None
+
+        cm_canon = canonicalize_name(cm)
+        cm_acr = cm.strip().upper()
+        country_norm = normalize_country(country)
+        df = self.df
+
+        def _pick_best(candidates: pd.DataFrame) -> Optional[pd.Series]:
+            if candidates.empty:
+                return None
+            if country_norm and "__country" in candidates.columns:
+                c2 = candidates[candidates["__country"] == country_norm]
+                if not c2.empty:
+                    return c2.iloc[0]
+            return candidates.iloc[0]
+
+        exact = df[df["__canon_name"] == cm_canon]
+        picked = _pick_best(exact)
+        if picked is not None:
+            return picked
+
+        acr_exact = df[df["__acronym"] == cm_acr]
+        picked = _pick_best(acr_exact)
+        if picked is not None:
+            return picked
+
+        if len(cm_acr) >= 2:
+            acr_prefix = df[df["__acronym"].str.startswith(cm_acr, na=False)]
+            picked = _pick_best(acr_prefix)
+            if picked is not None:
+                return picked
+
+        if cm_canon:
+            sub = df[df["__canon_name"].str.contains(re.escape(cm_canon), na=False)]
+            picked = _pick_best(sub)
+            if picked is not None:
+                return picked
+
+        try:
+            from rapidfuzz import process, fuzz  # type: ignore
+
+            match = process.extractOne(cm_canon, self._canon_choices, scorer=fuzz.token_set_ratio)
+            if match and match[1] >= 85:
+                idx = self._canon_choices.index(match[0])
+                return df.iloc[idx]
+        except Exception:
+            import difflib
+
+            best = difflib.get_close_matches(cm_canon, self._canon_choices, n=1, cutoff=0.85)
+            if best:
+                idx = self._canon_choices.index(best[0])
+                return df.iloc[idx]
+
+        return None
+
+    def _candidate_manifests(
+        self,
+        client_name: str,
+        category: Optional[str] = None,
+        country: Optional[str] = None,
+    ) -> List[Path]:
+        cname = canonicalize_name(client_name)
+        country_norm = normalize_country(country)
+        candidates: List[Path] = []
+
+        for (cat, client_folder, third_folder, mpath) in self.manifest_rows:
+            if category and cat != category:
+                continue
+
+            folder_canon = canonicalize_name(client_folder)
+            if folder_canon != cname and cname not in folder_canon and folder_canon not in cname:
+                continue
+
+            if country_norm:
+                if not third_folder:
+                    continue
+                if normalize_country(third_folder) != country_norm:
+                    continue
+
+            candidates.append(mpath)
+
+        return candidates
+
+    def _preferred_no_country_manifests(self, client_name: str, category: str) -> List[Path]:
+        candidates = self._candidate_manifests(client_name=client_name, category=category, country=None)
+        preferred: List[Path] = []
+
+        for p in candidates:
+            rel = p.relative_to(self.faiss_index_dir)
+            if len(rel.parts) != 4:
+                continue
+            subfolder_norm = _norm_folder_name(rel.parts[2])
+            if subfolder_norm in PREFERRED_NO_COUNTRY_SUBFOLDERS_NORM:
+                preferred.append(p)
+
+        def _rank(p: Path) -> int:
+            rel = p.relative_to(self.faiss_index_dir)
+            subfolder_norm = _norm_folder_name(rel.parts[2])
+            return 0 if subfolder_norm == "ultimateparent" else 1
+
+        preferred.sort(key=_rank)
+        return preferred
+
+    def _read_manifest_docs(self, manifest_path: Path) -> List[ManifestDoc]:
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+
+        out: List[ManifestDoc] = []
+        for d in data.get("docs", []) or []:
+            policy_id = str(d.get("policy_id") or "").strip()
+            source_file = d.get("source_file")
+            md = d.get("metadata") or {}
+
+            if isinstance(md, dict) and "metadataAttributes" in md and isinstance(md["metadataAttributes"], dict):
+                md = md["metadataAttributes"]
+            if isinstance(md, dict) and "metadataAtrributes" in md and isinstance(md["metadataAtrributes"], dict):
+                md = md["metadataAtrributes"]
+
+            if isinstance(md, dict):
+                out.append(ManifestDoc(policy_id=policy_id, source_file=source_file, metadata=md))
+
+        return out
+
+    def _is_capid_query(self, query: str) -> bool:
+        q = (query or "").lower()
+        return bool(re.search(r"\b(cap\s*(id|oid)|capid|capoid|client\s*id|cid)\b", q))
+
+    def _is_list_files_query(self, query: str) -> bool:
+        q = (query or "").lower()
+        return any(
+            p in q
+            for p in [
+                "list all files",
+                "all the files",
+                "file names",
+                "filenames",
+                "documents under",
+                "all files",
+            ]
+        )
+
+    def _extract_attributes_fallback(self, query: str) -> List[str]:
+        q = (query or "").lower()
+        attrs: List[str] = []
+        for a in ATTRIBUTE_HINTS:
+            if a in q:
+                attrs.append(a)
+        if "agreement" in q and "type" in q and "agreement type" not in attrs:
+            attrs.append("agreement type")
+        return attrs
+
+    def _best_key_match(self, want: str, keys: List[str]) -> Optional[str]:
+        want_c = canonicalize_name(want).replace(" ", "")
+        if not want_c:
+            return None
+
+        best = None
+        best_score = 0.0
+        for k in keys:
+            kc = canonicalize_name(k).replace(" ", "")
+            if not kc:
+                continue
+            if kc == want_c:
+                return k
+
+            score = 0.0
+            if want_c in kc or kc in want_c:
+                score = 0.90
+            else:
+                want_t = set(canonicalize_name(want).split())
+                k_t = set(canonicalize_name(k).split())
+                if want_t and want_t.issubset(k_t):
+                    score = 0.82
+
+            if score > best_score:
+                best_score = score
+                best = k
+
+        return best if best_score >= 0.80 else None
+
+    def _extract_group_from_manifests(self, manifest_paths: List[Path]) -> List[str]:
+        groups: List[str] = []
+        seen = set()
+
+        for mp in manifest_paths[:12]:
+            docs = self._read_manifest_docs(mp)
+            for d in docs:
+                if not isinstance(d.metadata, dict):
+                    continue
+
+                group_key = None
+                for k in d.metadata.keys():
+                    kk = canonicalize_name(str(k)).replace(" ", "")
+                    if kk in {"group", "groupid", "group_id"}:
+                        group_key = k
+                        break
+                if group_key is None:
+                    continue
+
+                val = d.metadata.get(group_key)
+                if val is None:
+                    continue
+
+                if isinstance(val, (list, tuple)):
+                    for x in val:
+                        s = _clean_spaces(str(x))
+                        if s and s not in seen:
+                            seen.add(s)
+                            groups.append(s)
+                else:
+                    s = _clean_spaces(str(val))
+                    if s and s not in seen:
+                        seen.add(s)
+                        groups.append(s)
+
+        return groups
+
+    def lookup(
+        self,
+        query: str,
+        category: Optional[str] = None,
+        country: Optional[str] = None,
+        session_id: Optional[str] = None,
+        use_llm: bool = True,
+    ) -> str:
+        self.ensure_loaded()
+        assert self.df is not None
+
+        category_norm = (category or "").strip().lower() or None
+
+        if session_id and session_id in self.sessions:
+            mem = self.sessions[session_id]
+            if not category_norm:
+                category_norm = mem.get("category")
+
+        intent: Dict[str, Any] = {
+            "client_mention": None,
+            "country": None,
+            "category": category_norm,
+            "attributes": [],
+            "wants_file_list": False,
+        }
+
+        if use_llm:
+            intent = self._parse_intent_llm(query)
+            if category_norm:
+                intent["category"] = category_norm
+        else:
+            intent["country"] = self._resolve_country_from_query(query)
+            intent["category"] = category_norm
+
+        query_country = normalize_country(intent.get("country")) or self._resolve_country_from_query(query)
+        has_query_country = bool(query_country)
+        resolved_country = query_country if has_query_country else None
+
+        client_mention = (intent.get("client_mention") or "").strip()
+        if not client_mention:
+            client_mention = self._extract_client_guess(query)
+
+        client_mention = self._apply_client_alias_map(client_mention, query)
+
+        if not client_mention and session_id and session_id in self.sessions:
+            client_mention = self.sessions[session_id].get("client_name") or ""
+
+        if not client_mention:
+            return "Client name not detected. Please include a client name like 'amgen' or 'google'."
+
+        row = self._resolve_client_row(client_mention, country=resolved_country)
+        if row is None:
+            return f"'{client_mention}' was not found in master CSV database."
+
+        real_client_name = str(row[self.client_name_col]).strip()
+        cid = str(row[self.cid_col]).strip()
+
+        resolved_category = intent.get("category") or "finance"
+        if resolved_category not in {"finance", "legal"}:
+            resolved_category = "finance"
+
+        if session_id:
+            self.sessions[session_id] = {
+                "client_name": client_mention,
+                "country": resolved_country,
+                "category": resolved_category,
+            }
+
+        if self._is_capid_query(query):
+            if has_query_country and resolved_country:
+                return f"CAPID / Client ID for {real_client_name} ({resolved_country}) is {cid}."
+
+            preferred = self._preferred_no_country_manifests(client_name=real_client_name, category=resolved_category)
+            if not preferred:
+                return (
+                    f"Country not specified. I couldn't find 'Ultimate Parent' or 'Corporate Family' manifest.json "
+                    f"for {real_client_name}. Please specify the country if you want to know the CAPID."
+                )
+
+            groups = self._extract_group_from_manifests(preferred)
+            if not groups:
+                return (
+                    f"Country not specified. GROUP was not found in Ultimate Parent/Corporate Family manifest.json "
+                    f"for {real_client_name}. Please specify the country if you want to know the CAPID."
+                )
+
+            if len(groups) == 1:
+                return (
+                    f"Group ID for {real_client_name} is {groups[0]}. "
+                    f"Please specify the country if you want to know the CAPID."
+                )
+
+            lines = [f"Group IDs found for {real_client_name}:"]
+            for g in groups[:20]:
+                lines.append(f"- {g}")
+            lines.append("Please specify the country if you want to know the CAPID.")
+            return "\n".join(lines)
+
+        if has_query_country and resolved_country:
+            manifests = self._candidate_manifests(
+                client_name=real_client_name,
+                category=resolved_category,
+                country=resolved_country,
+            )
+            if not manifests:
+                manifests = self._candidate_manifests(
+                    client_name=real_client_name,
+                    category=resolved_category,
+                    country=None,
+                )
+        else:
+            manifests = self._preferred_no_country_manifests(client_name=real_client_name, category=resolved_category)
+
+        if not manifests:
+            return (
+                f"Found client '{real_client_name}' (CID={cid}) but no manifest.json was found "
+                f"under {self.faiss_index_dir} for that client."
+            )
+
+        all_docs: List[ManifestDoc] = []
+        for mp in manifests[:12]:
+            all_docs.extend(self._read_manifest_docs(mp))
+
+        if not all_docs:
+            return f"Found manifest.json for {real_client_name}, but it has no docs/metadata inside."
+
+        wants_file_list = bool(intent.get("wants_file_list")) or self._is_list_files_query(query)
+        attributes = intent.get("attributes") or []
+        if not attributes:
+            attributes = self._extract_attributes_fallback(query)
+
+        all_keys = sorted({k for d in all_docs for k in (d.metadata or {}).keys()})
+
+        if wants_file_list and not attributes:
+            names = sorted({d.policy_id for d in all_docs if d.policy_id})
+            if not names:
+                return "No policy/file names found in manifest metadata."
+            return "Files found:\n- " + "\n- ".join(names[:300])
+
+        context = self._build_context(
+            client_name=real_client_name,
+            cid=cid,
+            category=resolved_category,
+            country=resolved_country,
+            docs=all_docs,
+            wants_file_list=wants_file_list,
+            want_attribute=(attributes[0] if attributes else None),
+            all_keys=all_keys,
+        )
+
+        if use_llm:
+            return self._final_answer_llm(query=query, context=context)
+
+        header = ""
+        if wants_file_list:
+            names = sorted({d.policy_id for d in all_docs if d.policy_id})
+            header = "Files found:\n- " + "\n- ".join(names[:50])
+
+        if attributes:
+            want = attributes[0]
+            key = self._best_key_match(want, all_keys)
+            if not key:
+                return (header + "\n\n" + f"Attribute '{want}' was not found in manifest metadata.").strip()
+
+            lines = []
+            for d in all_docs:
+                if key in d.metadata:
+                    lines.append(f"{d.policy_id}: {key} = {d.metadata.get(key)}")
+
+            if not lines:
+                return (header + "\n\n" + f"No values found for '{key}' in manifest metadata.").strip()
+
+            return (header + "\n\n" + "\n".join(lines[:200])).strip()
+
+        return "I could not determine which metadata attribute you are asking for."
+
+    def _build_context(
+        self,
+        client_name: str,
+        cid: str,
+        category: str,
+        country: Optional[str],
+        docs: List[ManifestDoc],
+        wants_file_list: bool,
+        want_attribute: Optional[str],
+        all_keys: List[str],
+        max_docs: int = 40,
+    ) -> str:
+        lines: List[str] = []
+        lines.append(f"CLIENT: {client_name}")
+        lines.append(f"CID: {cid}")
+        lines.append(f"CATEGORY: {category}")
+        if country:
+            lines.append(f"COUNTRY: {country}")
+        lines.append("")
+
+        if wants_file_list:
+            names = sorted({d.policy_id for d in docs if d.policy_id})
+            lines.append("FILES:")
+            for n in names[:200]:
+                lines.append(f"- {n}")
+            lines.append("")
+
+        if want_attribute:
+            lines.append(f"REQUESTED_ATTRIBUTE: {want_attribute}")
+            best_key = self._best_key_match(want_attribute, all_keys)
+            lines.append(f"BEST_MATCH_METADATA_KEY: {best_key if best_key else '(not found)'}")
+            lines.append("")
+
+        lines.append("PER-FILE METADATA:")
+        best_key = self._best_key_match(want_attribute, all_keys) if want_attribute else None
+
+        for d in docs[:max_docs]:
+            lines.append(f"- policy_id: {d.policy_id}")
+            if best_key and best_key in d.metadata:
+                lines.append(f"  {best_key}: {d.metadata.get(best_key)}")
+            else:
+                shown = 0
+                for k, v in list(d.metadata.items())[:10]:
+                    lines.append(f"  {k}: {v}")
+                    shown += 1
+                if shown == 0:
+                    lines.append("  (no metadata fields)")
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
+    def _final_answer_llm(self, query: str, context: str) -> str:
+        chain = _ANSWER_PROMPT | self._llm() | StrOutputParser()
+        return (chain.invoke({"query": query, "context": context}) or "").strip()
