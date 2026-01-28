@@ -1,0 +1,458 @@
+# services/rag_search_service.py
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
+
+# Reuse your existing deterministic client/country logic from MetadataService
+from services.metadata_service import MetadataService, canonicalize_name, normalize_country
+
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_aws import ChatBedrockConverse
+
+# Vectorstore + embeddings (LangChain)
+try:
+    # Newer LangChain
+    from langchain_community.vectorstores import FAISS  # type: ignore
+except Exception:
+    # Older LangChain
+    from langchain.vectorstores import FAISS  # type: ignore
+
+try:
+    from langchain_aws import BedrockEmbeddings  # type: ignore
+except Exception as e:
+    raise ImportError("BedrockEmbeddings not available. Install/enable langchain-aws.") from e
+
+
+_RAG_ANSWER_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a RAG assistant. Answer ONLY using the provided context chunks. "
+            "If the answer is not in the context, say: 'Not found in available documents.' "
+            "Keep the response short and direct. When possible, mention the source file/policy id.",
+        ),
+        ("human", "Question: {query}\n\nContext:\n{context}\n\nAnswer:"),
+    ]
+)
+
+
+@dataclass
+class RagChunk:
+    rank: int
+    score: float
+    text: str
+    metadata: Dict[str, Any]
+
+
+class RagSearchService:
+    """
+    RAG Search API behavior you described:
+    - Input: only query string (client name can be anywhere in query)
+    - Category is fixed to 'finance'
+    - Resolve client + optional country using MetadataService logic
+    - Choose FAISS index directory based on:
+        * if country: /<category>/<client>/<country>/
+        * if no country: /<category>/<client>/Ultimate Parent/  and  /<category>/<client>/Corporate Family/
+      (loads whichever exists; if both exist, searches both and merges results)
+    - Return JSON:
+        1) top_k nearest chunks
+        2) final LLM answer
+        3) source links (deduped from chunk metadata)
+    """
+
+    def __init__(
+        self,
+        metadata_svc: MetadataService,
+        faiss_index_dir: str,
+        bedrock_region: str = "us-east-1",
+        llm_model_id: Optional[str] = None,
+        embedding_model_id: Optional[str] = None,
+        top_k: int = 8,
+    ):
+        load_dotenv()
+        self.meta = metadata_svc
+        self.faiss_index_dir = Path(faiss_index_dir)
+        self.bedrock_region = bedrock_region
+        self.llm_model_id = llm_model_id or os.getenv(
+            "BEDROCK_LLM_MODEL",
+            "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        )
+        self.embedding_model_id = embedding_model_id or os.getenv(
+            "BEDROCK_EMBEDDING_MODEL",
+            "amazon.titan-embed-text-v1",
+        )
+        self.top_k = int(top_k)
+
+        # Lazily created
+        self._embeddings = None
+
+    def _emb(self):
+        if self._embeddings is not None:
+            return self._embeddings
+        import boto3
+
+        brt = boto3.client("bedrock-runtime", region_name=self.bedrock_region)
+        self._embeddings = BedrockEmbeddings(model_id=self.embedding_model_id, client=brt)
+        return self._embeddings
+
+    def _llm(self) -> ChatBedrockConverse:
+        import boto3
+
+        client = boto3.client("bedrock-runtime", region_name=self.bedrock_region)
+        return ChatBedrockConverse(
+            model_id=self.llm_model_id,
+            client=client,
+            temperature=0.0,
+            max_tokens=700,
+        )
+
+    def _detect_client_and_country(self, query: str, use_llm: bool = True) -> Tuple[str, Optional[str]]:
+        """
+        Uses your MetadataService logic:
+        - LLM intent parsing (if enabled) to get client_mention/country
+        - fallback client guess
+        - alias mapping
+        - master CSV row resolution (deterministic)
+        """
+        self.meta.ensure_loaded()
+
+        intent = {"client_mention": None, "country": None}
+        if use_llm:
+            i = self.meta._parse_intent_llm(query)  # reuse your exact intent parser
+            intent["client_mention"] = (i.get("client_mention") or "").strip()
+            intent["country"] = normalize_country(i.get("country"))
+        else:
+            intent["country"] = self.meta._resolve_country_from_query(query)
+
+        client_mention = (intent.get("client_mention") or "").strip()
+        if not client_mention:
+            client_mention = self.meta._extract_client_guess(query)
+
+        client_mention = self.meta._apply_client_alias_map(client_mention, query)
+
+        user_country = normalize_country(intent.get("country"))
+        # resolve row (country-aware if user gave one)
+        row = self.meta._resolve_client_row(client_mention, country=user_country)
+        if row is None:
+            raise ValueError(f"'{client_mention}' was not found in master CSV database.")
+
+        real_client_name = str(row[self.meta.client_name_col]).strip()
+        return real_client_name, user_country  # user_country may be None
+
+    def _possible_index_dirs(
+        self,
+        category: str,
+        client_name: str,
+        country: Optional[str],
+    ) -> List[Path]:
+        """
+        This maps your "routing" requirement to actual directories.
+        NOTE: We must match the *folder name* used on disk for the client.
+        Your manifest matching already uses 'contains' logic for client folder; we reuse that pattern here.
+        """
+        category = (category or "finance").strip().lower() or "finance"
+        if category not in {"finance", "legal"}:
+            category = "finance"
+
+        # Find matching client folders under category by canonical/contains
+        base = self.faiss_index_dir / category
+        if not base.exists():
+            return []
+
+        cname = canonicalize_name(client_name)
+        client_dirs: List[Path] = []
+        for d in base.iterdir():
+            if not d.is_dir():
+                continue
+            dc = canonicalize_name(d.name)
+            if dc == cname or cname in dc or dc in cname:
+                client_dirs.append(d)
+
+        out: List[Path] = []
+        ctry = normalize_country(country)
+
+        if ctry:
+            # Country-specific folder
+            for cd in client_dirs:
+                out.append(cd / ctry)
+        else:
+            # No country -> only Ultimate Parent and Corporate Family
+            for cd in client_dirs:
+                out.append(cd / "Ultimate Parent")
+                out.append(cd / "Corporate Family")
+
+        # keep only existing dirs that look like LangChain FAISS save_local folders
+        existing = [p for p in out if p.exists() and p.is_dir()]
+        return existing
+
+    def _load_faiss_store(self, folder: Path):
+        """
+        Expects LangChain FAISS save_local format:
+          folder/index.faiss and folder/index.pkl
+        """
+        # Newer LangChain requires allow_dangerous_deserialization for pickle.
+        try:
+            return FAISS.load_local(
+                str(folder),
+                self._emb(),
+                allow_dangerous_deserialization=True,
+            )
+        except TypeError:
+            # Older versions don't have allow_dangerous_deserialization
+            return FAISS.load_local(str(folder), self._emb())
+
+    def _extract_source_link(self, md: Dict[str, Any]) -> Optional[str]:
+        """
+        "source links" here means: whatever reference we can return.
+        Prefer URL-like fields; else return file/path-like fields.
+        """
+        if not md:
+            return None
+        # common metadata keys in LangChain docs
+        candidates = [
+            md.get("source"),
+            md.get("source_file"),
+            md.get("path"),
+            md.get("url"),
+            md.get("link"),
+            md.get("document_url"),
+            md.get("file"),
+        ]
+        for c in candidates:
+            if not c:
+                continue
+            s = str(c).strip()
+            if not s:
+                continue
+            return s
+        return None
+
+    def _build_context_from_chunks(self, chunks: List[RagChunk], max_chars: int = 14000) -> str:
+        """
+        Build context string with source hints so the LLM can cite.
+        """
+        parts: List[str] = []
+        total = 0
+        for ch in chunks:
+            src = self._extract_source_link(ch.metadata) or ""
+            pid = ch.metadata.get("policy_id") or ch.metadata.get("policyId") or ""
+            header = f"[Rank {ch.rank} | score={ch.score:.4f} | policy_id={pid} | source={src}]"
+            block = header + "\n" + ch.text.strip()
+            if total + len(block) > max_chars:
+                break
+            parts.append(block)
+            total += len(block)
+        return "\n\n---\n\n".join(parts).strip()
+
+    def search_and_answer(
+        self,
+        query: str,
+        session_id: Optional[str] = None,
+        use_llm_intent: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Returns dict:
+          - top_chunks: list[ {rank, score, text, metadata} ]
+          - answer: str
+          - sources: list[str]
+        """
+        q = (query or "").strip()
+        if not q:
+            raise ValueError("query is required")
+
+        # 1) detect client + optional country (deterministic + alias map + CSV resolver)
+        client_name, user_country = self._detect_client_and_country(q, use_llm=use_llm_intent)
+
+        # 2) choose index dirs (finance fixed)
+        category = "finance"
+        index_dirs = self._possible_index_dirs(category=category, client_name=client_name, country=user_country)
+        if not index_dirs:
+            # Helpful error that matches your folder rules
+            if user_country:
+                raise FileNotFoundError(
+                    f"No FAISS index folder found under {self.faiss_index_dir}/{category}/<client>/{user_country}/"
+                )
+            raise FileNotFoundError(
+                f"No FAISS index folder found under {self.faiss_index_dir}/{category}/<client>/Ultimate Parent/ or Corporate Family/"
+            )
+
+        # 3) retrieve from one or more indexes, merge, then keep best top_k
+        merged: List[RagChunk] = []
+        rank_counter = 1
+
+        for folder in index_dirs:
+            store = self._load_faiss_store(folder)
+            # similarity_search_with_score returns (Document, score) where score semantics may differ by implementation
+            hits = store.similarity_search_with_score(q, k=self.top_k)
+            for doc, score in hits:
+                text = (doc.page_content or "").strip()
+                md = dict(doc.metadata or {})
+                # preserve where it came from
+                md.setdefault("_index_folder", str(folder))
+                merged.append(RagChunk(rank=0, score=float(score), text=text, metadata=md))
+
+        # Sort: if scores are distances, lower is better; if they are similarity, higher is better.
+        # FAISS in LangChain often returns L2 distance (lower better). We'll assume lower-better,
+        # BUT detect common "similarity" fields by quick heuristic:
+        # If many scores are between 0 and 1 and higher tends to mean closer, you can flip.
+        # For now: lower is better (safe for L2).
+        merged.sort(key=lambda x: x.score)
+
+        top = merged[: self.top_k]
+        for i, ch in enumerate(top, start=1):
+            ch.rank = i
+
+        # 4) build sources list (dedup)
+        sources: List[str] = []
+        seen = set()
+        for ch in top:
+            s = self._extract_source_link(ch.metadata)
+            if not s:
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            sources.append(s)
+
+        # 5) build LLM context + answer
+        context = self._build_context_from_chunks(top)
+        chain = _RAG_ANSWER_PROMPT | self._llm() | StrOutputParser()
+        answer = (chain.invoke({"query": q, "context": context}) or "").strip()
+
+        return {
+            "client": client_name,
+            "country": user_country,
+            "category": category,
+            "top_chunks": [
+                {
+                    "rank": ch.rank,
+                    "score": ch.score,
+                    "text": ch.text,
+                    "metadata": ch.metadata,
+                }
+                for ch in top
+            ],
+            "answer": answer,
+            "sources": sources,
+        }
+
+# app.py  (additions only)
+from __future__ import annotations
+
+import os
+from typing import Optional, Any, Dict, List
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+from services.metadata_service import MetadataService
+from services.rag_search_service import RagSearchService
+
+load_dotenv()
+
+app = FastAPI(title="Metadata Lookup API", version="1.0.0")
+
+# ---- Service Singleton ----
+svc = MetadataService(
+    client_master_csv_path=os.getenv("CLIENT_MASTER_CSV", "Excel/Contractextraction list1.csv"),
+    schema_json_path=os.getenv("CLIENT_MASTER_SCHEMA_JSON", "data/client_master_schema.json"),
+    faiss_index_dir=os.getenv("FAISS_INDEX_DIR", "/opt/ml/faiss_indices"),
+    client_name_col=os.getenv("CLIENT_NAME_COL", "parent_hq"),
+    country_col=os.getenv("COUNTRY_COL", "country__c"),
+    cid_col=os.getenv("CID_COL", "cid"),
+    bedrock_region=os.getenv("AWS_REGION", "us-east-1"),
+    llm_model_id=os.getenv("BEDROCK_LLM_MODEL", None),
+)
+
+rag = RagSearchService(
+    metadata_svc=svc,
+    faiss_index_dir=os.getenv("FAISS_INDEX_DIR", "/opt/ml/faiss_indices"),
+    bedrock_region=os.getenv("AWS_REGION", "us-east-1"),
+    llm_model_id=os.getenv("BEDROCK_LLM_MODEL", None),
+    embedding_model_id=os.getenv("BEDROCK_EMBEDDING_MODEL", None),
+    top_k=int(os.getenv("RAG_TOP_K", "8")),
+)
+
+# ---- Existing Request/Response Models ----
+class MetadataLookupRequest(BaseModel):
+    query: str
+    category: Optional[str] = None
+    country: Optional[str] = None
+    session_id: Optional[str] = None
+    use_llm: bool = True
+
+
+class MetadataLookupResponse(BaseModel):
+    answer: str
+
+
+# ---- NEW RAG Request/Response Models ----
+class RagSearchRequest(BaseModel):
+    query: str
+    session_id: Optional[str] = None
+
+
+class RagSearchResponse(BaseModel):
+    client: str
+    country: Optional[str] = None
+    category: str
+    top_chunks: List[Dict[str, Any]]
+    answer: str
+    sources: List[str]
+
+
+@app.on_event("startup")
+def _startup_load():
+    try:
+        svc.ensure_loaded()
+    except Exception as e:
+        print(f"[WARN] startup preload failed: {e}")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/api/metadata/lookup", response_model=MetadataLookupResponse)
+def metadata_lookup(payload: MetadataLookupRequest):
+    if not payload.query or not payload.query.strip():
+        raise HTTPException(400, "query is required")
+
+    try:
+        answer_text = svc.lookup(
+            query=payload.query.strip(),
+            category=payload.category,
+            country=payload.country,
+            session_id=payload.session_id,
+            use_llm=bool(payload.use_llm),
+        )
+        return MetadataLookupResponse(answer=answer_text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"lookup failed: {str(e)}")
+
+
+@app.post("/api/rag/search", response_model=RagSearchResponse)
+def rag_search(payload: RagSearchRequest):
+    if not payload.query or not payload.query.strip():
+        raise HTTPException(400, "query is required")
+
+    try:
+        out = rag.search_and_answer(query=payload.query.strip(), session_id=payload.session_id, use_llm_intent=True)
+        return RagSearchResponse(**out)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"rag search failed: {str(e)}")
