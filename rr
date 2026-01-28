@@ -486,3 +486,133 @@ class RagSearchService:
                 for ch in top
             ],
         }
+
+
+
+# app.py
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from services.metadata_service import MetadataService
+from services.rag_search_service import RagSearchService
+
+load_dotenv()
+
+app = FastAPI(title="Metadata Lookup API", version="1.0.0")
+
+# ---- Service Singleton ----
+svc = MetadataService(
+    client_master_csv_path=os.getenv("CLIENT_MASTER_CSV", "Excel/Contractextraction list1.csv"),
+    schema_json_path=os.getenv("CLIENT_MASTER_SCHEMA_JSON", "data/client_master_schema.json"),
+    faiss_index_dir=os.getenv("FAISS_INDEX_DIR", "/opt/ml/faiss_indices"),
+    client_name_col=os.getenv("CLIENT_NAME_COL", "parent_hq"),
+    country_col=os.getenv("COUNTRY_COL", "country__c"),
+    cid_col=os.getenv("CID_COL", "cid"),
+    bedrock_region=os.getenv("AWS_REGION", "us-east-1"),
+    llm_model_id=os.getenv("BEDROCK_LLM_MODEL", None),
+    # Optional: pass alias map here if you want hard mapping
+    # client_alias_map={"apmm": "A.P. Moller - Maersk A/S", "maersk": "A.P. Moller - Maersk A/S"},
+)
+
+rag = RagSearchService(
+    metadata_svc=svc,
+    faiss_index_dir=os.getenv("FAISS_INDEX_DIR", "/opt/ml/faiss_indices"),
+    bedrock_region=os.getenv("AWS_REGION", "us-east-1"),
+    llm_model_id=os.getenv("BEDROCK_LLM_MODEL", None),
+    embedding_model_id=os.getenv("BEDROCK_EMBEDDING_MODEL", None),
+    top_k=int(os.getenv("RAG_TOP_K", "8")),
+    category_fixed="finance",
+    # Optional MMR knobs:
+    # mmr_fetch_k=int(os.getenv("RAG_MMR_FETCH_K", "40")),
+    # mmr_lambda_mult=float(os.getenv("RAG_MMR_LAMBDA", "0.5")),
+)
+
+# ---- Request/Response Models ----
+class MetadataLookupRequest(BaseModel):
+    query: str
+    category: Optional[str] = None   # finance | legal | None
+    country: Optional[str] = None    # US | UK | IN | etc
+    session_id: Optional[str] = None
+    use_llm: bool = True
+
+
+class MetadataLookupResponse(BaseModel):
+    answer: str
+
+
+class RagSearchRequest(BaseModel):
+    query: str
+    session_id: Optional[str] = None
+
+
+class RagChunkOut(BaseModel):
+    text: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RagSearchResponse(BaseModel):
+    # ORDER you asked: answer -> sources -> top_chunks
+    answer: str
+    sources: List[str] = Field(default_factory=list)
+    top_chunks: List[RagChunkOut] = Field(default_factory=list)
+
+
+@app.on_event("startup")
+def _startup_load():
+    # Optional pre-load for faster first response
+    try:
+        svc.ensure_loaded()
+    except Exception as e:
+        print(f"[WARN] startup preload failed: {e}")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/api/metadata/lookup", response_model=MetadataLookupResponse)
+def metadata_lookup(payload: MetadataLookupRequest):
+    if not payload.query or not payload.query.strip():
+        raise HTTPException(400, "query is required")
+
+    try:
+        answer_text = svc.lookup(
+            query=payload.query.strip(),
+            category=payload.category,
+            country=payload.country,
+            session_id=payload.session_id,
+            use_llm=bool(payload.use_llm),
+        )
+        return MetadataLookupResponse(answer=answer_text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"lookup failed: {str(e)}")
+
+
+@app.post("/api/rag/search", response_model=RagSearchResponse)
+def rag_search(payload: RagSearchRequest):
+    if not payload.query or not payload.query.strip():
+        raise HTTPException(400, "query is required")
+
+    try:
+        out = rag.search_and_answer(
+            query=payload.query.strip(),
+            session_id=payload.session_id,
+            use_llm_intent=True,
+        )
+        # out is dict: {answer, sources, top_chunks}
+        return out
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"rag search failed: {str(e)}")
