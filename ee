@@ -1,0 +1,532 @@
+# services/rag_search_service.py
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
+
+from services.metadata_service import MetadataService, canonicalize_name, normalize_country
+
+from langchain_aws import BedrockEmbeddings
+
+try:
+    from langchain_community.vectorstores import FAISS  # type: ignore
+except Exception:
+    from langchain.vectorstores import FAISS  # type: ignore
+
+
+@dataclass
+class RagChunk:
+    # keep rank/score internally for ordering; DO NOT return them in API response
+    rank: int
+    score: float
+    text: str
+    metadata: Dict[str, Any]
+
+
+class RagSearchService:
+    """
+    STRUCTURED retrieval-only RAG:
+
+    Input:
+      { "query": "...", "client": "...", "country": "US|UK|IN|...", "category": "finance|legal" }
+
+    Routing rules (STRICT):
+      - If country is provided -> ONLY /<category>/<client>/<country>/
+        If missing -> raise "country not in indexer"
+      - If country NOT provided -> ONLY /<category>/<client>/Ultimate Parent/ and/or /Corporate Family/
+        (use both if exist)
+
+    Output:
+      - manifest (ONCE at top-level; can include multiple manifests if multiple folders)
+      - top_chunks: [{text, metadata}, ...]
+      - client_resolved, country, category
+    """
+
+    def __init__(
+        self,
+        metadata_svc: MetadataService,
+        faiss_index_dir: str,
+        bedrock_region: str = "us-east-1",
+        embedding_model_id: Optional[str] = None,
+        default_top_k: int = 8,
+        default_category: str = "finance",
+        mmr_fetch_k: Optional[int] = None,
+        mmr_lambda_mult: float = 0.5,
+    ):
+        load_dotenv()
+        self.meta = metadata_svc
+        self.faiss_index_dir = Path(faiss_index_dir)
+        self.bedrock_region = bedrock_region
+
+        self.embedding_model_id = embedding_model_id or os.getenv(
+            "BEDROCK_EMBEDDING_MODEL",
+            "amazon.titan-embed-text-v1",
+        )
+
+        self.default_top_k = int(default_top_k)
+        self.default_category = (default_category or "finance").strip().lower()
+        if self.default_category not in {"finance", "legal"}:
+            self.default_category = "finance"
+
+        self.mmr_fetch_k = int(mmr_fetch_k) if mmr_fetch_k is not None else max(self.default_top_k * 5, 25)
+        self.mmr_lambda_mult = float(mmr_lambda_mult)
+
+        self._embeddings = None
+
+    # ---------------- Embeddings ----------------
+    def _emb(self):
+        if self._embeddings is not None:
+            return self._embeddings
+        import boto3
+
+        brt = boto3.client("bedrock-runtime", region_name=self.bedrock_region)
+        self._embeddings = BedrockEmbeddings(model_id=self.embedding_model_id, client=brt)
+        return self._embeddings
+
+    # ---------------- Folder helpers ----------------
+    def _match_client_dirs(self, category_dir: Path, client_name: str) -> List[Path]:
+        if not category_dir.exists():
+            return []
+        target = canonicalize_name(client_name)
+        if not target:
+            return []
+        out: List[Path] = []
+        for d in category_dir.iterdir():
+            if not d.is_dir():
+                continue
+            dc = canonicalize_name(d.name)
+            if dc == target or target in dc or dc in target:
+                out.append(d)
+        return out
+
+    def _find_subfolder(self, base: Path, want: str) -> Optional[Path]:
+        w = canonicalize_name(want)
+        if not base.exists() or not base.is_dir():
+            return None
+        for d in base.iterdir():
+            if d.is_dir() and canonicalize_name(d.name) == w:
+                return d
+        return None
+
+    def _possible_index_dirs_strict(self, client_name: str, category: str, country: Optional[str]) -> List[Path]:
+        """
+        STRICT:
+          - country provided -> ONLY <client>/<country>
+          - no country -> ONLY Ultimate Parent / Corporate Family
+        """
+        cat = (category or self.default_category).strip().lower()
+        if cat not in {"finance", "legal"}:
+            cat = self.default_category
+
+        cat_dir = self.faiss_index_dir / cat
+        client_dirs = self._match_client_dirs(cat_dir, client_name)
+        if not client_dirs:
+            return []
+
+        ctry = normalize_country(country)
+
+        if ctry:
+            existing: List[Path] = []
+            for cd in client_dirs:
+                # exact
+                p = cd / ctry
+                if p.exists() and p.is_dir():
+                    existing.append(p)
+                    continue
+                # normalized match (USA / U.S. / etc.)
+                for sub in cd.iterdir():
+                    if sub.is_dir() and normalize_country(sub.name) == ctry:
+                        existing.append(sub)
+            return existing  # if empty => "country not in indexer"
+
+        out: List[Path] = []
+        for cd in client_dirs:
+            up = self._find_subfolder(cd, "Ultimate Parent")
+            cf = self._find_subfolder(cd, "Corporate Family")
+            if up:
+                out.append(up)
+            if cf:
+                out.append(cf)
+        return out
+
+    # ---------------- FAISS ----------------
+    def _load_faiss_store(self, folder: Path):
+        try:
+            return FAISS.load_local(str(folder), self._emb(), allow_dangerous_deserialization=True)
+        except TypeError:
+            return FAISS.load_local(str(folder), self._emb())
+
+    def _json_sanitize(self, obj: Any) -> Any:
+        if obj is None:
+            return None
+        if isinstance(obj, (str, int, float, bool)):
+            return obj
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, dict):
+            return {str(k): self._json_sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, set)):
+            return [self._json_sanitize(v) for v in obj]
+        return str(obj)
+
+    # ---------------- Manifest reading (ONCE per folder) ----------------
+    def _read_manifest_payload(self, folders: List[Path], max_docs_per_manifest: int) -> Dict[str, Any]:
+        """
+        Reads manifest.json from each selected index folder (if present).
+        Returns a single top-level payload (NOT repeated per chunk).
+        """
+        payload: Dict[str, Any] = {
+            "manifests_found": 0,
+            "manifests": [],  # list per folder
+            "metadata_keys": [],
+            "docs_truncated": False,
+        }
+
+        all_keys = set()
+
+        for folder in folders:
+            mp = folder / "manifest.json"
+            if not mp.exists():
+                payload["manifests"].append(
+                    {
+                        "folder": str(folder),
+                        "manifest_path": str(mp),
+                        "exists": False,
+                        "docs_count_returned": 0,
+                        "docs_truncated": False,
+                        "docs": [],
+                    }
+                )
+                continue
+
+            try:
+                data = json.loads(mp.read_text(encoding="utf-8"))
+            except Exception:
+                payload["manifests"].append(
+                    {
+                        "folder": str(folder),
+                        "manifest_path": str(mp),
+                        "exists": True,
+                        "error": "failed to parse manifest.json",
+                        "docs_count_returned": 0,
+                        "docs_truncated": False,
+                        "docs": [],
+                    }
+                )
+                continue
+
+            docs = data.get("docs", []) or []
+            truncated = False
+
+            if max_docs_per_manifest is not None and len(docs) > int(max_docs_per_manifest):
+                docs = docs[: int(max_docs_per_manifest)]
+                truncated = True
+                payload["docs_truncated"] = True
+
+            docs_out: List[Dict[str, Any]] = []
+            for d in docs:
+                policy_id = str(d.get("policy_id") or "").strip()
+                source_file = d.get("source_file")
+
+                md = d.get("metadata") or {}
+                # normalize nested formats
+                if isinstance(md, dict) and "metadataAttributes" in md and isinstance(md["metadataAttributes"], dict):
+                    md = md["metadataAttributes"]
+                if isinstance(md, dict) and "metadataAtrributes" in md and isinstance(md["metadataAtrributes"], dict):
+                    md = md["metadataAtrributes"]
+
+                if isinstance(md, dict):
+                    for k in md.keys():
+                        all_keys.add(str(k))
+                else:
+                    md = {}
+
+                docs_out.append(
+                    {
+                        "policy_id": policy_id,
+                        "source_file": source_file,
+                        "metadata": md,
+                    }
+                )
+
+            payload["manifests"].append(
+                {
+                    "folder": str(folder),
+                    "manifest_path": str(mp),
+                    "exists": True,
+                    "docs_count_returned": len(docs_out),
+                    "docs_truncated": truncated,
+                    "docs": docs_out,
+                }
+            )
+
+        payload["manifests_found"] = sum(1 for m in payload["manifests"] if m.get("exists") is True and "error" not in m)
+        payload["metadata_keys"] = sorted(all_keys)
+        return payload
+
+    # ---------------- Public: Structured Retrieval ----------------
+    def retrieve_chunks_structured(
+        self,
+        query: str,
+        client: str,
+        country: Optional[str] = None,
+        category: Optional[str] = "finance",
+        top_k: Optional[int] = None,
+        include_manifest: bool = True,
+        max_docs_per_manifest: int = 100000,
+    ) -> Dict[str, Any]:
+        q = (query or "").strip()
+        if not q:
+            raise ValueError("query is required")
+
+        client_in = (client or "").strip()
+        if not client_in:
+            raise ValueError("client is required")
+
+        cat = (category or self.default_category).strip().lower()
+        if cat not in {"finance", "legal"}:
+            cat = self.default_category
+
+        ctry = normalize_country(country)
+        k = int(top_k) if top_k else self.default_top_k
+
+        # Resolve client via CSV if possible; else use alias-mapped input
+        self.meta.ensure_loaded()
+        client_mapped = self.meta._apply_client_alias_map(client_in)
+        row = self.meta._resolve_client_row(client_mapped, country=ctry)
+        client_resolved = str(row[self.meta.client_name_col]).strip() if row is not None else client_mapped
+
+        # STRICT routing
+        index_dirs = self._possible_index_dirs_strict(client_resolved, cat, ctry)
+        if not index_dirs:
+            if ctry:
+                raise FileNotFoundError(
+                    f"Country '{ctry}' was provided, but index folder was not found under "
+                    f"{self.faiss_index_dir}/{cat}/{client_resolved}/<{ctry}>/"
+                )
+            raise FileNotFoundError(
+                f"No country provided, but neither Ultimate Parent nor Corporate Family index folders were found under "
+                f"{self.faiss_index_dir}/{cat}/{client_resolved}/"
+            )
+
+        # ✅ Read manifest ONCE (top-level), not per chunk
+        manifest_payload: Dict[str, Any] = {}
+        if include_manifest:
+            manifest_payload = self._read_manifest_payload(index_dirs, max_docs_per_manifest)
+
+        merged: List[RagChunk] = []
+
+        for folder in index_dirs:
+            store = self._load_faiss_store(folder)
+
+            fetch_k = self.mmr_fetch_k
+            lambda_mult = self.mmr_lambda_mult
+
+            # 1) MMR docs (no scores)
+            mmr_docs = store.max_marginal_relevance_search(q, k=k, fetch_k=fetch_k, lambda_mult=lambda_mult)
+
+            # 2) scored pool to map scores for ordering
+            scored = store.similarity_search_with_score(q, k=fetch_k)
+
+            def _doc_key(d) -> str:
+                md = getattr(d, "metadata", {}) or {}
+                md_items = sorted((str(k2), str(v2)) for k2, v2 in md.items())
+                return (getattr(d, "page_content", "") or "") + "||" + "||".join([f"{k2}={v2}" for k2, v2 in md_items])
+
+            score_map: Dict[str, float] = {}
+            for d, s in scored:
+                key = _doc_key(d)
+                if key not in score_map or float(s) < score_map[key]:
+                    score_map[key] = float(s)
+
+            for d in mmr_docs:
+                text = (d.page_content or "").strip()
+                md = dict(d.metadata or {})
+                md.setdefault("_index_folder", str(folder))  # helps trace which folder produced the chunk
+                sc = score_map.get(_doc_key(d), 0.0)
+                merged.append(RagChunk(rank=0, score=float(sc), text=text, metadata=md))
+
+        if not merged:
+            return {
+                "manifest": manifest_payload,
+                "top_chunks": [],
+                "client_resolved": client_resolved,
+                "country": ctry,
+                "category": cat,
+            }
+
+        # sort by FAISS distance (lower is usually better)
+        merged.sort(key=lambda x: x.score)
+
+        # de-dup
+        dedup: List[RagChunk] = []
+        seen = set()
+        for ch in merged:
+            sig = (ch.text[:400], str(ch.metadata.get("policy_id") or ""), str(ch.metadata.get("_index_folder") or ""))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            dedup.append(ch)
+
+        top = dedup[:k]
+
+        return {
+            "manifest": manifest_payload,  
+            "top_chunks": [{"text": ch.text, "metadata": self._json_sanitize(ch.metadata)} for ch in top],
+            "client_resolved": client_resolved,
+            "country": ctry,
+            "category": cat,
+        }
+_____
+
+
+# app.py
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from services.metadata_service import MetadataService
+from services.rag_search_service import RagSearchService
+
+load_dotenv()
+
+app = FastAPI(title="Structured Metadata + RAG Retrieval API", version="2.2.0")
+
+# ---- Services ----
+svc = MetadataService(
+    client_master_csv_path=os.getenv("CLIENT_MASTER_CSV", "Excel/Contractextraction list1.csv"),
+    faiss_index_dir=os.getenv("FAISS_INDEX_DIR", "/opt/ml/faiss_indices"),
+    client_name_col=os.getenv("CLIENT_NAME_COL", "parent_hq"),
+    country_col=os.getenv("COUNTRY_COL", "country_code"),
+    cid_col=os.getenv("CID_COL", "cid"),
+    # optional:
+    # client_alias_map={"apmm": "A.P. Moller - Maersk A/S", "maersk": "A.P. Moller - Maersk A/S"},
+)
+
+rag = RagSearchService(
+    metadata_svc=svc,
+    faiss_index_dir=os.getenv("FAISS_INDEX_DIR", "/opt/ml/faiss_indices"),
+    bedrock_region=os.getenv("AWS_REGION", "us-east-1"),
+    embedding_model_id=os.getenv("BEDROCK_EMBEDDING_MODEL", None),
+    default_top_k=int(os.getenv("RAG_TOP_K", "8")),
+    default_category=os.getenv("RAG_DEFAULT_CATEGORY", "finance"),
+)
+
+
+# -------------------------
+# Structured Metadata Lookup
+# -------------------------
+class MetadataLookupStructuredRequest(BaseModel):
+    client: str
+    country: Optional[str] = None
+    category: Optional[str] = "finance"
+    include_manifest: bool = True
+    max_docs_per_manifest: int = 200
+
+
+class MetadataLookupStructuredResponse(BaseModel):
+    client_input: str
+    client_resolved: Optional[str] = None
+    category: str
+    country: Optional[str] = None
+
+    capid: Optional[str] = None
+    capids_by_country: List[Dict[str, str]] = Field(default_factory=list)
+
+    manifest: Dict[str, Any] = Field(default_factory=dict)
+    error: Optional[str] = None
+
+
+@app.post("/api/metadata/lookup", response_model=MetadataLookupStructuredResponse)
+def metadata_lookup_structured(payload: MetadataLookupStructuredRequest):
+    if not payload.client or not payload.client.strip():
+        raise HTTPException(400, "client is required")
+
+    try:
+        out = svc.lookup_structured(
+            client=payload.client.strip(),
+            country=payload.country,
+            category=payload.category,
+            include_manifest=bool(payload.include_manifest),
+            max_docs_per_manifest=int(payload.max_docs_per_manifest),
+        )
+        return out
+    except Exception as e:
+        raise HTTPException(500, f"metadata lookup failed: {str(e)}")
+
+
+# -------------------------
+# Structured RAG Retrieval (manifest once + chunks)
+# -------------------------
+class RagRetrieveStructuredRequest(BaseModel):
+    query: str
+    client: str
+    country: Optional[str] = None
+    category: Optional[str] = "finance"
+    top_k: Optional[int] = None
+
+    include_manifest: bool = True
+    max_docs_per_manifest: int = 100000  # set high for "complete"
+
+
+class RagChunkOut(BaseModel):
+    text: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RagRetrieveStructuredResponse(BaseModel):
+    manifest: Dict[str, Any] = Field(default_factory=dict)  # ✅ once at top-level
+    top_chunks: List[RagChunkOut] = Field(default_factory=list)
+
+    client_resolved: str
+    country: Optional[str] = None
+    category: str
+
+
+@app.post("/api/rag/search", response_model=RagRetrieveStructuredResponse)
+def rag_retrieve_structured(payload: RagRetrieveStructuredRequest):
+    if not payload.query or not payload.query.strip():
+        raise HTTPException(400, "query is required")
+    if not payload.client or not payload.client.strip():
+        raise HTTPException(400, "client is required")
+
+    try:
+        out = rag.retrieve_chunks_structured(
+            query=payload.query.strip(),
+            client=payload.client.strip(),
+            country=payload.country,
+            category=payload.category,
+            top_k=payload.top_k,
+            include_manifest=bool(payload.include_manifest),
+            max_docs_per_manifest=int(payload.max_docs_per_manifest),
+        )
+        return out
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"rag retrieval failed: {str(e)}")
+
+
+@app.on_event("startup")
+def _startup_load():
+    try:
+        svc.ensure_loaded()
+    except Exception as e:
+        print(f"[WARN] startup preload failed: {e}")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
