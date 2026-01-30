@@ -1,0 +1,354 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
+import boto3
+from dotenv import load_dotenv
+from langchain_aws import BedrockEmbeddings
+
+from services.metadata_service import MetadataService, canonicalize_name, normalize_country
+
+try:
+    from langchain_community.vectorstores import FAISS  # type: ignore
+except Exception:
+    from langchain.vectorstores import FAISS  # type: ignore
+
+
+def _is_s3_uri(s: str) -> bool:
+    return isinstance(s, str) and s.startswith("s3://")
+
+
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    u = urlparse(uri)
+    bucket = (u.netloc or "").strip()
+    key = (u.path or "").lstrip("/")
+    if not bucket:
+        raise ValueError(f"Invalid S3 URI (missing bucket): {uri}")
+    return bucket, key
+
+
+def _sync_s3_prefix_to_local_dir(s3_prefix_uri: str, local_dir: str, region: str) -> str:
+    """
+    Download everything under s3://bucket/prefix into local_dir, preserving structure.
+    """
+    bucket, base_key = _parse_s3_uri(s3_prefix_uri)
+
+    prefix = base_key.rstrip("/")
+    if prefix:
+        prefix += "/"
+
+    os.makedirs(local_dir, exist_ok=True)
+
+    s3 = boto3.client("s3", region_name=region)
+    paginator = s3.get_paginator("list_objects_v2")
+
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []) or []:
+            key = obj.get("Key") or ""
+            if not key or key.endswith("/"):
+                continue
+
+            rel = key[len(prefix):] if key.startswith(prefix) else key
+            dest_path = os.path.join(local_dir, rel)
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            s3.download_file(bucket, key, dest_path)
+
+    return local_dir
+
+
+@dataclass
+class RagChunk:
+    rank: int
+    score: float
+    text: str
+    metadata: Dict[str, Any]
+
+
+class RagSearchService:
+    """
+    S3-only:
+      - faiss_index_dir MUST be s3://bucket/prefix
+      - syncs prefix to local cache, then auto-detects the true root containing finance/legal
+    """
+
+    def __init__(
+        self,
+        metadata_svc: MetadataService,
+        faiss_index_dir: str,  # S3 prefix
+        bedrock_region: str = "us-east-1",
+        embedding_model_id: Optional[str] = None,
+        default_top_k: int = 8,
+        default_category: str = "finance",
+        mmr_fetch_k: Optional[int] = None,
+        mmr_lambda_mult: float = 0.5,
+        faiss_cache_dir: Optional[str] = None,
+        sync_on_init: bool = True,
+    ):
+        load_dotenv()
+
+        if not _is_s3_uri(faiss_index_dir):
+            raise ValueError("FAISS_INDEX_DIR must be an S3 prefix like s3://bucket/path")
+
+        self.meta = metadata_svc
+        self.faiss_index_dir_s3 = faiss_index_dir.rstrip("/")
+        self.bedrock_region = bedrock_region
+
+        self.embedding_model_id = embedding_model_id or os.getenv(
+            "BEDROCK_EMBEDDING_MODEL",
+            "amazon.titan-embed-text-v1",
+        )
+
+        self.default_top_k = int(default_top_k)
+        self.default_category = (default_category or "finance").strip().lower()
+        if self.default_category not in {"finance", "legal"}:
+            self.default_category = "finance"
+
+        self.mmr_fetch_k = int(mmr_fetch_k) if mmr_fetch_k is not None else max(self.default_top_k * 5, 25)
+        self.mmr_lambda_mult = float(mmr_lambda_mult)
+
+        self._embeddings = None
+
+        self.faiss_cache_dir = (faiss_cache_dir or os.getenv("FAISS_INDEX_DIR_LOCAL") or "/tmp/faiss_indices").strip()
+        if not self.faiss_cache_dir:
+            self.faiss_cache_dir = "/tmp/faiss_indices"
+
+        if sync_on_init:
+            _sync_s3_prefix_to_local_dir(self.faiss_index_dir_s3, self.faiss_cache_dir, region=self.bedrock_region)
+
+        # AUTO-DETECT real root containing finance/legal
+        cache_root = Path(self.faiss_cache_dir)
+        self.faiss_index_dir = self._detect_faiss_root(cache_root)
+
+    def _detect_faiss_root(self, root: Path) -> Path:
+        """
+        We expect either:
+          root/finance or root/legal
+        But handle common nesting like:
+          root/<one-level>/finance
+          root/faiss_indices/finance
+        """
+        if (root / "finance").is_dir() or (root / "legal").is_dir():
+            return root
+
+        # one level down
+        try:
+            for p in root.iterdir():
+                if p.is_dir() and ((p / "finance").is_dir() or (p / "legal").is_dir()):
+                    return p
+        except Exception:
+            pass
+
+        # shallow walk up to depth 3
+        for dirpath, dirnames, _ in os.walk(str(root)):
+            d = Path(dirpath)
+            if (d / "finance").is_dir() or (d / "legal").is_dir():
+                return d
+            rel_depth = len(d.relative_to(root).parts)
+            if rel_depth >= 3:
+                dirnames[:] = []
+
+        # helpful debug: show top-level dirs
+        top = []
+        try:
+            top = [p.name for p in root.iterdir() if p.is_dir()]
+        except Exception:
+            pass
+
+        raise FileNotFoundError(
+            f"FAISS root not found in local cache '{root}'. "
+            f"Expected to find 'finance/' or 'legal/' directories. "
+            f"Top-level dirs: {top}. "
+            f"Check FAISS_INDEX_DIR S3 prefix: {self.faiss_index_dir_s3}"
+        )
+
+    # ---------------- Embeddings ----------------
+    def _emb(self):
+        if self._embeddings is not None:
+            return self._embeddings
+        brt = boto3.client("bedrock-runtime", region_name=self.bedrock_region)
+        self._embeddings = BedrockEmbeddings(model_id=self.embedding_model_id, client=brt)
+        return self._embeddings
+
+    # ---------------- Folder helpers ----------------
+    def _match_client_dirs(self, category_dir: Path, client_name: str) -> List[Path]:
+        if not category_dir.exists():
+            return []
+        target = canonicalize_name(client_name)
+        if not target:
+            return []
+        out: List[Path] = []
+        for d in category_dir.iterdir():
+            if not d.is_dir():
+                continue
+            dc = canonicalize_name(d.name)
+            if dc == target or target in dc or dc in target:
+                out.append(d)
+        return out
+
+    def _find_subfolder(self, base: Path, want: str) -> Optional[Path]:
+        w = canonicalize_name(want)
+        if not base.exists() or not base.is_dir():
+            return None
+        for d in base.iterdir():
+            if d.is_dir() and canonicalize_name(d.name) == w:
+                return d
+        return None
+
+    def _possible_index_dirs_strict(self, client_name: str, category: str, country: Optional[str]) -> List[Path]:
+        cat = (category or self.default_category).strip().lower()
+        if cat not in {"finance", "legal"}:
+            cat = self.default_category
+
+        cat_dir = self.faiss_index_dir / cat
+        client_dirs = self._match_client_dirs(cat_dir, client_name)
+        if not client_dirs:
+            return []
+
+        ctry = normalize_country(country)
+
+        if ctry:
+            existing: List[Path] = []
+            for cd in client_dirs:
+                p = cd / ctry
+                if p.exists() and p.is_dir():
+                    existing.append(p)
+                    continue
+                for sub in cd.iterdir():
+                    if sub.is_dir() and normalize_country(sub.name) == ctry:
+                        existing.append(sub)
+            return existing
+
+        out: List[Path] = []
+        for cd in client_dirs:
+            up = self._find_subfolder(cd, "Ultimate Parent")
+            cf = self._find_subfolder(cd, "Corporate Family")
+            if up:
+                out.append(up)
+            if cf:
+                out.append(cf)
+        return out
+
+    # ---------------- FAISS ----------------
+    def _load_faiss_store(self, folder: Path):
+        try:
+            return FAISS.load_local(str(folder), self._emb(), allow_dangerous_deserialization=True)
+        except TypeError:
+            return FAISS.load_local(str(folder), self._emb())
+
+    def _json_sanitize(self, obj: Any) -> Any:
+        if obj is None:
+            return None
+        if isinstance(obj, (str, int, float, bool)):
+            return obj
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, dict):
+            return {str(k): self._json_sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, set)):
+            return [self._json_sanitize(v) for v in obj]
+        return str(obj)
+
+    # ---------------- Public ----------------
+    def retrieve_chunks_structured(
+        self,
+        query: str,
+        client: str,
+        country: Optional[str] = None,
+        category: Optional[str] = "finance",
+        top_k: Optional[int] = None,
+        include_manifest: bool = True,
+        max_docs_per_manifest: int = 100000,
+    ) -> Dict[str, Any]:
+        q = (query or "").strip()
+        if not q:
+            raise ValueError("query is required")
+
+        client_in = (client or "").strip()
+        if not client_in:
+            raise ValueError("client is required")
+
+        cat = (category or self.default_category).strip().lower()
+        if cat not in {"finance", "legal"}:
+            cat = self.default_category
+
+        ctry = normalize_country(country)
+        k = int(top_k) if top_k else self.default_top_k
+
+        self.meta.ensure_loaded()
+        client_mapped = self.meta._apply_client_alias_map(client_in)
+        row = self.meta._resolve_client_row(client_mapped, country=ctry)
+        client_resolved = str(row[self.meta.client_name_col]).strip() if row is not None else client_mapped
+
+        index_dirs = self._possible_index_dirs_strict(client_resolved, cat, ctry)
+        if not index_dirs:
+            raise FileNotFoundError(
+                f"Index folder not found. Resolved client='{client_resolved}', category='{cat}', country='{ctry}'. "
+                f"Local faiss root='{self.faiss_index_dir}'. S3 prefix='{self.faiss_index_dir_s3}'."
+            )
+
+        manifest_payload: Dict[str, Any] = {}
+        if include_manifest:
+            m = self.meta.lookup_structured(
+                client=client_in,
+                country=country,
+                category=cat,
+                include_manifest=True,
+                max_docs_per_manifest=max_docs_per_manifest,
+            )
+            manifest_payload = m.get("manifest") or {}
+
+        merged: List[RagChunk] = []
+
+        for folder in index_dirs:
+            store = self._load_faiss_store(folder)
+
+            mmr_docs = store.max_marginal_relevance_search(
+                q,
+                k=k,
+                fetch_k=self.mmr_fetch_k,
+                lambda_mult=self.mmr_lambda_mult,
+            )
+            scored = store.similarity_search_with_score(q, k=self.mmr_fetch_k)
+
+            def _doc_key(d) -> str:
+                md = getattr(d, "metadata", {}) or {}
+                md_items = sorted((str(k2), str(v2)) for k2, v2 in md.items())
+                return (getattr(d, "page_content", "") or "") + "||" + "||".join([f"{k2}={v2}" for k2, v2 in md_items])
+
+            score_map: Dict[str, float] = {}
+            for d, s in scored:
+                key = _doc_key(d)
+                if key not in score_map or float(s) < score_map[key]:
+                    score_map[key] = float(s)
+
+            for d in mmr_docs:
+                text = (d.page_content or "").strip()
+                md = dict(d.metadata or {})
+                md.setdefault("_index_folder", str(folder))
+                sc = score_map.get(_doc_key(d), 0.0)
+                merged.append(RagChunk(rank=0, score=float(sc), text=text, metadata=md))
+
+        merged.sort(key=lambda x: x.score)
+
+        # de-dupe
+        dedup: List[RagChunk] = []
+        seen = set()
+        for ch in merged:
+            sig = (ch.text[:400], str(ch.metadata.get("policy_id") or ""), str(ch.metadata.get("_index_folder") or ""))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            dedup.append(ch)
+
+        top = dedup[:k]
+        return {
+            "top_chunks": [{"text": ch.text, "metadata": self._json_sanitize(ch.metadata)} for ch in top],
+            "client_resolved": client_resolved,
+            "country": ctry,
+            "category": cat,
+            "manifest": manifest_payload,
+        }
