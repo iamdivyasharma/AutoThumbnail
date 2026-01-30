@@ -1,0 +1,37 @@
+import os
+import boto3
+from botocore.exceptions import ClientError
+
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+BUCKET = os.getenv("TEST_S3_BUCKET", "YOUR_BUCKET_NAME")
+PREFIX = os.getenv("TEST_S3_PREFIX", "")  # e.g. "faiss_indices/" (optional)
+TEST_KEY = os.getenv("TEST_S3_KEY", "PATH/TO/SOME/EXISTING/OBJECT")  # must exist
+
+s3 = boto3.client("s3", region_name=AWS_REGION)
+
+def test_listbucket():
+    print(f"\n[TEST] s3:ListBucket on bucket='{BUCKET}' prefix='{PREFIX}'")
+    try:
+        resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX, MaxKeys=1)
+        n = len(resp.get("Contents", []) or [])
+        print(f"✅ ListBucket OK (found {n} object(s) in first page)")
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        msg = e.response.get("Error", {}).get("Message")
+        print(f"❌ ListBucket FAILED: {code} - {msg}")
+
+def test_getobject():
+    print(f"\n[TEST] s3:GetObject on s3://{BUCKET}/{TEST_KEY}")
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=TEST_KEY)
+        b = obj["Body"].read(64)
+        print(f"✅ GetObject OK (read {len(b)} bytes)")
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        msg = e.response.get("Error", {}).get("Message")
+        print(f"❌ GetObject FAILED: {code} - {msg}")
+
+if __name__ == "__main__":
+    test_listbucket()
+    test_getobject()
