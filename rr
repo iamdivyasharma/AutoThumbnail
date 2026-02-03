@@ -1,0 +1,33 @@
+import os
+import boto3
+from urllib.parse import urlparse
+from botocore.exceptions import ClientError
+
+uri = os.getenv("CLIENT_MASTER_CSV", "").strip()
+print("CLIENT_MASTER_CSV =", uri)
+
+u = urlparse(uri)
+bucket = u.netloc
+key = u.path.lstrip("/")
+print("bucket =", bucket)
+print("key    =", key)
+
+s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION","us-east-1"))
+sts = boto3.client("sts", region_name=os.getenv("AWS_REGION","us-east-1"))
+print("caller =", sts.get_caller_identity()["Arn"])
+
+# 1) HEAD (checks existence + GetObject permission without downloading full file)
+try:
+    s3.head_object(Bucket=bucket, Key=key)
+    print("✅ head_object OK (GetObject permission + key exists)")
+except ClientError as e:
+    print("❌ head_object FAILED:", e.response["Error"]["Code"], e.response["Error"]["Message"])
+
+# 2) LIST prefix (only if you are using prefix mode)
+prefix = key.rstrip("/") + "/"
+try:
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=5)
+    keys = [x["Key"] for x in resp.get("Contents", [])]
+    print("✅ list_objects_v2 OK. sample keys:", keys)
+except ClientError as e:
+    print("❌ list_objects_v2 FAILED:", e.response["Error"]["Code"], e.response["Error"]["Message"])
